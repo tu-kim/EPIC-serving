@@ -277,30 +277,168 @@ def step3_non_eager_fails(model: str) -> None:
 
 # ---------------------------------------------------------------------------
 # step4 -- shared non-prefix chunk: sparse-on vs dense output comparison
+#
+# CHUNK ALIGNMENT (root-cause fix): the earlier version built prompts by string
+# concatenation. Re-tokenizing "head + passage + tail" does NOT guarantee that
+# the passage B starts on a chunk boundary or that its token ids are identical
+# between the warm and reuse prompts (subword boundaries shift with the
+# surrounding text). Without byte-identical, chunk-aligned B tokens the content
+# hash never matches and the connector finds NO non-prefix hit -> nothing to
+# reuse -> the comparison is meaningless. So we assemble at the TOKEN level
+# (mirroring benchmarks/epic_reuse/data_prep.py):
+#   * head A is padded to a multiple of chunk_size with a repeated filler id,
+#   * passage B is truncated to EXACTLY k*chunk_size tokens,
+#   * the SAME B id slice is spliced into both prompts,
+# guaranteeing B is byte-identical and chunk-aligned in warm and reuse.
 # ---------------------------------------------------------------------------
+DEFAULT_CHUNK_SIZE = 256
+
+
+def build_aligned_token_prompts(
+    *,
+    head_ids: list[int],
+    passage_ids: list[int],
+    tail_ids: list[int],
+    reuse_head_ids: list[int],
+    reuse_tail_ids: list[int],
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    filler_id: int = 0,
+    passage_chunks: int = 1,
+) -> dict:
+    """Token-level, chunk-aligned assembly of the warm + reuse prompts (pure).
+
+    Returns a dict with the two token-id lists plus the precomputed B-chunk
+    boundaries / hashes the smoke logs and asserts on. No tokenizer or GPU here
+    so this is unit-testable on CPU (test_step4_alignment).
+
+    Invariants this guarantees (the whole point of the rewrite):
+      * head A is padded to a multiple of ``chunk_size`` -> B starts on a chunk
+        boundary in BOTH prompts.
+      * B is truncated to exactly ``passage_chunks * chunk_size`` tokens and the
+        SAME id slice is used in both prompts -> byte-identical content -> the
+        connector's content hash collides -> a real non-prefix hit.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if passage_chunks <= 0:
+        raise ValueError("passage_chunks must be positive")
+
+    # Pad each head UP to a chunk-size multiple so B lands on a chunk boundary.
+    def _pad_to_chunk(ids: list[int]) -> list[int]:
+        rem = len(ids) % chunk_size
+        if rem == 0 and len(ids) > 0:
+            return list(ids)
+        pad = (chunk_size - rem) % chunk_size
+        # Ensure at least one full A chunk so A is itself chunkable (prefix).
+        if len(ids) == 0:
+            pad = chunk_size
+        return list(ids) + [filler_id] * pad
+
+    warm_head = _pad_to_chunk(head_ids)
+    reuse_head = _pad_to_chunk(reuse_head_ids)
+
+    # Truncate B to EXACTLY passage_chunks * chunk_size; pad with filler if the
+    # source passage is short (so the count is exact regardless of input length).
+    b_len = passage_chunks * chunk_size
+    b_ids = list(passage_ids[:b_len])
+    if len(b_ids) < b_len:
+        b_ids = b_ids + [filler_id] * (b_len - len(b_ids))
+
+    warm_ids = warm_head + b_ids + list(tail_ids)
+    reuse_ids = reuse_head + b_ids + list(reuse_tail_ids)
+
+    # Precompute the B chunk boundaries + hashes in each prompt (offsets differ
+    # because the heads differ in length, but the hashes MUST match: same B ids).
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.chunk_store import (
+        hash_chunk_tokens,
+    )
+
+    def _b_chunks(head_len: int) -> list[tuple[int, str]]:
+        out = []
+        for c in range(passage_chunks):
+            start = head_len + c * chunk_size
+            out.append(
+                (start, hash_chunk_tokens(b_ids[c * chunk_size : (c + 1) * chunk_size]))
+            )
+        return out
+
+    warm_b = _b_chunks(len(warm_head))
+    reuse_b = _b_chunks(len(reuse_head))
+    # The B hashes must be identical across the two prompts (that is the reuse
+    # signal). Offsets differ (different head lengths) -> non-prefix in reuse.
+    assert [h for _, h in warm_b] == [h for _, h in reuse_b], (
+        "B chunk hashes diverge -> alignment broken; B must be byte-identical."
+    )
+
+    return {
+        "warm_ids": warm_ids,
+        "reuse_ids": reuse_ids,
+        "b_len": b_len,
+        "chunk_size": chunk_size,
+        "passage_chunks": passage_chunks,
+        "warm_b_offset": len(warm_head),
+        "reuse_b_offset": len(reuse_head),
+        "expected_b_hashes": [h for _, h in warm_b],
+    }
+
+
 def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
     _log("step4: shared NON-prefix chunk, sparse ON output vs dense output")
 
-    # Request 1: a prompt whose MIDDLE is the shared passage -> EPIC saves the
-    # passage chunk(s). Request 2: a DIFFERENT prompt whose middle is the SAME
-    # passage (A=head, C=tail differs, B=shared passage in the middle) -> the
-    # passage is a non-prefix content match for request 2.
-    warm_prompt = _PROMPT_HEAD + _SHARED_PASSAGE + _PROMPT_TAIL_1
-    reuse_prompt = (
-        "Different opening sentence here for the second request entirely. "
-        + _SHARED_PASSAGE
-        + _PROMPT_TAIL_2
-    )
+    from vllm.inputs import TokensPrompt
+
     params = _greedy_params(max_tokens=48)
 
-    # --- dense reference: sparse OFF (connector still saves, but dense forward).
-    # Use the same backend as the sparse run so the comparison is apples-to-apples.
+    # --- dense reference engine (also gives us the tokenizer for assembly) ---
     llm_dense = _build_llm(
         model,
         kv_config=_epic_kv_config(sparse=False),
         attention_backend="FLEX_ATTENTION",
     )
-    llm_dense.generate([warm_prompt], params)  # warm: saves the shared chunk
+    tok = llm_dense.get_tokenizer()
+
+    def _enc(text: str) -> list[int]:
+        # add_special_tokens=False: we control boundaries ourselves; a leading
+        # BOS in B would break byte-identity vs. the same B inside another prompt.
+        return list(tok.encode(text, add_special_tokens=False))
+
+    chunk_size = DEFAULT_CHUNK_SIZE
+    # filler id: a stable, common token (space) so padding is innocuous text.
+    filler_id = _enc(" ")[-1] if _enc(" ") else 0
+
+    assembled = build_aligned_token_prompts(
+        head_ids=_enc(_PROMPT_HEAD),
+        passage_ids=_enc(_SHARED_PASSAGE),
+        tail_ids=_enc(_PROMPT_TAIL_1),
+        reuse_head_ids=_enc(
+            "Different opening sentence here for the second request entirely. "
+        ),
+        reuse_tail_ids=_enc(_PROMPT_TAIL_2),
+        chunk_size=chunk_size,
+        filler_id=filler_id,
+        passage_chunks=1,
+    )
+    warm_prompt = TokensPrompt(prompt_token_ids=assembled["warm_ids"])
+    reuse_prompt = TokensPrompt(prompt_token_ids=assembled["reuse_ids"])
+
+    _log(
+        f"step4: chunk_size={chunk_size} B_len={assembled['b_len']} "
+        f"warm_B_offset={assembled['warm_b_offset']} "
+        f"reuse_B_offset={assembled['reuse_b_offset']} "
+        f"expected_B_chunks={len(assembled['expected_b_hashes'])} "
+        f"B_hash_prefixes={[h[:12] for h in assembled['expected_b_hashes']]}"
+    )
+    _log(
+        "step4: GPU LOG EXPECTATIONS -- on the reuse request the connector should "
+        f"log 'EPIC sparse match' with non_prefix_hits="
+        f"{len(assembled['expected_b_hashes'])} at offset "
+        f"[{assembled['reuse_b_offset']}], then 'EPIC load emit' with "
+        f"chunks={len(assembled['expected_b_hashes'])} scattering B into the "
+        "paged cache (slot_range within the reuse request's blocks)."
+    )
+
+    # warm: saves the shared B chunk(s).
+    llm_dense.generate([warm_prompt], params)
     dense_out = _token_ids(llm_dense.generate([reuse_prompt], params))[0]
     del llm_dense
 

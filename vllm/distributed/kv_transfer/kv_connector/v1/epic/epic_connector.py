@@ -362,8 +362,30 @@ class EpicConnector(KVConnectorBase_V1):
                 # and external so the advance (N-external) can be derived later.
                 self._matched_prefix[request.request_id] = sel.prefix_chunks
                 self._sparse_reqs[request.request_id] = (n, external)
+                # EPIC fix (root cause): the non-prefix B chunks counted into
+                # ``external`` are treated as computed by the scheduler, so they
+                # are NEVER forwarded. Their KV therefore MUST be loaded into the
+                # paged cache or M queries attend to uninitialized slots. Mark a
+                # load pending here (not only for prefix hits) so
+                # build_connector_meta emits ChunkLoadSpecs for B even when there
+                # is no prefix hit (the B-only case). See update_state_after_alloc
+                # and build_connector_meta.
+                self._loads_pending[request.request_id] = request
+                # EPIC diagnostics (info, 1 line/req): observability for the GPU
+                # smoke (expected B chunk count + offsets vs. external/|M|).
+                logger.info(
+                    "EPIC sparse match req=%s N=%d prefix_extent=%d "
+                    "non_prefix_hits=%d offsets=%s external=%d num_new=%d",
+                    request.request_id,
+                    n,
+                    sel.prefix_extent,
+                    len(sel.non_prefix_hits),
+                    [int(h.prompt_offset) for h in sel.non_prefix_hits],
+                    external,
+                    num_new,
+                )
                 # Phase 1 loads (prefix chunks) still happen synchronously in
-                # start_load_kv; non-prefix B loading is the Batch-3 runner's job.
+                # start_load_kv; non-prefix B loading now happens there too.
                 return num_new, False
             # external == n (fully cached) or no genuinely-new tokens: fall
             # through to the prefix-only path (dense), which handles num_new==0.
@@ -383,7 +405,16 @@ class EpicConnector(KVConnectorBase_V1):
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
-        if num_external_tokens > 0 and request.request_id in self._matched_prefix:
+        # A load is pending whenever the scheduler allocated blocks for external
+        # KV (num_external_tokens > 0) and we have a match record for the request.
+        # In sparse mode the match record is the per-request sparse entry (B-only
+        # requests have an empty prefix but still need their B chunks loaded);
+        # in prefix-only mode it is _matched_prefix. Covering both here means the
+        # B-only case (no prefix hit, only non-prefix B) still registers a load.
+        if num_external_tokens > 0 and (
+            request.request_id in self._matched_prefix
+            or request.request_id in self._sparse_reqs
+        ):
             self._loads_pending[request.request_id] = request
 
     def build_connector_meta(
@@ -422,9 +453,62 @@ class EpicConnector(KVConnectorBase_V1):
                             length=length,
                         )
                     )
+                # EPIC fix (root cause): in sparse mode the non-prefix B chunks
+                # are counted into ``external`` (computed) and never forwarded,
+                # so their KV MUST be scattered into the paged cache here. We turn
+                # each non-prefix hit into a real ChunkLoadSpec so the worker's
+                # _load_chunk (scatter + PIC delta) populates the B slots. The PIC
+                # delta is new_pos - stored.old_positions; setting
+                # new_pos_start = h.prompt_offset makes the re-rotary target the
+                # chunk's actual position in THIS prompt (old_pos_start stays -1:
+                # the worker reads the real old positions from the store, exactly
+                # like the prefix case). Outside sparse mode this is inert: the
+                # non-prefix hits are only RECORDED (Phase 1 prefix-only path).
+                emit_b_loads = self._sparse_forward and req_id in self._sparse_reqs
                 for h in self._non_prefix.get(req_id, []):
+                    if emit_b_loads:
+                        length = int(h.length)
+                        dst_slots = _slot_ids_from_blocks(
+                            block_ids,
+                            self._block_size,
+                            int(h.prompt_offset),
+                            length,
+                        )
+                        load.chunks.append(
+                            ChunkLoadSpec(
+                                chunk_hash=h.chunk_hash,
+                                dst_slot_ids=dst_slots,
+                                old_pos_start=-1,  # resolved on worker from store
+                                new_pos_start=int(h.prompt_offset),
+                                length=length,
+                            )
+                        )
+                    # Always keep the raw hit record (observability / non-sparse).
                     load.non_prefix_hits.append(h)
                 meta.add_load(load)
+                # EPIC diagnostics (info, 1 line/req): chunk count + slot ranges.
+                if load.chunks:
+                    ranges = [
+                        (s.new_pos_start, s.new_pos_start + s.length)
+                        for s in load.chunks
+                    ]
+                    slot_lo = min(
+                        (min(s.dst_slot_ids) for s in load.chunks if s.dst_slot_ids),
+                        default=-1,
+                    )
+                    slot_hi = max(
+                        (max(s.dst_slot_ids) for s in load.chunks if s.dst_slot_ids),
+                        default=-1,
+                    )
+                    logger.info(
+                        "EPIC load emit req=%s chunks=%d pos_ranges=%s "
+                        "slot_range=[%d,%d]",
+                        req_id,
+                        len(load.chunks),
+                        ranges,
+                        slot_lo,
+                        slot_hi,
+                    )
 
             # ---- saves ----
             # Harvest full content chunks of this prompt that are NOT already
@@ -501,6 +585,21 @@ class EpicConnector(KVConnectorBase_V1):
             chunks = self._split_prompt_into_chunks(token_ids)
             sel = self._selection.select(None, 0, self._store, chunks)  # type: ignore[arg-type]
 
+        # EPIC fix (consistency): only emit a sparse plan when there is at least
+        # one non-prefix B hit. This matches the scheduler-side condition that
+        # registered the request as sparse (get_num_new_matched_tokens takes the
+        # sparse branch only when ``sel.non_prefix_hits`` is non-empty). Without
+        # this guard a pure-new prompt (no reuse) would emit M == every token and
+        # degenerate into a full-sequence "sparse" forward that the scheduler
+        # never marked sparse -> the two conditions diverge and M=all fires a
+        # needless single-batch gate. No non-prefix hits -> dense (None).
+        if not sel.non_prefix_hits:
+            logger.info(
+                "EPIC sparse skip req=%s: no non-prefix hits -> dense forward",
+                req_id,
+            )
+            return None
+
         # The policy's _seq_len() reads request.prompt_token_ids first; pass a
         # minimal shim carrying the exact N (the V1 Request isn't in scope in
         # build_connector_meta, only the new-req descriptor's token ids).
@@ -524,6 +623,14 @@ class EpicConnector(KVConnectorBase_V1):
         external = rec[1] if rec is not None else 0
         computed_advance = max(0, seq_len - external)
 
+        logger.info(
+            "EPIC sparse emit req=%s N=%d |M|=%d external=%d advance=%d",
+            req_id,
+            seq_len,
+            len(plan.recompute_offsets),
+            external,
+            computed_advance,
+        )
         meta.add_sparse(
             EpicReqSparse(
                 req_id=req_id,

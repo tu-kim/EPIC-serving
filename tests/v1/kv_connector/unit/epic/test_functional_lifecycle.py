@@ -500,6 +500,138 @@ def test_scenario_b_sparse_lifecycle_acb():
     assert hc in saved  # C is pure-new (fully in M) -> saved canonically.
 
 
+def test_b_only_sparse_emits_chunk_load_at_prompt_offset():
+    """B-only request (no prefix hit, only a non-prefix B hit) must emit an
+    EpicReqLoad whose ChunkLoadSpec scatters B into the dst slots at
+    block-offset == prompt_offset.
+
+    This is the root-cause regression guard: previously the connector recorded
+    the non-prefix hit but never turned it into a ChunkLoadSpec, so B's KV was
+    never loaded and M queries attended to uninitialized slots.
+    """
+    link = 8
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    conn = _make_connector(sparse=True, link=link, store=store)
+
+    # gap(new) + B(cached). No prefix hit (gap is new) -> B is the ONLY reuse.
+    gap = list(range(300, 300 + CHUNK))
+    b = list(range(700, 700 + CHUNK))
+    hb = _store_chunk(store, b, old_start=900)
+
+    tokens = gap + b  # N = 2*CHUNK ; B at prompt offset CHUNK (non-prefix).
+    n = len(tokens)
+
+    external, is_async = conn.get_num_new_matched_tokens(_Req("r0", tokens), 0)
+    assert is_async is False
+    assert external == CHUNK  # |A|=0 + |B|=CHUNK.
+
+    # The sparse match path must have registered a pending load (B-only case).
+    assert "r0" in conn._loads_pending
+
+    num_new = n - external
+    sout = _SchedOut(
+        scheduled_new_reqs=[_NewReq("r0", tokens, _block_ids_for(n))],
+        num_scheduled_tokens={"r0": num_new},
+    )
+    meta = conn.build_connector_meta(sout)
+
+    # An EpicReqLoad with exactly one ChunkLoadSpec for B at prompt_offset==CHUNK.
+    assert len(meta.loads) == 1
+    load = meta.loads[0]
+    assert load.req_id == "r0"
+    assert len(load.chunks) == 1
+    spec = load.chunks[0]
+    assert spec.chunk_hash == hb
+    assert spec.new_pos_start == CHUNK  # B lands at its prompt offset.
+    assert spec.length == CHUNK
+    # dst slots: block offset == prompt_offset (CHUNK), one full block here.
+    expected_dst = _slot_ids_from_blocks([1], BLOCK, 0, CHUNK)
+    assert spec.dst_slot_ids == expected_dst
+    # The hit is still recorded for observability.
+    assert len(load.non_prefix_hits) == 1
+    assert load.non_prefix_hits[0].prompt_offset == CHUNK
+
+
+def test_b_scatter_and_pic_at_nonprefix_offset():
+    """End-to-end worker scatter of a NON-prefix B chunk: B's K is PIC-rotated to
+    its NEW (non-prefix) prompt positions and lands in exactly its dst slots.
+
+    Extends Scenario B into the worker load path: previously B was never
+    scattered. The PIC delta = new_pos - stored.old_pos must be correct even when
+    new_pos starts at a non-zero, non-prefix offset.
+    """
+    torch.manual_seed(11)
+    link = 8
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+
+    # B's canonical KV: raw K RoPE'd at B's ORIGINAL positions p_old.
+    p_old_start = 900
+    old_positions = torch.arange(
+        p_old_start, p_old_start + CHUNK, dtype=torch.int64
+    )
+    k_raw = torch.randn(CHUNK, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float64)
+    v_raw = torch.randn(CHUNK, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float64)
+    k_old = _neox_rope_reference(k_raw, old_positions, BASE, ROTARY_DIM)
+
+    b_tokens = list(range(700, 700 + CHUNK))
+    hb = hash_chunk_tokens(b_tokens)
+    stored = StoredChunk(chunk_hash=hb, length=CHUNK, old_positions=old_positions)
+    stored.k_per_layer[LAYER] = k_old
+    stored.v_per_layer[LAYER] = v_raw
+    store.put(stored)
+
+    # Prompt: gap(new) + B(cached, non-prefix). B lands at prompt offset CHUNK.
+    gap = list(range(300, 300 + CHUNK))
+    tokens = gap + b_tokens
+    n = len(tokens)
+    b_offset = CHUNK  # B's NEW prompt position start (non-prefix).
+
+    # Scheduler side: produce the load metadata with B emitted as a ChunkLoadSpec.
+    sched = _make_connector(sparse=True, link=link, store=store, worker=False)
+    external, _ = sched.get_num_new_matched_tokens(_Req("r0", tokens), 0)
+    assert external == CHUNK
+    sout = _SchedOut(
+        scheduled_new_reqs=[_NewReq("r0", tokens, _block_ids_for(n))],
+        num_scheduled_tokens={"r0": n - external},
+    )
+    load_meta = sched.build_connector_meta(sout)
+    assert len(load_meta.loads) == 1 and len(load_meta.loads[0].chunks) == 1
+
+    # Worker side: scatter into a fresh paged cache.
+    worker = _make_connector(sparse=True, link=link, store=store, worker=True)
+    cache = _make_paged_cache(num_blocks=n // BLOCK)
+    worker.register_kv_caches({LAYER: cache})
+    worker._connector_metadata = load_meta
+
+    class _NoLayerCtx:
+        no_compile_layers = None
+
+    worker.start_load_kv(_NoLayerCtx())
+
+    # B's dst slots = block 1 (prompt offset CHUNK), one block.
+    dst = _slot_ids_from_blocks([1], BLOCK, 0, CHUNK)
+    k_bank = cache[0].reshape((n // BLOCK) * BLOCK, NUM_KV_HEADS, HEAD_SIZE)
+    v_bank = cache[1].reshape((n // BLOCK) * BLOCK, NUM_KV_HEADS, HEAD_SIZE)
+    loaded_k = k_bank[dst]
+    loaded_v = v_bank[dst]
+
+    # Ground truth: the SAME raw K, RoPE'd DIRECTLY at B's NEW prompt positions
+    # [b_offset, b_offset+CHUNK). PIC must re-align from p_old to this span.
+    new_positions = torch.arange(b_offset, b_offset + CHUNK, dtype=torch.int64)
+    k_new_truth = _neox_rope_reference(k_raw, new_positions, BASE, ROTARY_DIM)
+    assert torch.allclose(loaded_k, k_new_truth, atol=1e-6, rtol=1e-5), (
+        (loaded_k - k_new_truth).abs().max().item()
+    )
+    # V is position-independent -> byte-identical to what was stored.
+    assert torch.allclose(loaded_v, v_raw, atol=1e-9)
+
+    # B's KV landed ONLY in its block; the new gap block stays zero (it will be
+    # filled by the actual forward, not by us).
+    gap_slots = _slot_ids_from_blocks([0], BLOCK, 0, CHUNK)
+    assert torch.count_nonzero(k_bank[gap_slots]) == 0
+    assert torch.count_nonzero(v_bank[gap_slots]) == 0
+
+
 def test_scenario_b_with_real_scheduler_overrides():
     """Bind Scenario B's connector accounting to a real Scheduler instance.
 

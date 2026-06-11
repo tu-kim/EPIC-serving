@@ -117,21 +117,24 @@ def test_flag_off_no_sparse_emission():
 # --------------------------------------------------------------------------
 
 
-def test_flag_on_emits_sparse_for_pure_new_prompt():
+def test_flag_on_pure_new_prompt_is_dense_no_sparse():
+    # EPIC fix (consistency): a pure-new prompt with NO non-prefix hits must NOT
+    # emit a sparse plan -- it is a dense forward. Emitting M == every token here
+    # would diverge from the scheduler-side condition (which only marks a request
+    # sparse when there is a non-prefix B hit) and needlessly trip the
+    # single-batch gate. So: no sparse metadata at all.
     c = _make_connector(sparse=True, link=8)
-    # No prior cache -> no reuse -> M == every token (full C). is_sparse True.
-    tokens = list(range(2 * CHUNK))  # 128
+    tokens = list(range(2 * CHUNK))  # 128, all genuinely new
     sout = _SchedOut(
         scheduled_new_reqs=[_NewReq("r0", tokens, _block_ids_for(len(tokens)))],
         num_scheduled_tokens={"r0": len(tokens)},
     )
     meta = c.build_connector_meta(sout)
-    assert len(meta.sparse) == 1
-    sp = meta.sparse[0]
-    assert sp.req_id == "r0"
-    assert sp.full_seq_len == 128
-    # Pure-new prompt: M is all positions.
-    assert sp.sparse_positions == list(range(128))
+    assert meta.sparse == []
+    assert c.has_sparse_requests(meta) is False
+    # All chunks new -> all saved (dense behavior unchanged).
+    assert len(meta.saves) == 1
+    assert len(meta.saves[0].chunk_hashes) == 2
 
 
 def test_flag_on_non_prefix_reuse_emits_sparse_subset():
@@ -168,6 +171,76 @@ def test_flag_on_non_prefix_reuse_emits_sparse_subset():
     # sorted/unique invariants.
     pos = meta.sparse[0].sparse_positions
     assert pos == sorted(set(pos))
+
+
+def test_zero_non_prefix_hits_no_sparse_emission():
+    """EPIC fix 2 (consistency): a sparse-enabled request with ZERO non-prefix
+    hits must NOT emit any sparse metadata and must NOT register as sparse.
+
+    Covers two no-hit shapes:
+      * pure-new prompt (nothing cached),
+      * pure-prefix prompt (the whole prompt is a contiguous cached prefix A).
+    Both are dense; only a genuine non-prefix B turns a request sparse.
+    """
+    # (a) pure-new: nothing cached.
+    c = _make_connector(sparse=True, link=8)
+    tokens = list(range(2 * CHUNK))
+    ext, _ = c.get_num_new_matched_tokens(_Req("r0", tokens), 0)
+    assert ext == 0
+    assert "r0" not in c._sparse_reqs  # not registered sparse.
+    sout = _SchedOut(
+        scheduled_new_reqs=[_NewReq("r0", tokens, _block_ids_for(len(tokens)))],
+        num_scheduled_tokens={"r0": len(tokens)},
+    )
+    meta = c.build_connector_meta(sout)
+    assert meta.sparse == []
+    assert c.has_sparse_requests(meta) is False
+
+    # (b) pure-prefix: the whole prompt is a contiguous cached prefix.
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    c2 = _make_connector(sparse=True, link=8, store=store)
+    a = list(range(0, CHUNK))
+    b = list(range(64, 64 + CHUNK))  # contiguous after a -> folds into prefix.
+    _store_chunk(store, a)
+    _store_chunk(store, b)
+    ptoks = a + b
+    ext2, _ = c2.get_num_new_matched_tokens(_Req("r1", ptoks), 0)
+    # Whole prompt is the contiguous prefix -> no non-prefix hit, not sparse.
+    assert "r1" not in c2._sparse_reqs
+    sout2 = _SchedOut(
+        scheduled_new_reqs=[_NewReq("r1", ptoks, _block_ids_for(len(ptoks)))],
+        num_scheduled_tokens={"r1": max(0, len(ptoks) - ext2)},
+    )
+    meta2 = c2.build_connector_meta(sout2)
+    assert meta2.sparse == []
+
+
+def test_b_only_request_registers_load_pending():
+    """EPIC fix 1 (root cause): a B-only sparse request (no prefix hit) must be
+    registered as a pending load by get_num_new_matched_tokens so that
+    build_connector_meta emits the B chunk load. Previously only prefix hits set
+    _loads_pending, so a pure-B request's KV was never scattered."""
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    c = _make_connector(sparse=True, link=8, store=store)
+    gap = list(range(300, 300 + CHUNK))  # new -> no prefix.
+    b = list(range(700, 700 + CHUNK))    # cached, non-prefix.
+    hb = _store_chunk(store, b)
+    tokens = gap + b
+    ext, _ = c.get_num_new_matched_tokens(_Req("r0", tokens), 0)
+    assert ext == CHUNK
+    assert "r0" in c._loads_pending  # B-only still pending a load.
+    assert "r0" in c._sparse_reqs
+
+    sout = _SchedOut(
+        scheduled_new_reqs=[_NewReq("r0", tokens, _block_ids_for(len(tokens)))],
+        num_scheduled_tokens={"r0": len(tokens) - ext},
+    )
+    meta = c.build_connector_meta(sout)
+    assert len(meta.loads) == 1
+    chunks = meta.loads[0].chunks
+    assert len(chunks) == 1
+    assert chunks[0].chunk_hash == hb
+    assert chunks[0].new_pos_start == CHUNK
 
 
 # --------------------------------------------------------------------------
@@ -341,20 +414,23 @@ def external_to_num_new(n: int, external: int | None) -> int:
 
 
 def test_accounting_pure_new_no_reuse():
-    # No cache -> external 0, M == all N tokens, advance == N, dense-equivalent.
+    # No cache -> external 0, no non-prefix hits -> DENSE (no sparse emission).
+    # EPIC fix (consistency): the pure-new prompt is not sparse; the connector
+    # reports external 0 -> num_new == N and emits NO sparse plan, so the
+    # scheduler keeps its default contiguous accounting.
     c = _make_connector(sparse=True, link=8)
     tokens = list(range(2 * CHUNK))  # N=128
     r = _simulate_schedule(c, tokens)
     n = r["n"]
-    # external 0 (nothing cached) so the sparse match path is NOT taken; the
-    # connector reports 0 -> num_new == N. _emit_sparse still emits M==all N.
     assert r["external"] == 0
     assert r["num_new"] == n
-    assert r["m_rows"] == n          # M == every token (pure C).
-    # No external recorded -> advance falls back to seq_len == N.
-    assert r["advance"] == n
-    assert r["num_computed_after_step"] == n  # converges to N exactly.
-    # blocks allocated cover all N positions: external+num_new == N.
+    # No non-prefix hit -> no sparse plan -> the override hooks return None and
+    # the runner keeps the dense contiguous schedule.
+    assert r["m_rows"] is None
+    assert r["positions"] is None
+    assert r["advance"] is None
+    # Default advance (== num_new) lands num_computed on N: external + num_new.
+    assert r["num_computed_after_step"] == n
     assert r["external"] + r["num_new"] == n
 
 
