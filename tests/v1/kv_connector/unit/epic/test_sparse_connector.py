@@ -17,6 +17,7 @@ import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.chunk_store import (
     EpicChunkStore,
+    EpicSchedulerIndex,
     StoredChunk,
     hash_chunk_tokens,
 )
@@ -49,14 +50,51 @@ class _SchedOut:
     num_scheduled_tokens: dict = field(default_factory=dict)
 
 
+class _LiveStoreIndex(EpicSchedulerIndex):
+    """Test-only scheduler index that reads membership THROUGH a live worker
+    store. Many scheduler-logic tests populate the store AFTER building the
+    connector; a live proxy keeps those tests one-store while still routing
+    selection through the index seam (the production code path). ``register`` /
+    ``touch`` are tracked but membership defers to the backing store so post-build
+    ``_store_chunk`` calls are visible. (The dedicated 2-instance / LRU mirror
+    tests use the real ``EpicSchedulerIndex`` instead.)
+    """
+
+    def __init__(self, store: EpicChunkStore):
+        super().__init__(
+            capacity_bytes=10**8,
+            num_layers=1,
+            num_kv_heads=1,
+            head_size=1,
+            cache_dtype_size=4,
+        )
+        self._backing = store
+
+    def contains(self, chunk_hash: str) -> bool:
+        return self._backing.contains(chunk_hash) or super().contains(chunk_hash)
+
+    def get_length(self, chunk_hash: str):
+        ln = self._backing.get_length(chunk_hash)
+        return ln if ln is not None else super().get_length(chunk_hash)
+
+
 def _make_connector(*, sparse: bool, link: int = 8, store=None):
-    """Build a minimal scheduler-side EpicConnector without VllmConfig/GPU."""
+    """Build a minimal SCHEDULER-role EpicConnector without VllmConfig/GPU.
+
+    Role-split: this is the SCHEDULER instance, so it carries the mirror INDEX
+    (not the worker store). The index proxies a live worker store so chunks
+    seeded before OR after build are visible -- modeling "a worker already saved
+    these chunks" (the 2-instance reality) without per-test ordering fuss.
+    """
     c = object.__new__(EpicConnector)
     c._block_size = BLOCK
     c._chunk_size = CHUNK
-    c._store = store if store is not None else EpicChunkStore(
+    worker_store = store if store is not None else EpicChunkStore(
         capacity_bytes=10**8, pin_memory=False
     )
+    # SCHEDULER role: store is None, index mirrors the worker store.
+    c._store = None
+    c._index = _LiveStoreIndex(worker_store)
     c._matched_prefix = {}
     c._non_prefix = {}
     c._loads_pending = {}

@@ -33,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.chunk_store import (
     EpicChunkStore,
+    EpicSchedulerIndex,
     StoredChunk,
     hash_chunk_tokens,
 )
@@ -122,10 +123,42 @@ class EpicConnector(KVConnectorBase_V1):
 
         capacity = int(extra.get("epic_cpu_bytes", DEFAULT_CAPACITY_BYTES))
         world_size = vllm_config.parallel_config.world_size
-        self._store = EpicChunkStore(
-            capacity_bytes=capacity // max(world_size, 1),
-            pin_memory=bool(extra.get("epic_pin_memory", True)),
-        )
+        self._capacity_bytes = capacity // max(world_size, 1)
+
+        # --- role split (root-cause fix) -----------------------------------
+        # The connector is instantiated as TWO separate objects in TWO separate
+        # processes: SCHEDULER (EngineCore) and WORKER. The WORKER owns the real
+        # KV tensors (EpicChunkStore); the SCHEDULER only needs to KNOW which
+        # chunks are cached so its selection produces hits. Giving the scheduler
+        # its own (always-empty) store was the bug. Instead:
+        #   * WORKER   -> EpicChunkStore (holds tensors; save/load run here).
+        #   * SCHEDULER-> EpicSchedulerIndex (metadata-only deterministic mirror;
+        #     selection/dedup query this).
+        # We compute the per-chunk byte dims ONCE so the mirror's byte budget /
+        # LRU exactly tracks the worker store (see EpicSchedulerIndex).
+        dims = self._derive_chunk_byte_dims(vllm_config, kv_cache_config)
+        (self._idx_num_layers, self._idx_num_kv_heads, self._idx_head_size,
+            self._idx_dtype_size) = dims
+
+        # Both fields exist on every instance for code clarity, but only the
+        # role-appropriate one is constructed/used. (Constructing both would be
+        # harmless metadata, but None makes the role intent explicit and trips
+        # loudly if the wrong side is touched.)
+        self._store: EpicChunkStore | None = None
+        self._index: EpicSchedulerIndex | None = None
+        if role == KVConnectorRole.SCHEDULER:
+            self._index = EpicSchedulerIndex(
+                capacity_bytes=self._capacity_bytes,
+                num_layers=self._idx_num_layers,
+                num_kv_heads=self._idx_num_kv_heads,
+                head_size=self._idx_head_size,
+                cache_dtype_size=self._idx_dtype_size,
+            )
+        else:  # KVConnectorRole.WORKER
+            self._store = EpicChunkStore(
+                capacity_bytes=self._capacity_bytes,
+                pin_memory=bool(extra.get("epic_pin_memory", True)),
+            )
 
         # Scheduler-side bookkeeping: req_id -> matched prefix chunk hashes.
         self._matched_prefix: dict[str, list[tuple[str, int]]] = {}
@@ -215,6 +248,77 @@ class EpicConnector(KVConnectorBase_V1):
                 logger.warning("EPIC PICRotator unavailable, loads disabled: %s", e)
                 self._pic = None
                 self._alignment = None
+
+    # ===================== chunk byte-dim derivation =====================
+
+    @staticmethod
+    def _derive_chunk_byte_dims(
+        vllm_config: VllmConfig, kv_cache_config: "KVCacheConfig"
+    ) -> tuple[int, int, int, int]:
+        """Return (num_layers, num_kv_heads, head_size, cache_dtype_size).
+
+        These four numbers feed ``stored_chunk_nbytes`` so the scheduler index
+        and the worker store compute identical per-chunk byte sizes (==
+        ``StoredChunk.nbytes()`` for the same chunk length). We read them from the
+        ``kv_cache_config`` attention specs when available (the authoritative,
+        post-profiling source: num_kv_heads here is already TP-sharded and the
+        dtype is the real cache dtype, fp8 included), and fall back to
+        ``VllmConfig`` accessors otherwise.
+
+        Drift note: if the worker harvests KV in a dtype that differs from the
+        spec dtype (it does ``kv_layer[...].to("cpu")``, preserving the cache
+        dtype, so they match in the supported FlashAttention layout), the mirror
+        byte budget would diverge. We therefore prefer the spec dtype, which is
+        exactly the dtype the worker tensors carry.
+        """
+        from vllm.v1.kv_cache_interface import AttentionSpec
+        from vllm.utils.torch_utils import get_dtype_size
+
+        num_layers = 0
+        num_kv_heads = 0
+        head_size = 0
+        dtype_size = 0
+        try:
+            for group in kv_cache_config.kv_cache_groups:
+                spec = group.kv_cache_spec
+                if isinstance(spec, AttentionSpec):
+                    num_layers += len(group.layer_names)
+                    # All attention layers in a uniform group share dims; take
+                    # the group's spec (last write wins -- they agree).
+                    num_kv_heads = spec.num_kv_heads
+                    head_size = spec.head_size
+                    dtype_size = get_dtype_size(spec.dtype)
+        except Exception:  # noqa: BLE001
+            num_layers = 0
+
+        # Fallbacks from VllmConfig if the kv_cache_config was unavailable /
+        # non-attention (keeps the index functional; bytes stay deterministic).
+        if num_layers <= 0:
+            try:
+                num_layers = vllm_config.model_config.get_num_layers(
+                    vllm_config.parallel_config
+                )
+            except Exception:  # noqa: BLE001
+                num_layers = 1
+        if num_kv_heads <= 0:
+            try:
+                num_kv_heads = vllm_config.model_config.get_num_kv_heads(
+                    vllm_config.parallel_config
+                )
+            except Exception:  # noqa: BLE001
+                num_kv_heads = 1
+        if head_size <= 0:
+            try:
+                head_size = vllm_config.model_config.get_head_size()
+            except Exception:  # noqa: BLE001
+                head_size = 1
+        if dtype_size <= 0:
+            try:
+                dtype_size = get_dtype_size(vllm_config.model_config.dtype)
+            except Exception:  # noqa: BLE001
+                dtype_size = 2
+
+        return num_layers, num_kv_heads, head_size, dtype_size
 
     # ===================== sparse-mode safety gating (S7) =====================
 
@@ -306,6 +410,19 @@ class EpicConnector(KVConnectorBase_V1):
 
     # ===================== scheduler-side =====================
 
+    def _membership(self) -> "EpicSchedulerIndex":
+        """The scheduler-side membership oracle (the mirror index).
+
+        All scheduler-side hit tests (selection, save dedup) MUST go through this
+        so they see worker-store membership deterministically. Constructed only
+        in SCHEDULER role; asserting here makes a wrong-role call fail loudly
+        instead of silently missing against an empty worker store.
+        """
+        assert self._index is not None, (
+            "EpicConnector._membership() called off the SCHEDULER role"
+        )
+        return self._index
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -320,8 +437,10 @@ class EpicConnector(KVConnectorBase_V1):
         # SelectionStrategy (scheduler side, side-effect free): which content
         # chunks to reuse. EPIC = exact-hash prefix walk; the contiguous prefix
         # is loadable now, non-prefix hits are Phase 2 candidates (recorded).
+        # ROOT-CAUSE FIX: query the scheduler-side mirror INDEX, never the worker
+        # store (which is None in SCHEDULER role and was always empty before).
         sel = self._selection.select(
-            request, num_computed_tokens, self._store, chunks
+            request, num_computed_tokens, self._membership(), chunks
         )
 
         self._non_prefix[request.request_id] = sel.non_prefix_hits
@@ -513,12 +632,23 @@ class EpicConnector(KVConnectorBase_V1):
             # ---- saves ----
             # Harvest full content chunks of this prompt that are NOT already
             # cached, so future requests can reuse them position-independently.
+            # ROOT-CAUSE FIX: every save the scheduler emits here is registered
+            # into the scheduler-side mirror index (_membership()) IMMEDIATELY, so
+            # a later request in the SAME or a future step sees the chunk as
+            # cached -- deterministically mirroring what the worker store will
+            # hold after it executes this EpicReqSave. The dedup test below also
+            # queries the index (not the empty worker store).
+            index = self._membership()
             save = EpicReqSave(req_id=req_id)
             already_loaded = {
                 h for h, _ in self._matched_prefix.get(req_id, [])
             }
             for start, length, h in self._split_prompt_into_chunks(token_ids):
-                if h in already_loaded or self._store.contains(h):
+                if h in already_loaded or index.contains(h):
+                    # Already cached (or being loaded this step). Refresh LRU on
+                    # the index so its eviction order tracks the worker store,
+                    # which move_to_end's on the corresponding load/read.
+                    index.touch(h)
                     continue
                 # ---- S2 save guard (sparse mode only) ----
                 # In sparse forward, only the M tokens are freshly computed; the
@@ -538,6 +668,12 @@ class EpicConnector(KVConnectorBase_V1):
                 save.chunk_hashes.append(h)
                 save.chunk_slot_ids.append(slots)
                 save.chunk_positions.append(positions)
+                # Mirror the worker store membership: registering with the same
+                # byte accounting + LRU policy means the index evicts in lock-step
+                # with the worker store (same save sequence -> same eviction).
+                # old_pos == start (this prompt's positions) for diagnostics; the
+                # worker resolves the real old positions from its own store.
+                index.register(h, length, old_pos_start=start)
             if save.chunk_hashes:
                 meta.add_save(save)
 
@@ -583,7 +719,8 @@ class EpicConnector(KVConnectorBase_V1):
         sel = self._selections.get(req_id)
         if sel is None:
             chunks = self._split_prompt_into_chunks(token_ids)
-            sel = self._selection.select(None, 0, self._store, chunks)  # type: ignore[arg-type]
+            # Scheduler-side: query the mirror index, never the worker store.
+            sel = self._selection.select(None, 0, self._membership(), chunks)  # type: ignore[arg-type]
 
         # EPIC fix (consistency): only emit a sparse plan when there is at least
         # one non-prefix B hit. This matches the scheduler-side condition that
@@ -784,14 +921,46 @@ class EpicConnector(KVConnectorBase_V1):
         # the time the forward runs. Independent of whether there are loads.
         self._install_fusion_mask(forward_context, meta)
 
-        if not meta.loads or self._alignment is None:
+        if not meta.loads or self._alignment is None or self._store is None:
             return
 
         for load in meta.loads:
             for spec in load.chunks:
                 stored = self._store.get(spec.chunk_hash)
                 if stored is None:
-                    # Evicted between scheduler match and worker load.
+                    # MIRROR DRIFT (non-fatal, loud): the scheduler's index said
+                    # this chunk was cached and emitted a load for it, but the
+                    # worker store has no tensors for it. The scheduler index and
+                    # the worker store can legitimately diverge whenever the
+                    # WORKER skips a save the scheduler counted as registered --
+                    # i.e. any path where save_kv_layer returns early without
+                    # calling self._store.put():
+                    #   * unsupported / non-FlashAttention KV layout (the
+                    #     ``shape[0] == 2 and dim() == 5`` guard in save_kv_layer),
+                    #   * a chunk larger than the whole byte budget (EpicChunkStore
+                    #     .put drops it; the index also drops oversize chunks, so
+                    #     this specific case stays consistent),
+                    #   * genuine eviction races between match and load.
+                    # In all cases we skip ONLY this chunk's load (the M queries
+                    # over its positions will read uninitialized KV in sparse mode
+                    # -- a correctness risk that the error log surfaces) and let
+                    # the rest of the request load normally.
+                    # TODO(drift): report misses back to the scheduler index via
+                    # update_connector_output(KVConnectorOutput) so it can evict
+                    # the phantom entry. KVConnectorOutput has no generic
+                    # connector-data field today (outputs.py:195), so wiring a
+                    # typed miss-set is a follow-up; logging is the first-pass.
+                    logger.error(
+                        "EPIC worker load-miss (mirror drift): chunk_hash=%s "
+                        "req=%s new_pos_start=%d length=%d not in worker store; "
+                        "skipping this chunk's load (scheduler index believed it "
+                        "cached -- likely a worker save skipped for an unsupported "
+                        "KV layout). Remaining chunks load normally.",
+                        spec.chunk_hash,
+                        load.req_id,
+                        spec.new_pos_start,
+                        spec.length,
+                    )
                     continue
                 self._load_chunk(stored, spec)
 
@@ -949,7 +1118,18 @@ class EpicConnector(KVConnectorBase_V1):
         meta = self._connector_metadata
         if not isinstance(meta, EpicConnectorMetadata) or not meta.saves:
             return
+        if self._store is None:
+            # save_kv_layer only runs in WORKER role, where the store exists.
+            return
         shape = kv_layer.shape
+        # MIRROR-DRIFT SOURCE: if the KV layout is not the supported
+        # FlashAttention (2, num_blocks, block_size, ...) shape, the worker skips
+        # the save entirely and the chunk NEVER enters the worker store -- but the
+        # scheduler index already registered it (it registers unconditionally at
+        # save-emit, having no visibility into the worker layout). The result is a
+        # phantom index entry whose later load triggers the loud load-miss in
+        # start_load_kv. This is an accepted, logged drift for unsupported
+        # layouts (Phase 1 targets default FlashAttention only).
         if not (shape[0] == 2 and kv_layer.dim() == 5):
             return
         num_blocks, block_size = shape[1], shape[2]

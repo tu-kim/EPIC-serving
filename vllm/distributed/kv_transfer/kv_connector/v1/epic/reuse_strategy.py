@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
 import torch
 
@@ -57,6 +57,23 @@ if TYPE_CHECKING:
 MaskMod = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
 ]
+
+
+@runtime_checkable
+class SupportsChunkMembership(Protocol):
+    """The minimal membership surface SelectionStrategy needs.
+
+    Both the worker ``EpicChunkStore`` (real tensors) and the scheduler
+    ``EpicSchedulerIndex`` (metadata-only mirror) implement this, so selection is
+    agnostic to which side it runs on. SCHEDULER role passes the index here; the
+    WORKER role never runs selection. This is the seam that fixes the role-split
+    bug: scheduler selection queries the mirror, not its own (always-empty)
+    store.
+    """
+
+    def contains(self, chunk_hash: str) -> bool: ...
+
+    def get_length(self, chunk_hash: str) -> int | None: ...
 
 
 # ============================================================================
@@ -135,12 +152,15 @@ class SelectionStrategy(ABC):
         self,
         request: "Request",
         num_computed_tokens: int,
-        store: "EpicChunkStore",
+        store: "SupportsChunkMembership",
         chunks: list[tuple[int, int, str]],
     ) -> ReuseSelection:
         """Return prefix + non-prefix matches.
 
         Args:
+            store: any object exposing ``contains`` / ``get_length`` -- on the
+                scheduler this is the ``EpicSchedulerIndex`` mirror, never the
+                (empty) per-role ``EpicChunkStore``.
             chunks: ``[(start_token, length, chunk_hash), ...]`` full chunks of
                 the prompt (already block-aligned by the connector).
         """
@@ -253,7 +273,7 @@ class EpicSelection(SelectionStrategy):
         self,
         request: "Request",
         num_computed_tokens: int,
-        store: "EpicChunkStore",
+        store: "SupportsChunkMembership",
         chunks: list[tuple[int, int, str]],
     ) -> ReuseSelection:
         sel = ReuseSelection()
@@ -545,6 +565,7 @@ class LegoLinkMaskBuilder(FusionMaskBuilder):
 
 __all__ = [
     "MaskMod",
+    "SupportsChunkMembership",
     "ReuseSelection",
     "RecomputePlan",
     "SelectionStrategy",

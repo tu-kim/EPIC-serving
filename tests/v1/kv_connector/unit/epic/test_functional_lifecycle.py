@@ -35,8 +35,11 @@ from dataclasses import dataclass, field
 
 import torch
 
+import pickle
+
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.chunk_store import (
     EpicChunkStore,
+    EpicSchedulerIndex,
     StoredChunk,
     hash_chunk_tokens,
 )
@@ -133,24 +136,29 @@ def _make_paged_cache(num_blocks: int) -> torch.Tensor:
     )
 
 
-def _make_connector(
-    *,
-    sparse: bool,
-    link: int = 8,
-    store: EpicChunkStore | None = None,
-    worker: bool = False,
-) -> EpicConnector:
-    """Assemble an EpicConnector field-by-field (no VllmConfig / GPU).
+def _make_scheduler_index(
+    capacity_bytes: int = 10**8,
+) -> EpicSchedulerIndex:
+    """A scheduler mirror index sized for these tests' float64 1-layer KV.
 
-    ``worker=True`` additionally wires a real CPU ``PICRotator`` + alignment and
-    empty kv-cache registries so the worker load path can run.
+    Dims match the worker StoredChunk tensors built below (NUM_KV_HEADS,
+    HEAD_SIZE, float64=8 bytes, 1 layer) so the index byte budget == the worker
+    store byte budget -- the requirement for deterministic LRU mirroring.
     """
+    return EpicSchedulerIndex(
+        capacity_bytes=capacity_bytes,
+        num_layers=1,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        cache_dtype_size=8,  # float64
+    )
+
+
+def _base_connector(*, sparse: bool, link: int) -> EpicConnector:
+    """Common field init shared by both roles."""
     c = object.__new__(EpicConnector)
     c._block_size = BLOCK
     c._chunk_size = CHUNK
-    c._store = store if store is not None else EpicChunkStore(
-        capacity_bytes=10**8, pin_memory=False
-    )
     c._matched_prefix = {}
     c._non_prefix = {}
     c._loads_pending = {}
@@ -164,24 +172,92 @@ def _make_connector(
     c._mask_builder = None
     c._flex_layers_patched = set()
     c._mask_capacity = 0
-    if worker:
-        rot = PICRotator(
-            head_size=HEAD_SIZE,
-            rotary_dim=ROTARY_DIM,
-            base=BASE,
-            is_neox_style=True,
-            dtype=torch.float64,
-        )
-        c._pic = rot
-        c._alignment = PicAlignment(rot)
-        c._kv_caches = {}
-        c._layer_names = []
-    else:
-        c._pic = None
-        c._alignment = None
-        c._kv_caches = {}
-        c._layer_names = []
+    c._pic = None
+    c._alignment = None
+    c._kv_caches = {}
+    c._layer_names = []
     return c
+
+
+class _LiveStoreIndex(EpicSchedulerIndex):
+    """Scheduler index that reads membership through a live worker store.
+
+    For scheduler-logic tests that populate the store AFTER building the
+    connector, this keeps them single-store while still routing selection through
+    the production index seam. The dedicated 2-instance tests (Scenario A and the
+    new mirror tests) use a REAL mirror index seeded via the save path instead.
+    """
+
+    def __init__(self, store: EpicChunkStore):
+        super().__init__(
+            capacity_bytes=10**8,
+            num_layers=1,
+            num_kv_heads=NUM_KV_HEADS,
+            head_size=HEAD_SIZE,
+            cache_dtype_size=8,
+        )
+        self._backing = store
+
+    def contains(self, chunk_hash: str) -> bool:
+        return self._backing.contains(chunk_hash) or super().contains(chunk_hash)
+
+    def get_length(self, chunk_hash: str):
+        ln = self._backing.get_length(chunk_hash)
+        return ln if ln is not None else super().get_length(chunk_hash)
+
+
+def _make_scheduler(
+    *,
+    sparse: bool,
+    link: int = 8,
+    index: EpicSchedulerIndex | None = None,
+    live_store: EpicChunkStore | None = None,
+) -> EpicConnector:
+    """SCHEDULER-role connector: carries the mirror INDEX, no worker store.
+
+    ``live_store`` wires a through-reading proxy index for the single-store
+    scheduler-logic tests; ``index`` injects a specific mirror for the 2-instance
+    tests.
+    """
+    c = _base_connector(sparse=sparse, link=link)
+    c._store = None
+    if index is not None:
+        c._index = index
+    elif live_store is not None:
+        c._index = _LiveStoreIndex(live_store)
+    else:
+        c._index = _make_scheduler_index()
+    return c
+
+
+def _make_worker(
+    *, sparse: bool, link: int = 8, store: EpicChunkStore | None = None
+) -> EpicConnector:
+    """WORKER-role connector: carries the real STORE + a CPU PICRotator."""
+    c = _base_connector(sparse=sparse, link=link)
+    c._index = None
+    c._store = store if store is not None else EpicChunkStore(
+        capacity_bytes=10**8, pin_memory=False
+    )
+    rot = PICRotator(
+        head_size=HEAD_SIZE,
+        rotary_dim=ROTARY_DIM,
+        base=BASE,
+        is_neox_style=True,
+        dtype=torch.float64,
+    )
+    c._pic = rot
+    c._alignment = PicAlignment(rot)
+    return c
+
+
+def _pickle_roundtrip(meta: EpicConnectorMetadata) -> EpicConnectorMetadata:
+    """Cross the scheduler->worker process boundary the way V1 does: the
+    EpicConnectorMetadata is pickled in the EngineCore and unpickled in the
+    worker. Round-tripping here proves the metadata is self-contained (no live
+    object refs) -- and is what makes these tests catch the role-split bug that a
+    single shared object hid."""
+    return pickle.loads(pickle.dumps(meta))
 
 
 # ===========================================================================
@@ -190,8 +266,12 @@ def _make_connector(
 def test_scenario_a_save_then_position_independent_prefix_reuse():
     torch.manual_seed(0)
 
-    # --- request 1: a chunk that lived at original positions p_old = [10, 26) ---
-    p_old_start = 10
+    # --- request 1: the chunk lives as req1's SECOND chunk (chunk-aligned), so
+    # it harvests at original positions p_old = [CHUNK, 2*CHUNK). Chunk alignment
+    # is the connector's own save invariant (only whole CHUNK-aligned chunks are
+    # harvested), so we cannot save it at an arbitrary offset like 10. The PIC
+    # signed-delta path is still exercised: p_old != p_new (req2 reuses it at 0).
+    p_old_start = CHUNK
     old_positions = torch.arange(p_old_start, p_old_start + CHUNK, dtype=torch.int64)
     # Raw (pre-RoPE) K and the V we will store; K-in-cache is RoPE'd at p_old.
     k_raw = torch.randn(CHUNK, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float64)
@@ -201,38 +281,47 @@ def test_scenario_a_save_then_position_independent_prefix_reuse():
     chunk_tokens = list(range(5000, 5000 + CHUNK))
     chunk_hash = hash_chunk_tokens(chunk_tokens)
 
-    # Build a worker connector and stash request 1's KV via the SAVE path. We
-    # exercise ``save_kv_layer`` so the harvest -> StoredChunk wiring is covered
-    # (not a hand-built StoredChunk).
-    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
-    worker = _make_connector(sparse=False, store=store, worker=True)
+    # TWO real connector instances in (modeled) two processes: a SCHEDULER (mirror
+    # index, no store) and a WORKER (real store, no index). This is the 2-instance
+    # reality the role-split bug lived in; the single-object tests hid it.
+    sched = _make_scheduler(sparse=False)
+    worker = _make_worker(sparse=False)
+    store = worker._store
 
-    # Request 1's blocks: chunk occupies block 3 (slots 48..64). Put k_old/v_raw
-    # into a fresh paged cache, then save_kv_layer harvests those slots.
-    req1_block = 3
+    # === request 1: prefill that SAVES the chunk, driven through BOTH roles ===
+    # req1 = [filler chunk][target chunk]; target is chunk #1 at token offset
+    # CHUNK -> harvested positions [CHUNK, 2*CHUNK) == p_old.
+    filler_tokens = list(range(1000, 1000 + CHUNK))
+    req1_prompt = filler_tokens + chunk_tokens
+    req1_block_ids = _block_ids_for(len(req1_prompt))
     req1_cache = _make_paged_cache(num_blocks=8)
-    req1_slots = _slot_ids_from_blocks([req1_block], BLOCK, 0, CHUNK)
-    assert req1_slots == list(range(req1_block * BLOCK, req1_block * BLOCK + CHUNK))
-    # Scatter k_old / v_raw into req1 cache at those slots (K-bank=[0], V-bank=[1]).
+    req1_slots = _slot_ids_from_blocks(
+        req1_block_ids[0], BLOCK, p_old_start, CHUNK
+    )
     k_bank = req1_cache[0].reshape(8 * BLOCK, NUM_KV_HEADS, HEAD_SIZE)
     v_bank = req1_cache[1].reshape(8 * BLOCK, NUM_KV_HEADS, HEAD_SIZE)
     k_bank[req1_slots] = k_old
     v_bank[req1_slots] = v_raw
 
+    # 1a) SCHEDULER builds req1's metadata. Because the chunk is not yet in the
+    # mirror index, build_connector_meta emits an EpicReqSave for it AND registers
+    # it in the index (the root-cause fix: scheduler mirrors its own save
+    # decision). No prior match -> no load.
+    sout1 = _SchedOut(
+        scheduled_new_reqs=[_NewReq("req1", req1_prompt, req1_block_ids)],
+        num_scheduled_tokens={"req1": len(req1_prompt)},
+    )
+    save_meta = sched.build_connector_meta(sout1)
+    # The scheduler index now believes the chunk is cached (mirror).
+    assert sched._index.contains(chunk_hash)
+    assert any(chunk_hash in s.chunk_hashes for s in save_meta.saves)
+
+    # 1b) WORKER executes the save after a pickle round-trip (process boundary).
     worker.register_kv_caches({LAYER: req1_cache})
-
-    save_meta = EpicConnectorMetadata()
-    from vllm.distributed.kv_transfer.kv_connector.v1.epic.metadata import EpicReqSave
-
-    save = EpicReqSave(req_id="req1")
-    save.chunk_hashes.append(chunk_hash)
-    save.chunk_slot_ids.append(req1_slots)
-    save.chunk_positions.append(old_positions.tolist())
-    save_meta.add_save(save)
-    worker._connector_metadata = save_meta
+    worker._connector_metadata = _pickle_roundtrip(save_meta)
     worker.save_kv_layer(LAYER, req1_cache, attn_metadata=None)
 
-    # The store now holds the chunk with its ORIGINAL positions.
+    # The worker store now holds the chunk with its ORIGINAL positions.
     stored = store.get(chunk_hash)
     assert stored is not None
     assert stored.old_positions.tolist() == old_positions.tolist()
@@ -245,9 +334,10 @@ def test_scenario_a_save_then_position_independent_prefix_reuse():
     new_positions = torch.arange(p_new_start, p_new_start + CHUNK, dtype=torch.int64)
 
     # Scheduler side: request 2's prompt starts with the cached chunk -> prefix
-    # match of CHUNK tokens.
+    # match of CHUNK tokens. The hit comes from the SCHEDULER's own index (which
+    # req1's save populated) -- NOT from the worker store, which the scheduler
+    # cannot see. THIS is the assertion the role-split bug would fail.
     req2_prompt = chunk_tokens + list(range(7000, 7000 + CHUNK))  # chunk + new tail
-    sched = _make_connector(sparse=False, store=store, worker=False)
     num_new, is_async = sched.get_num_new_matched_tokens(
         _Req("req2", req2_prompt), num_computed_tokens=0
     )
@@ -266,6 +356,7 @@ def test_scenario_a_save_then_position_independent_prefix_reuse():
         num_scheduled_tokens={"req2": len(req2_prompt)},
     )
     load_meta = sched.build_connector_meta(sout)
+    load_meta = _pickle_roundtrip(load_meta)
     assert len(load_meta.loads) == 1
     load = load_meta.loads[0]
     assert len(load.chunks) == 1
@@ -325,7 +416,7 @@ def test_scenario_a_nonzero_new_position_full_pic():
     stored.v_per_layer[LAYER] = v_raw
     store.put(stored)
 
-    worker = _make_connector(sparse=False, store=store, worker=True)
+    worker = _make_worker(sparse=False, store=store)
     cache = _make_paged_cache(num_blocks=4)
     worker.register_kv_caches({LAYER: cache})
 
@@ -394,7 +485,7 @@ def test_scenario_b_sparse_lifecycle_acb():
     """
     link = 8
     store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
-    conn = _make_connector(sparse=True, link=link, store=store)
+    conn = _make_scheduler(sparse=True, link=link, live_store=store)
 
     a = list(range(0, CHUNK))
     cnew = list(range(300, 300 + CHUNK))  # genuinely new (breaks contiguity)
@@ -511,7 +602,7 @@ def test_b_only_sparse_emits_chunk_load_at_prompt_offset():
     """
     link = 8
     store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
-    conn = _make_connector(sparse=True, link=link, store=store)
+    conn = _make_scheduler(sparse=True, link=link, live_store=store)
 
     # gap(new) + B(cached). No prefix hit (gap is new) -> B is the ONLY reuse.
     gap = list(range(300, 300 + CHUNK))
@@ -587,7 +678,7 @@ def test_b_scatter_and_pic_at_nonprefix_offset():
     b_offset = CHUNK  # B's NEW prompt position start (non-prefix).
 
     # Scheduler side: produce the load metadata with B emitted as a ChunkLoadSpec.
-    sched = _make_connector(sparse=True, link=link, store=store, worker=False)
+    sched = _make_scheduler(sparse=True, link=link, live_store=store)
     external, _ = sched.get_num_new_matched_tokens(_Req("r0", tokens), 0)
     assert external == CHUNK
     sout = _SchedOut(
@@ -598,7 +689,7 @@ def test_b_scatter_and_pic_at_nonprefix_offset():
     assert len(load_meta.loads) == 1 and len(load_meta.loads[0].chunks) == 1
 
     # Worker side: scatter into a fresh paged cache.
-    worker = _make_connector(sparse=True, link=link, store=store, worker=True)
+    worker = _make_worker(sparse=True, link=link, store=store)
     cache = _make_paged_cache(num_blocks=n // BLOCK)
     worker.register_kv_caches({LAYER: cache})
     worker._connector_metadata = load_meta
@@ -645,7 +736,7 @@ def test_scenario_b_with_real_scheduler_overrides():
 
     link = 8
     store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
-    conn = _make_connector(sparse=True, link=link, store=store)
+    conn = _make_scheduler(sparse=True, link=link, live_store=store)
     a = list(range(0, CHUNK))
     cnew = list(range(300, 300 + CHUNK))
     b = list(range(700, 700 + CHUNK))
@@ -713,7 +804,7 @@ def test_scenario_c_flag_off_no_sparse_trace():
     """
     link = 8
     store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
-    conn = _make_connector(sparse=False, link=link, store=store)
+    conn = _make_scheduler(sparse=False, link=link, live_store=store)
 
     a = list(range(0, CHUNK))
     cnew = list(range(300, 300 + CHUNK))
@@ -752,7 +843,7 @@ def test_scenario_c_flag_off_no_sparse_trace():
 
     # Prefix-only load: only A is loadable (B's non-prefix hit is recorded but
     # not loaded in Phase 1).
-    conn2 = _make_connector(sparse=False, link=link, store=store)
+    conn2 = _make_scheduler(sparse=False, link=link, live_store=store)
     ext2, _ = conn2.get_num_new_matched_tokens(_Req("r0", tokens), 0)
     conn2.update_state_after_alloc(
         _Req("r0", tokens), blocks=None, num_external_tokens=ext2
@@ -771,6 +862,194 @@ def test_scenario_c_flag_off_no_sparse_trace():
     assert load.chunks[0].length == CHUNK
     # B's non-prefix hit is recorded on the load (tracked, not a chunk load).
     assert len(load.non_prefix_hits) >= 1
+
+
+# ===========================================================================
+# Role-split fix -- dedicated regression tests (2-instance, mirror index)
+# ===========================================================================
+def test_scheduler_index_hits_second_request_after_self_emitted_save():
+    """(a) A SCHEDULER instance must hit on the 2nd request using ONLY its own
+    mirror index, populated by the 1st request's emitted save -- WITHOUT ever
+    seeing the worker store.
+
+    This is the exact scenario the role-split bug failed: previously the
+    scheduler queried its own (empty) store and always returned 0 hits, so
+    request 2 never reused request 1's chunk.
+    """
+    sched = _make_scheduler(sparse=False)
+    assert sched._store is None  # scheduler has NO store -- index only.
+
+    chunk_tokens = list(range(2000, 2000 + CHUNK))
+    h = hash_chunk_tokens(chunk_tokens)
+
+    # Request 1: a brand-new chunk -> scheduler emits a save AND registers it.
+    r1_prompt = chunk_tokens + list(range(40, 40 + CHUNK))
+    n1, _ = sched.get_num_new_matched_tokens(_Req("r1", r1_prompt), 0)
+    assert n1 == 0  # nothing cached yet -> no reuse on the first request.
+    sout1 = _SchedOut(
+        scheduled_new_reqs=[_NewReq("r1", r1_prompt, _block_ids_for(len(r1_prompt)))],
+        num_scheduled_tokens={"r1": len(r1_prompt)},
+    )
+    sched.build_connector_meta(sout1)
+    assert sched._index.contains(h)  # the save was mirrored into the index.
+
+    # Request 2: same chunk at a (prefix) position -> hit, from the INDEX alone.
+    r2_prompt = chunk_tokens + list(range(99, 99 + CHUNK))
+    n2, _ = sched.get_num_new_matched_tokens(_Req("r2", r2_prompt), 0)
+    assert n2 == CHUNK  # the role-split bug would return 0 here.
+
+
+def test_scheduler_index_mirrors_worker_store_lru_evictions():
+    """(b) The mirror index must evict in lock-step with the worker store given
+    the same save sequence and the same byte budget.
+
+    We drive an identical sequence of chunks through (i) a worker EpicChunkStore
+    and (ii) an EpicSchedulerIndex with the SAME byte budget + dims, and assert
+    membership is identical at every step (so the scheduler never reports a hit
+    the worker has already evicted, and vice versa).
+    """
+    # Budget that holds ~3 chunks of CHUNK tokens (forces eviction at the 4th).
+    chunk_nbytes = (
+        CHUNK * (1 * 2 * NUM_KV_HEADS * HEAD_SIZE * 8) + 8 * CHUNK
+    )  # 1 layer, K+V, float64, + int64 old_positions
+    budget = 3 * chunk_nbytes + 1
+
+    store = EpicChunkStore(capacity_bytes=budget, pin_memory=False)
+    index = EpicSchedulerIndex(
+        capacity_bytes=budget,
+        num_layers=1,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        cache_dtype_size=8,
+    )
+
+    hashes = []
+    for i in range(6):  # 6 distinct chunks -> 3 evictions
+        toks = list(range(10_000 * (i + 1), 10_000 * (i + 1) + CHUNK))
+        h = hash_chunk_tokens(toks)
+        hashes.append(h)
+        # worker store put (real tensors).
+        sc = StoredChunk(
+            chunk_hash=h,
+            length=CHUNK,
+            old_positions=torch.arange(CHUNK, dtype=torch.int64),
+        )
+        sc.k_per_layer[LAYER] = torch.zeros(CHUNK, NUM_KV_HEADS, HEAD_SIZE,
+                                            dtype=torch.float64)
+        sc.v_per_layer[LAYER] = torch.zeros(CHUNK, NUM_KV_HEADS, HEAD_SIZE,
+                                            dtype=torch.float64)
+        store.put(sc)
+        # index register (metadata only) -- same byte accounting.
+        index.register(h, CHUNK, old_pos_start=0)
+
+        # Membership must be IDENTICAL after every step.
+        for hh in hashes:
+            assert store.contains(hh) == index.contains(hh), (
+                f"divergence at step {i} for {hh[:8]}"
+            )
+    # Same byte accounting => same byte total.
+    assert store.current_bytes == index.current_bytes
+    # The 3 oldest are evicted from BOTH.
+    assert not index.contains(hashes[0])
+    assert not store.contains(hashes[0])
+    assert index.contains(hashes[-1])
+    assert store.contains(hashes[-1])
+
+
+def test_worker_load_miss_logs_error_skips_and_loads_rest(caplog):
+    """(c) A worker load whose chunk is missing from the worker store (mirror
+    drift) must: log an error, skip ONLY that chunk, and load the rest normally.
+    """
+    import logging
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.metadata import (
+        ChunkLoadSpec,
+        EpicReqLoad,
+    )
+
+    torch.manual_seed(3)
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+
+    # Chunk GOOD is in the store; chunk MISSING is not (simulating a worker save
+    # that was skipped for an unsupported layout, while the scheduler index --
+    # and thus the emitted load -- still references it).
+    good_old = torch.arange(500, 500 + CHUNK, dtype=torch.int64)
+    k_raw = torch.randn(CHUNK, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float64)
+    v_raw = torch.randn(CHUNK, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float64)
+    k_old = _neox_rope_reference(k_raw, good_old, BASE, ROTARY_DIM)
+    h_good = hash_chunk_tokens(list(range(11, 11 + CHUNK)))
+    sc = StoredChunk(chunk_hash=h_good, length=CHUNK, old_positions=good_old)
+    sc.k_per_layer[LAYER] = k_old
+    sc.v_per_layer[LAYER] = v_raw
+    store.put(sc)
+    h_missing = hash_chunk_tokens(list(range(99_000, 99_000 + CHUNK)))
+
+    worker = _make_worker(sparse=False, store=store)
+    cache = _make_paged_cache(num_blocks=4)
+    worker.register_kv_caches({LAYER: cache})
+
+    # Load BOTH chunks: missing at block 0 (pos 0), good at block 1 (pos CHUNK).
+    meta = EpicConnectorMetadata()
+    load = EpicReqLoad(req_id="rX")
+    load.chunks.append(ChunkLoadSpec(
+        chunk_hash=h_missing,
+        dst_slot_ids=_slot_ids_from_blocks([0], BLOCK, 0, CHUNK),
+        old_pos_start=-1, new_pos_start=0, length=CHUNK,
+    ))
+    good_dst = _slot_ids_from_blocks([1], BLOCK, 0, CHUNK)
+    load.chunks.append(ChunkLoadSpec(
+        chunk_hash=h_good,
+        dst_slot_ids=good_dst,
+        old_pos_start=-1, new_pos_start=CHUNK, length=CHUNK,
+    ))
+    meta.add_load(load)
+    worker._connector_metadata = meta
+
+    class _NoLayerCtx:
+        no_compile_layers = None
+
+    # Capture directly off the connector's own logger object (vLLM loggers do not
+    # propagate to caplog's root handler), so the assertion is robust to logging
+    # config.
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.epic_connector import (
+        logger as epic_logger,
+    )
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture(level=logging.ERROR)
+    epic_logger.addHandler(handler)
+    prev_level = epic_logger.level
+    epic_logger.setLevel(logging.ERROR)
+    try:
+        worker.start_load_kv(_NoLayerCtx())
+    finally:
+        epic_logger.removeHandler(handler)
+        epic_logger.setLevel(prev_level)
+
+    # An ERROR was logged naming the missing hash.
+    assert any(
+        r.levelno == logging.ERROR
+        and "mirror drift" in r.getMessage()
+        and h_missing in r.getMessage()
+        for r in records
+    )
+
+    k_bank = cache[0].reshape(4 * BLOCK, NUM_KV_HEADS, HEAD_SIZE)
+    v_bank = cache[1].reshape(4 * BLOCK, NUM_KV_HEADS, HEAD_SIZE)
+    # The GOOD chunk loaded correctly (PIC to its new position CHUNK).
+    new_pos = torch.arange(CHUNK, 2 * CHUNK, dtype=torch.int64)
+    truth = _neox_rope_reference(k_raw, new_pos, BASE, ROTARY_DIM)
+    assert torch.allclose(k_bank[good_dst], truth, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(v_bank[good_dst], v_raw, atol=1e-9)
+    # The MISSING chunk's destination block stayed zero (skipped, not garbage).
+    missing_dst = _slot_ids_from_blocks([0], BLOCK, 0, CHUNK)
+    assert torch.count_nonzero(k_bank[missing_dst]) == 0
+    assert torch.count_nonzero(v_bank[missing_dst]) == 0
 
 
 if __name__ == "__main__":
