@@ -184,29 +184,83 @@ def step1_no_trace(model: str) -> None:
     _log("step1: PASS (connector-on outputs byte-identical to baseline)")
 
 
+class _in_process_engine:
+    """Run the V1 EngineCore in-process for the duration of the block.
+
+    The S7 safety gate raises ValueError inside EpicConnector.__init__
+    (SCHEDULER role), which is constructed in the EngineCore process. With the
+    default multiprocess engine the parent only sees a generic RuntimeError
+    ("Engine core initialization failed"), so the expected-failure steps below
+    could not assert on the gate message. In-process, the ValueError
+    propagates directly to this process.
+    """
+
+    def __enter__(self):
+        self._prev = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING")
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        return self
+
+    def __exit__(self, *exc):
+        if self._prev is None:
+            os.environ.pop("VLLM_ENABLE_V1_MULTIPROCESSING", None)
+        else:
+            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = self._prev
+        return False
+
+
+def _expect_gate_failure(
+    step: str, model: str, *, enforce_eager: bool, attention_backend: str,
+    must_mention: str,
+) -> None:
+    try:
+        with _in_process_engine():
+            _build_llm(
+                model,
+                kv_config=_epic_kv_config(sparse=True),
+                enforce_eager=enforce_eager,
+                attention_backend=attention_backend,
+            )
+    except ValueError as e:
+        if must_mention not in str(e):
+            _fail(
+                step,
+                f"raised ValueError but it does not mention "
+                f"{must_mention!r}: {e}",
+            )
+        _log(f"{step}: PASS (raised ValueError as expected: {str(e)[:120]}...)")
+        return
+    except Exception as e:  # noqa: BLE001
+        # Multiprocess engines surface the gate as a RuntimeError in the
+        # parent; accept it if the gate text survived in the message chain.
+        chain = []
+        cur: BaseException | None = e
+        while cur is not None:
+            chain.append(str(cur))
+            cur = cur.__cause__ or cur.__context__
+        if any(must_mention in c for c in chain):
+            _log(
+                f"{step}: PASS (gate fired in EngineCore; surfaced as "
+                f"{type(e).__name__})"
+            )
+            return
+        _fail(
+            step,
+            f"expected ValueError mentioning {must_mention!r}, got "
+            f"{type(e).__name__}: {e}",
+        )
+    _fail(step, f"{step} config did NOT raise (safety gate broken)")
+
+
 # ---------------------------------------------------------------------------
 # step2 -- sparse ON + wrong backend must fail fast
 # ---------------------------------------------------------------------------
 def step2_wrong_backend_fails(model: str) -> None:
     _log("step2: sparse ON + non-FlexAttention backend must raise ValueError")
-    try:
-        _build_llm(
-            model,
-            kv_config=_epic_kv_config(sparse=True),
-            enforce_eager=True,
-            attention_backend="FLASH_ATTN",
-        )
-    except ValueError as e:
-        if "FLEX_ATTENTION" not in str(e):
-            _fail(
-                "step2",
-                f"raised ValueError but it does not name FLEX_ATTENTION: {e}",
-            )
-        _log(f"step2: PASS (raised ValueError as expected: {str(e)[:120]}...)")
-        return
-    except Exception as e:  # noqa: BLE001
-        _fail("step2", f"expected ValueError, got {type(e).__name__}: {e}")
-    _fail("step2", "sparse ON with FLASH_ATTN did NOT raise (safety gate broken)")
+    _expect_gate_failure(
+        "step2", model,
+        enforce_eager=True, attention_backend="FLASH_ATTN",
+        must_mention="FLEX_ATTENTION",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -214,26 +268,10 @@ def step2_wrong_backend_fails(model: str) -> None:
 # ---------------------------------------------------------------------------
 def step3_non_eager_fails(model: str) -> None:
     _log("step3: sparse ON + FlexAttention + NOT eager must raise ValueError")
-    try:
-        _build_llm(
-            model,
-            kv_config=_epic_kv_config(sparse=True),
-            enforce_eager=False,
-            attention_backend="FLEX_ATTENTION",
-        )
-    except ValueError as e:
-        if "enforce_eager" not in str(e):
-            _fail(
-                "step3",
-                f"raised ValueError but it does not mention enforce_eager: {e}",
-            )
-        _log(f"step3: PASS (raised ValueError as expected: {str(e)[:120]}...)")
-        return
-    except Exception as e:  # noqa: BLE001
-        _fail("step3", f"expected ValueError, got {type(e).__name__}: {e}")
-    _fail(
-        "step3",
-        "sparse ON + FlexAttention but non-eager did NOT raise (safety gate broken)",
+    _expect_gate_failure(
+        "step3", model,
+        enforce_eager=False, attention_backend="FLEX_ATTENTION",
+        must_mention="enforce_eager",
     )
 
 
