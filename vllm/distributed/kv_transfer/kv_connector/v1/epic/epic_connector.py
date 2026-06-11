@@ -86,6 +86,46 @@ class _PromptLenShim:
         self.prompt_token_ids = token_ids
 
 
+def check_scatter_fidelity(
+    kv_cache: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    slot_ids: list[int],
+) -> tuple[bool, float, bool, float] | None:
+    """Pure read-back comparison of a scatter (Implement 2 core, CPU-testable).
+
+    Reads the ``slot_ids`` rows back out of the supported FlashAttention paged
+    layout ``(2, num_blocks, block_size, H, D)`` and compares them to the K/V
+    that *should* be there. Returns ``(k_allclose, k_maxabsdiff, v_allclose,
+    v_maxabsdiff)`` or ``None`` for an unsupported layout. No tensor is mutated.
+
+    This is the load-fidelity oracle: if scatter wrote to the wrong slots, or a
+    bad stride/reshape aliases the wrong memory, the read-back diverges from the
+    reference and ``allclose`` is False -- the exact in-situ signal the GPU smoke
+    needs to separate a layout/aliasing bug from an algorithmic (approximation)
+    one. Unit-tested on CPU by injecting a deliberate slot-offset error.
+    """
+    shape = kv_cache.shape
+    if not (shape[0] == 2 and kv_cache.dim() == 5):
+        return None
+    num_blocks, block_size = shape[1], shape[2]
+    k_bank = kv_cache[0].reshape(num_blocks * block_size, *shape[3:])
+    v_bank = kv_cache[1].reshape(num_blocks * block_size, *shape[3:])
+    slots = torch.as_tensor(slot_ids, device=kv_cache.device, dtype=torch.long)
+    k_back = k_bank[slots]
+    v_back = v_bank[slots]
+    k_ref = k.to(k_bank.dtype)
+    v_ref = v.to(v_bank.dtype)
+    k_diff = (k_back.float() - k_ref.float()).abs().max().item()
+    v_diff = (v_back.float() - v_ref.float()).abs().max().item()
+    return (
+        bool(torch.allclose(k_back, k_ref)),
+        float(k_diff),
+        bool(torch.allclose(v_back, v_ref)),
+        float(v_diff),
+    )
+
+
 def _slot_ids_from_blocks(
     block_ids: list[int], block_size: int, start_token: int, num_tokens: int
 ) -> list[int]:
@@ -179,6 +219,24 @@ class EpicConnector(KVConnectorBase_V1):
         # LegoLink link-token count: leading tokens of each non-prefix chunk
         # that are always recomputed (the boundary stitch). DESIGN §4.1.
         self._link_tokens: int = int(extra.get("epic_link_tokens", 8))
+
+        # --- DIAGNOSTIC: worker load fidelity self-check (default OFF) ------
+        # When ``epic_debug_check_load`` is on, the worker re-reads the dst KV
+        # slots IMMEDIATELY after scatter and compares them to the source
+        # StoredChunk K/V (allclose + per-layer max-abs-diff on the FIRST loaded
+        # chunk only, 1 logger.info line). This catches paged-cache layout /
+        # stride / aliasing bugs IN SITU: if scatter wrote to the wrong slots or
+        # the (2,num_blocks,block_size,H,D) reshape aliases the wrong memory, the
+        # read-back diverges from the source. The PIC re-rotary is applied to the
+        # source K before scatter, so the check compares against the ALIGNED K
+        # (the exact tensor handed to _scatter_kv), isolating scatter fidelity
+        # from alignment math. Inert (no read-back, no cost) when off.
+        self._debug_check_load: bool = bool(
+            extra.get("epic_debug_check_load", False)
+        )
+        # One-shot latch so the per-layer compare logs only for the FIRST chunk
+        # of a step (avoids log spam across many chunks/requests).
+        self._check_load_done: bool = False
 
         # --- Strategy seams (see epic/reuse_strategy.py, epic/DESIGN.md) ---
         # EPIC = exact-hash selection + PIC alignment + static LegoLink recompute.
@@ -917,6 +975,31 @@ class EpicConnector(KVConnectorBase_V1):
         if not isinstance(meta, EpicConnectorMetadata):
             return
 
+        # DIAGNOSTIC: re-arm the per-step first-chunk check-load latch.
+        self._check_load_done = False
+
+        # DIAGNOSTIC (Implement 3): log the effective sparse plan the worker
+        # received this step -- the *actual* values flowing into the runner /
+        # FlexAttention forward, so a GPU run can confirm sparse_positions and
+        # the implied seq_len match what the scheduler intended (len, first3,
+        # last3, full_seq_len, computed_advance). Cheap; only fires when sparse
+        # descriptors are present.
+        for sp in meta.sparse:
+            if not sp.is_sparse:
+                continue
+            pos = sp.sparse_positions
+            logger.info(
+                "EPIC worker sparse plan req=%s |M|=%d first3=%s last3=%s "
+                "full_seq_len=%d computed_advance=%d (implied_seq_len=%d)",
+                sp.req_id,
+                len(pos),
+                pos[:3],
+                pos[-3:],
+                sp.full_seq_len,
+                sp.computed_advance,
+                (pos[-1] + 1) if pos else 0,
+            )
+
         # Install / refresh the fusion mask BEFORE chunk loads so it is ready by
         # the time the forward runs. Independent of whether there are loads.
         self._install_fusion_mask(forward_context, meta)
@@ -1047,6 +1130,11 @@ class EpicConnector(KVConnectorBase_V1):
         length = min(stored.length, spec.length)
         if length == 0:
             return
+        # Defensive defaults: unit tests build a worker via object.__new__ and
+        # set attributes by hand, so the diagnostic flags may be absent. getattr
+        # keeps the check inert (off) on those partially-built instances.
+        debug_check = getattr(self, "_debug_check_load", False)
+        check_done = getattr(self, "_check_load_done", True)
         # Destination slots and positions.
         new_positions = torch.arange(
             spec.new_pos_start, spec.new_pos_start + length, dtype=torch.int64
@@ -1075,6 +1163,36 @@ class EpicConnector(KVConnectorBase_V1):
 
             self._scatter_kv(kv_cache, k, v, spec.dst_slot_ids[:length])
 
+            # DIAGNOSTIC (Implement 2): re-read the dst slots and compare to the
+            # exact aligned K/V we just scattered. Catches paged-cache layout /
+            # stride / aliasing bugs in situ. First loaded chunk only (latched).
+            if debug_check and not check_done:
+                self._check_scatter_fidelity(
+                    kv_cache, k, v, spec.dst_slot_ids[:length], layer_name
+                )
+
+        # End-of-chunk: arm the latch so subsequent chunks this step are silent.
+        if debug_check:
+            self._check_load_done = True
+
+    def _kv_banks(
+        self, kv_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return flat (k_bank, v_bank) views for the supported FA layout.
+
+        FlashAttention V1 layout: (2, num_blocks, block_size, num_kv_heads,
+        head_size); flattened to (num_blocks*block_size, H, D) so a slot index
+        (block_id*block_size + offset) indexes a single token row. Returns None
+        for any other layout (Phase 1 supports default FlashAttention only).
+        """
+        shape = kv_cache.shape
+        if shape[0] == 2 and kv_cache.dim() == 5:
+            num_blocks, block_size = shape[1], shape[2]
+            k_bank = kv_cache[0].reshape(num_blocks * block_size, *shape[3:])
+            v_bank = kv_cache[1].reshape(num_blocks * block_size, *shape[3:])
+            return k_bank, v_bank
+        return None
+
     def _scatter_kv(
         self,
         kv_cache: torch.Tensor,
@@ -1088,19 +1206,54 @@ class EpicConnector(KVConnectorBase_V1):
         head_size). slot = block_id*block_size + offset.
         """
         slots = torch.as_tensor(slot_ids, device=kv_cache.device, dtype=torch.long)
-        # kv_cache[0] = K bank, kv_cache[1] = V bank.
-        shape = kv_cache.shape
-        if shape[0] == 2 and kv_cache.dim() == 5:
-            num_blocks, block_size = shape[1], shape[2]
-            k_bank = kv_cache[0].reshape(num_blocks * block_size, *shape[3:])
-            v_bank = kv_cache[1].reshape(num_blocks * block_size, *shape[3:])
+        banks = self._kv_banks(kv_cache)
+        if banks is not None:
+            k_bank, v_bank = banks
             k_bank[slots] = k.to(k_bank.dtype)
             v_bank[slots] = v.to(v_bank.dtype)
         else:
             # Unknown layout: skip (Phase 1 supports default FlashAttention only).
             logger.warning_once(
-                "EPIC: unsupported kv cache layout %s; skipping load.", tuple(shape)
+                "EPIC: unsupported kv cache layout %s; skipping load.",
+                tuple(kv_cache.shape),
             )
+
+    def _check_scatter_fidelity(
+        self,
+        kv_cache: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        slot_ids: list[int],
+        layer_name: str,
+    ) -> None:
+        """Read back the dst slots and compare to the scattered K/V (Implement 2).
+
+        Logs ONE info line per call with allclose + per-bank max-abs-diff. A
+        non-zero diff means the scatter did not land in the slots we read back
+        (layout/stride/aliasing bug) -- exactly the failure class that produces a
+        correct-looking plan but a corrupted forward. Pure read-back + tensor
+        math; no effect on the cache contents.
+        """
+        result = check_scatter_fidelity(kv_cache, k, v, slot_ids)
+        if result is None:
+            logger.info(
+                "EPIC check_load layer=%s SKIP (unsupported layout %s)",
+                layer_name,
+                tuple(kv_cache.shape),
+            )
+            return
+        k_ok, k_diff, v_ok, v_diff = result
+        logger.info(
+            "EPIC check_load layer=%s n=%d k_allclose=%s k_maxabsdiff=%.3e "
+            "v_allclose=%s v_maxabsdiff=%.3e%s",
+            layer_name,
+            len(slot_ids),
+            k_ok,
+            k_diff,
+            v_ok,
+            v_diff,
+            "" if (k_ok and v_ok) else "  <-- SCATTER FIDELITY MISMATCH",
+        )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         # Phase 1 loads synchronously in start_load_kv -> nothing to wait for.

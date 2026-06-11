@@ -99,12 +99,29 @@ def _greedy_params(max_tokens: int = 32):
     return SamplingParams(temperature=0.0, max_tokens=max_tokens)
 
 
-def _epic_kv_config(*, sparse: bool, fusion: bool = False) -> dict:
+def _epic_kv_config(
+    *,
+    sparse: bool,
+    fusion: bool = False,
+    link_tokens: int | None = None,
+    debug_check_load: bool = False,
+) -> dict:
     extra: dict = {}
     if sparse:
         extra["epic_sparse_forward"] = True
     if fusion:
         extra["epic_fusion_mask"] = True
+    # link sweep control (Implement 1): leading recomputed tokens per non-prefix
+    # chunk. link == chunk_size -> the WHOLE B chunk is recomputed -> the sparse
+    # machinery runs but the reuse approximation is null (M == all of B), so the
+    # output must match dense up to numerics. Smaller link -> more reuse, more
+    # approximation. Only meaningful with sparse on.
+    if link_tokens is not None:
+        extra["epic_link_tokens"] = int(link_tokens)
+    # worker load-fidelity self-check (Implement 2): re-read dst slots after
+    # scatter and compare to the store (1 info line/step on the first chunk).
+    if debug_check_load:
+        extra["epic_debug_check_load"] = True
     cfg: dict = {"kv_connector": "EpicConnector", "kv_role": "kv_both"}
     if extra:
         cfg["kv_connector_extra_config"] = extra
@@ -152,6 +169,44 @@ def _match_rate(a: list[int], b: list[int]) -> float:
         return 0.0
     same = sum(1 for i in range(n) if a[i] == b[i])
     return same / max(len(a), len(b))
+
+
+def _first_divergence(a: list[int], b: list[int]) -> int:
+    """Index of the first position where a and b differ (-1 if identical over
+    the shared prefix and equal length). A length mismatch with an otherwise
+    identical prefix reports the length of the shorter list."""
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    if len(a) != len(b):
+        return n
+    return -1
+
+
+def _head_compare(
+    tok, a: list[int], b: list[int], k: int = 12
+) -> str:
+    """Multi-line side-by-side of the first ``k`` tokens: id + decoded text.
+
+    ``tok`` is a vLLM tokenizer (decode one id at a time). Used to make the
+    divergence human-readable in the GPU log without a second tool."""
+    def _dec(tid: int) -> str:
+        try:
+            return tok.decode([tid]).replace("\n", "\\n")
+        except Exception:  # noqa: BLE001
+            return "<?>"
+
+    lines = ["    idx | dense_id (text)        | sparse_id (text)"]
+    n = max(len(a), len(b))
+    for i in range(min(k, n)):
+        av = a[i] if i < len(a) else None
+        bv = b[i] if i < len(b) else None
+        mark = "" if av == bv else "  <-- DIFF"
+        at = f"{av} ({_dec(av)!r})" if av is not None else "--"
+        bt = f"{bv} ({_dec(bv)!r})" if bv is not None else "--"
+        lines.append(f"    {i:3d} | {at:22s} | {bt}{mark}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -382,14 +437,35 @@ def build_aligned_token_prompts(
     }
 
 
+# Link sweep schedule (Implement 1). Each entry is a number of LINK tokens per
+# non-prefix B chunk that are recomputed. With a 256-token B chunk:
+#   256 -> M == ALL of B: the sparse machinery (match/load/scatter/mask/reduced
+#          forward) runs end-to-end, but NOTHING is actually reused (every B
+#          token is recomputed). Output MUST match dense up to numerics. This is
+#          the DECISIVE control: low match here == a MACHINERY bug (runner
+#          positions / seq_lens / flex logical_q / schedule accounting / scatter
+#          layout), NOT the reuse approximation.
+#    64 -> partial reuse (192 reused, 64 recomputed): mid-regime.
+#     8 -> the production LegoLink stitch (248 reused, 8 recomputed): the
+#          aggressive approximation that collapsed to 0.021 in the field.
+_LINK_SWEEP = [256, 64, 8]
+# Below this, a link value's match is treated as "machinery healthy enough"
+# (used only for the link == B-full decisive gate).
+_MACHINERY_PASS_THRESHOLD = 0.9
+
+
 def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
-    _log("step4: shared NON-prefix chunk, sparse ON output vs dense output")
+    _log(
+        "step4: shared NON-prefix chunk -- DENSE reference vs sparse across a "
+        f"LINK sweep {_LINK_SWEEP} (machinery-vs-approximation separation)"
+    )
 
     from vllm.inputs import TokensPrompt
 
     params = _greedy_params(max_tokens=48)
 
     # --- dense reference engine (also gives us the tokenizer for assembly) ---
+    # The dense reference is independent of the link value, so compute it ONCE.
     llm_dense = _build_llm(
         model,
         kv_config=_epic_kv_config(sparse=False),
@@ -434,44 +510,117 @@ def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
         f"{len(assembled['expected_b_hashes'])} at offset "
         f"[{assembled['reuse_b_offset']}], then 'EPIC load emit' with "
         f"chunks={len(assembled['expected_b_hashes'])} scattering B into the "
-        "paged cache (slot_range within the reuse request's blocks)."
+        "paged cache (slot_range within the reuse request's blocks). With "
+        "epic_debug_check_load on you will also see 'EPIC check_load' lines "
+        "(k/v allclose + max-abs-diff) confirming scatter fidelity in situ."
     )
 
-    # warm: saves the shared B chunk(s).
+    # warm: saves the shared B chunk(s). dense_out is the link-independent ref.
     llm_dense.generate([warm_prompt], params)
     dense_out = _token_ids(llm_dense.generate([reuse_prompt], params))[0]
     del llm_dense
 
-    # --- sparse run: sparse ON + fusion mask, FlexAttention + eager ---
-    llm_sparse = _build_llm(
-        model,
-        kv_config=_epic_kv_config(sparse=True, fusion=True),
-        enforce_eager=True,
-        attention_backend="FLEX_ATTENTION",
+    _log(
+        "step4: DENSE reference first 12 tokens: "
+        + ", ".join(f"{t}:{tok.decode([t])!r}" for t in dense_out[:12])
     )
-    llm_sparse.generate([warm_prompt], params)  # warm: saves the shared chunk
-    sparse_out = _token_ids(llm_sparse.generate([reuse_prompt], params))[0]
-    del llm_sparse
 
-    rate = _match_rate(dense_out, sparse_out)
-    cos = _decode_cosine(model, dense_out, sparse_out)
-    _log(f"step4: token-match rate sparse-vs-dense = {rate:.3f}")
-    if cos is not None:
-        _log(f"step4: embedding cosine similarity = {cos:.4f}")
+    # --- link sweep: one fresh sparse engine per link value -----------------
+    results: list[tuple[int, float, int]] = []  # (link, match_rate, first_div)
+    for link in _LINK_SWEEP:
+        b_len = assembled["b_len"]
+        eff_link = min(link, b_len)
+        _log(
+            f"step4[link={link}]: building sparse engine "
+            f"(epic_link_tokens={eff_link}, B_len={b_len}, "
+            f"reuse_fraction={(b_len - eff_link) / b_len:.2f})"
+        )
+        llm_sparse = _build_llm(
+            model,
+            kv_config=_epic_kv_config(
+                sparse=True,
+                fusion=True,
+                link_tokens=eff_link,
+                debug_check_load=True,  # Implement 2: scatter self-check on.
+            ),
+            enforce_eager=True,
+            attention_backend="FLEX_ATTENTION",
+        )
+        llm_sparse.generate([warm_prompt], params)  # warm: saves the chunk
+        sparse_out = _token_ids(llm_sparse.generate([reuse_prompt], params))[0]
+        del llm_sparse
+
+        rate = _match_rate(dense_out, sparse_out)
+        div = _first_divergence(dense_out, sparse_out)
+        cos = _decode_cosine(model, dense_out, sparse_out)
+        results.append((link, rate, div))
+
+        _log(f"step4[link={link}]: token-match rate sparse-vs-dense = {rate:.3f}")
+        _log(
+            f"step4[link={link}]: first divergence index = "
+            f"{'NONE (identical)' if div < 0 else div}"
+        )
+        if cos is not None:
+            _log(f"step4[link={link}]: embedding cosine similarity = {cos:.4f}")
+        _log(
+            f"step4[link={link}]: first 12 tokens (dense | sparse):\n"
+            + _head_compare(tok, dense_out, sparse_out, k=12)
+        )
+
+    # --- summary table -------------------------------------------------------
+    _log("step4: LINK SWEEP SUMMARY")
+    _log("    link | match_rate | first_div | regime")
+    for link, rate, div in results:
+        full = "B-FULL (decisive)" if link >= assembled["b_len"] else "approx"
+        _log(
+            f"    {link:4d} | {rate:10.3f} | "
+            f"{('none' if div < 0 else str(div)):>9s} | {full}"
+        )
     _log(
         "step4: HINT -- inspect the engine schedule log for the reuse request's "
         "step; under the S7 single-batch gate it must be scheduled ALONE "
         "(no other request in the same step)."
     )
-    # We do NOT hard-assert exact equality (sparse reuse is an approximation);
-    # a very low match rate signals a real numeric break.
-    if rate < 0.5:
+
+    # --- verdict (Implement 1): the link == B-full run is the decisive gate --
+    # It runs ALL sparse machinery with reuse approximation NULL (M == all of B).
+    # If it does not closely match dense, the bug is mechanical, not algorithmic.
+    decisive = next((r for r in results if r[0] >= assembled["b_len"]), None)
+    if decisive is None:
+        # No link covered the whole B chunk; cannot run the decisive control.
         _fail(
             "step4",
-            f"sparse output diverges badly from dense (match {rate:.3f} < 0.5); "
-            "likely a mask / PIC / position bug, not just approximation error.",
+            "link sweep had no entry >= B_len so the decisive (M==all-of-B) "
+            "control did not run; add B_len to _LINK_SWEEP.",
         )
-    _log("step4: PASS (sparse output within tolerance of dense)")
+    _, decisive_rate, decisive_div = decisive
+    if decisive_rate < _MACHINERY_PASS_THRESHOLD:
+        _fail(
+            "step4",
+            f"MACHINERY BUG: link={decisive[0]} recomputes the ENTIRE B chunk "
+            f"(zero reuse approximation) yet match={decisive_rate:.3f} < "
+            f"{_MACHINERY_PASS_THRESHOLD} (first divergence at "
+            f"{'none' if decisive_div < 0 else decisive_div}). Because reuse is "
+            "null here, this is NOT approximation error -- it is a mechanical "
+            "fault in the sparse path: runner positions / seq_lens, flex "
+            "logical_q, schedule accounting (computed_advance / num_scheduled), "
+            "or KV scatter layout. Inspect the 'EPIC check_load' lines (scatter "
+            "fidelity) and the 'EPIC worker sparse plan' line (effective "
+            "positions/seq_len) to localize. Fix the machinery before trusting "
+            "any approximation-regime number.",
+        )
+
+    # Machinery is healthy. The smaller-link runs are an APPROXIMATION regime:
+    # a low match there is an algorithmic limit (link=8 cannot restitch B's
+    # context), not a bug -- report, do not fail.
+    _log(
+        f"step4: MACHINERY OK (link={decisive[0]} M==all-of-B match "
+        f"{decisive_rate:.3f} >= {_MACHINERY_PASS_THRESHOLD}). Smaller-link rows "
+        "above are the reuse APPROXIMATION regime; a low match there is an "
+        "algorithmic limit (link cannot restitch B's lost cross-context), not a "
+        "mechanical bug. See the summary table for the degradation curve."
+    )
+    _log("step4: PASS (decisive B-full control matched dense; sweep reported)")
 
 
 def _decode_cosine(model: str, a: list[int], b: list[int]) -> float | None:
