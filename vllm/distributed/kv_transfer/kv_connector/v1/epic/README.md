@@ -93,7 +93,8 @@ sampling  : 마지막 M 행 = 위치 N-1 → 정상 decode 진입 (num_computed=
   "kv_connector_extra_config":{"epic_chunk_size":256}}'
 
 # Phase 2b (sparse-forward; FlexAttention + eager 필수)
-VLLM_ATTENTION_BACKEND=FLEX_ATTENTION ... --enforce-eager \
+# v0.22에서 VLLM_ATTENTION_BACKEND env var는 제거됨 -> --attention-backend 사용.
+... --attention-backend FLEX_ATTENTION --enforce-eager \
 --kv-transfer-config '{"kv_connector":"EpicConnector","kv_role":"kv_both",
   "kv_connector_extra_config":{"epic_chunk_size":256,
     "epic_sparse_forward":true,"epic_fusion_mask":true,"epic_link_tokens":8}}'

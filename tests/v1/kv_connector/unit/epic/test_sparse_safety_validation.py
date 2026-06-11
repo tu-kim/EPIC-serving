@@ -60,7 +60,7 @@ def test_flash_attention_backend_rejected():
     with pytest.raises(ValueError) as exc:
         _validate(_config("FLASH_ATTN", enforce_eager=True))
     msg = str(exc.value)
-    assert "VLLM_ATTENTION_BACKEND=FLEX_ATTENTION" in msg
+    assert "--attention-backend FLEX_ATTENTION" in msg
     assert "FLASH_ATTN" in msg
 
 
@@ -68,7 +68,7 @@ def test_auto_backend_rejected():
     # backend None == auto selection -> not guaranteed FlexAttention -> reject.
     with pytest.raises(ValueError) as exc:
         _validate(_config(None, enforce_eager=True))
-    assert "VLLM_ATTENTION_BACKEND=FLEX_ATTENTION" in str(exc.value)
+    assert "--attention-backend FLEX_ATTENTION" in str(exc.value)
 
 
 # --------------------------------------------------------------------------
@@ -88,7 +88,7 @@ def test_backend_checked_before_eager():
     # Both wrong: the backend error (the more fundamental misconfig) wins.
     with pytest.raises(ValueError) as exc:
         _validate(_config("FLASH_ATTN", enforce_eager=False))
-    assert "VLLM_ATTENTION_BACKEND=FLEX_ATTENTION" in str(exc.value)
+    assert "--attention-backend FLEX_ATTENTION" in str(exc.value)
 
 
 if __name__ == "__main__":

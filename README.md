@@ -61,7 +61,9 @@ uv pip install pytest tblib
 ### 3. GPU functional verification (run this first on a CUDA box)
 
 ```bash
-VLLM_ATTENTION_BACKEND=FLEX_ATTENTION .venv/bin/python \
+# The smoke script selects FlexAttention itself (attention_backend kwarg);
+# no env var needed. VLLM_ATTENTION_BACKEND was removed in vLLM v0.22.
+.venv/bin/python \
   tests/v1/kv_connector/unit/epic/gpu_smoke.py --model meta-llama/Llama-3.2-1B-Instruct
 ```
 
@@ -78,8 +80,9 @@ config gates → 4) real sparse run vs dense comparison.
     "kv_connector_extra_config":{"epic_chunk_size":256}}'
 
 # Full EPIC: non-prefix reuse + sparse-forward (FlexAttention + eager required)
-VLLM_ATTENTION_BACKEND=FLEX_ATTENTION .venv/bin/python -m vllm.entrypoints.openai.api_server \
+.venv/bin/python -m vllm.entrypoints.openai.api_server \
   --model meta-llama/Llama-3.2-1B-Instruct --enforce-eager \
+  --attention-backend FLEX_ATTENTION \
   --kv-transfer-config '{"kv_connector":"EpicConnector","kv_role":"kv_both",
     "kv_connector_extra_config":{"epic_chunk_size":256,"epic_sparse_forward":true,
       "epic_fusion_mask":true,"epic_link_tokens":8}}'

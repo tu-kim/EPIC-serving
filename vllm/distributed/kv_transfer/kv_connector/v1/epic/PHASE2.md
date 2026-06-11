@@ -39,8 +39,11 @@ Three guards, all active only when `epic_sparse_forward` is on:
    consumes; FlashAttention (the V1 default) would silently ignore it and return
    wrong results. So the connector *validates* (does not silently mutate) that
    `vllm_config.attention_config.backend.name == "FLEX_ATTENTION"`; otherwise it
-   raises a `ValueError` instructing the user to set
-   `VLLM_ATTENTION_BACKEND=FLEX_ATTENTION`. It deliberately does **not** override
+   raises a `ValueError` instructing the user to pass
+   `--attention-backend FLEX_ATTENTION` (serving) or
+   `attention_backend="FLEX_ATTENTION"` (offline LLM/EngineArgs). The legacy
+   `VLLM_ATTENTION_BACKEND` env var was removed in vLLM v0.22 and is silently
+   ignored. The connector deliberately does **not** override
    backend auto-selection — flipping vLLM's platform-level backend choice from a
    KV connector would be far more invasive and fragile than a config assertion.
    The same method also requires `enforce_eager` (first-pass safety; see #3).
@@ -82,27 +85,29 @@ behavior) has **not** run on a GPU. To verify, on a CUDA box with EPIC installed
 # 0. Build (heavy; CUDA compile). Do NOT run on the CPU dev box.
 VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
 
+# NOTE: VLLM_ATTENTION_BACKEND was removed in vLLM v0.22 (silently ignored).
+#       Select the backend with the --attention-backend CLI arg instead.
+
 # 1. Sanity: sparse OFF must be identical to baseline (no-trace check).
-VLLM_ATTENTION_BACKEND=FLEX_ATTENTION python -m vllm.entrypoints.openai.api_server \
-    --model <model> --enforce-eager \
+python -m vllm.entrypoints.openai.api_server \
+    --model <model> --enforce-eager --attention-backend FLEX_ATTENTION \
     --kv-transfer-config '{"kv_connector":"EpicConnector","kv_role":"kv_both"}'
 #    -> behaves exactly like no connector for outputs (only saves chunks).
 
 # 2. Safety gate: sparse ON but WRONG backend must fail fast.
-python -c 'import os; os.environ.pop("VLLM_ATTENTION_BACKEND", None)' ; \
-VLLM_ATTENTION_BACKEND=FLASH_ATTN python -m vllm.entrypoints.openai.api_server \
-    --model <model> --enforce-eager \
+python -m vllm.entrypoints.openai.api_server \
+    --model <model> --enforce-eager --attention-backend FLASH_ATTN \
     --kv-transfer-config '{"kv_connector":"EpicConnector","kv_role":"kv_both","kv_connector_extra_config":{"epic_sparse_forward":true}}'
-#    -> EXPECT a ValueError naming VLLM_ATTENTION_BACKEND=FLEX_ATTENTION.
+#    -> EXPECT a ValueError naming --attention-backend FLEX_ATTENTION.
 
 # 3. Safety gate: sparse ON, FlexAttention, but NOT eager must fail fast.
-VLLM_ATTENTION_BACKEND=FLEX_ATTENTION python -m vllm.entrypoints.openai.api_server \
-    --model <model> \
+python -m vllm.entrypoints.openai.api_server \
+    --model <model> --attention-backend FLEX_ATTENTION \
     --kv-transfer-config '{"kv_connector":"EpicConnector","kv_role":"kv_both","kv_connector_extra_config":{"epic_sparse_forward":true}}'
 #    -> EXPECT a ValueError about enforce_eager.
 
 # 4. Real sparse run: FlexAttention + eager + sparse ON.
-VLLM_ATTENTION_BACKEND=FLEX_ATTENTION python -m vllm.entrypoints.openai.api_server \
+python -m vllm.entrypoints.openai.api_server --attention-backend FLEX_ATTENTION \
     --model <model> --enforce-eager \
     --kv-transfer-config '{"kv_connector":"EpicConnector","kv_role":"kv_both","kv_connector_extra_config":{"epic_sparse_forward":true,"epic_fusion_mask":true}}'
 #    Drive two requests that share a NON-prefix chunk (e.g. RAG: same retrieved

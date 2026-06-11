@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
@@ -654,10 +653,13 @@ def engine_kwargs_for_mode(
     """Construct LLM(**kwargs) for a mode.
 
     Fairness: all three modes use enforce_eager. The attention backend is set
-    via the VLLM_ATTENTION_BACKEND env var (see ``apply_backend_env``) -- EPIC
-    requires FLEX_ATTENTION; the baselines use it too by default so the only
-    difference measured is the algorithm. ``baseline_backend`` (full/prefix
+    via the ``attention_backend`` LLM/EngineArgs kwarg (see ``backend_for_mode``)
+    -- EPIC requires FLEX_ATTENTION; the baselines use it too by default so the
+    only difference measured is the algorithm. ``baseline_backend`` (full/prefix
     only) lets a user opt a baseline into FLASH_ATTN for an extra reference.
+
+    Note: the legacy ``VLLM_ATTENTION_BACKEND`` env var was removed in vLLM
+    v0.22 and is silently ignored, so the backend MUST be passed as a kwarg.
 
     Prefix-caching toggle:
       * prefix / epic : enable_prefix_caching=True.
@@ -681,11 +683,17 @@ def engine_kwargs_for_mode(
     )
     if cfg is not None:
         kwargs["kv_transfer_config"] = cfg
+    # v0.22 removed VLLM_ATTENTION_BACKEND; select the backend through the
+    # EngineArgs/AttentionConfig surface. The string is normalized by
+    # AttentionConfig.validate_backend_before (upper-cased enum lookup).
+    kwargs["attention_backend"] = backend_for_mode(mode, baseline_backend)
     return kwargs
 
 
 def backend_for_mode(mode: str, baseline_backend: Optional[str]) -> str:
-    """Attention backend env value for a mode.
+    """Attention backend name for a mode (passed as the ``attention_backend``
+    LLM/EngineArgs kwarg; NOT an env var -- VLLM_ATTENTION_BACKEND was removed
+    in vLLM v0.22).
 
     epic           -> FLEX_ATTENTION (hard requirement; connector fails closed).
     full / prefix  -> FLEX_ATTENTION by default (fairness), or the user-supplied
@@ -694,12 +702,6 @@ def backend_for_mode(mode: str, baseline_backend: Optional[str]) -> str:
     if mode == "epic":
         return "FLEX_ATTENTION"
     return baseline_backend or "FLEX_ATTENTION"
-
-
-def apply_backend_env(mode: str, baseline_backend: Optional[str]) -> str:
-    backend = backend_for_mode(mode, baseline_backend)
-    os.environ["VLLM_ATTENTION_BACKEND"] = backend
-    return backend
 
 
 # ---------------------------------------------------------------------------

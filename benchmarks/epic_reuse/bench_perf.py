@@ -56,7 +56,6 @@ from benchmarks.epic_reuse.common import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_LINK_TOKENS,
     BenchRequest,
-    apply_backend_env,
     backend_for_mode,
     engine_kwargs_for_mode,
     expand_mode_specs,
@@ -150,7 +149,7 @@ def run_single_mode(
     measure_reps: int,
     baseline_backend: str | None,
 ) -> list[CellResult]:
-    backend = apply_backend_env(family, baseline_backend)
+    backend = backend_for_mode(family, baseline_backend)
     csv_link = link_tokens if family == "epic" else -1
     print(f"[epic-perf] mode={label} (family={family}, link_k={csv_link}) "
           f"backend={backend}")

@@ -54,7 +54,7 @@ from benchmarks.epic_reuse.common import (
     DEFAULT_LINK_TOKENS,
     BenchRequest,
     answer_containment,
-    apply_backend_env,
+    backend_for_mode,
     engine_kwargs_for_mode,
     expand_mode_specs,
     parse_int_list,
@@ -142,7 +142,7 @@ def run_single_mode(
     """Generate per-request outputs for one mode spec; dump them to a side JSONL
     so the orchestrator can do the cross-mode (exact-match / prefix) comparison.
     """
-    backend = apply_backend_env(family, None)
+    backend = backend_for_mode(family, None)
     csv_link = link_tokens if family == "epic" else -1
     print(f"[epic-acc] mode={label} (family={family}, link_k={csv_link}) "
           f"backend={backend}")

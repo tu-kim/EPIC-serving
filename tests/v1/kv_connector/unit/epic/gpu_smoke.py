@@ -24,9 +24,11 @@ Steps (run in order; stop at the first failure):
          isolation.
 
 Usage:
-    # On a CUDA box, after `VLLM_USE_PRECOMPILED=1 uv pip install -e .`:
-    VLLM_ATTENTION_BACKEND=FLEX_ATTENTION \
-        .venv/bin/python tests/v1/kv_connector/unit/epic/gpu_smoke.py \
+    # On a CUDA box, after `VLLM_USE_PRECOMPILED=1 uv pip install -e .`.
+    # The script selects the FlexAttention backend itself via the
+    # ``attention_backend="FLEX_ATTENTION"`` LLM kwarg (the legacy
+    # VLLM_ATTENTION_BACKEND env var was removed in vLLM v0.22):
+    .venv/bin/python tests/v1/kv_connector/unit/epic/gpu_smoke.py \
         --model meta-llama/Llama-3.2-1B-Instruct
 
     # Run a single step (e.g. just the safety gates):
@@ -109,7 +111,13 @@ def _epic_kv_config(*, sparse: bool, fusion: bool = False) -> dict:
     return cfg
 
 
-def _build_llm(model: str, *, kv_config: dict | None, enforce_eager: bool = True):
+def _build_llm(
+    model: str,
+    *,
+    kv_config: dict | None,
+    enforce_eager: bool = True,
+    attention_backend: str | None = None,
+):
     from vllm import LLM
 
     kwargs: dict = dict(
@@ -120,6 +128,11 @@ def _build_llm(model: str, *, kv_config: dict | None, enforce_eager: bool = True
     )
     if kv_config is not None:
         kwargs["kv_transfer_config"] = kv_config
+    if attention_backend is not None:
+        # v0.22 removed VLLM_ATTENTION_BACKEND; select the backend through the
+        # EngineArgs/AttentionConfig surface. The string is normalized by
+        # AttentionConfig.validate_backend_before (upper-cased enum lookup).
+        kwargs["attention_backend"] = attention_backend
     return LLM(**kwargs)
 
 
@@ -176,11 +189,12 @@ def step1_no_trace(model: str) -> None:
 # ---------------------------------------------------------------------------
 def step2_wrong_backend_fails(model: str) -> None:
     _log("step2: sparse ON + non-FlexAttention backend must raise ValueError")
-    prev = os.environ.get("VLLM_ATTENTION_BACKEND")
-    os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
     try:
         _build_llm(
-            model, kv_config=_epic_kv_config(sparse=True), enforce_eager=True
+            model,
+            kv_config=_epic_kv_config(sparse=True),
+            enforce_eager=True,
+            attention_backend="FLASH_ATTN",
         )
     except ValueError as e:
         if "FLEX_ATTENTION" not in str(e):
@@ -192,11 +206,6 @@ def step2_wrong_backend_fails(model: str) -> None:
         return
     except Exception as e:  # noqa: BLE001
         _fail("step2", f"expected ValueError, got {type(e).__name__}: {e}")
-    finally:
-        if prev is None:
-            os.environ.pop("VLLM_ATTENTION_BACKEND", None)
-        else:
-            os.environ["VLLM_ATTENTION_BACKEND"] = prev
     _fail("step2", "sparse ON with FLASH_ATTN did NOT raise (safety gate broken)")
 
 
@@ -205,11 +214,12 @@ def step2_wrong_backend_fails(model: str) -> None:
 # ---------------------------------------------------------------------------
 def step3_non_eager_fails(model: str) -> None:
     _log("step3: sparse ON + FlexAttention + NOT eager must raise ValueError")
-    prev = os.environ.get("VLLM_ATTENTION_BACKEND")
-    os.environ["VLLM_ATTENTION_BACKEND"] = "FLEX_ATTENTION"
     try:
         _build_llm(
-            model, kv_config=_epic_kv_config(sparse=True), enforce_eager=False
+            model,
+            kv_config=_epic_kv_config(sparse=True),
+            enforce_eager=False,
+            attention_backend="FLEX_ATTENTION",
         )
     except ValueError as e:
         if "enforce_eager" not in str(e):
@@ -221,11 +231,6 @@ def step3_non_eager_fails(model: str) -> None:
         return
     except Exception as e:  # noqa: BLE001
         _fail("step3", f"expected ValueError, got {type(e).__name__}: {e}")
-    finally:
-        if prev is None:
-            os.environ.pop("VLLM_ATTENTION_BACKEND", None)
-        else:
-            os.environ["VLLM_ATTENTION_BACKEND"] = prev
     _fail(
         "step3",
         "sparse ON + FlexAttention but non-eager did NOT raise (safety gate broken)",
@@ -237,7 +242,6 @@ def step3_non_eager_fails(model: str) -> None:
 # ---------------------------------------------------------------------------
 def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
     _log("step4: shared NON-prefix chunk, sparse ON output vs dense output")
-    os.environ["VLLM_ATTENTION_BACKEND"] = "FLEX_ATTENTION"
 
     # Request 1: a prompt whose MIDDLE is the shared passage -> EPIC saves the
     # passage chunk(s). Request 2: a DIFFERENT prompt whose middle is the SAME
@@ -251,8 +255,13 @@ def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
     )
     params = _greedy_params(max_tokens=48)
 
-    # --- dense reference: sparse OFF (connector still saves, but dense forward) ---
-    llm_dense = _build_llm(model, kv_config=_epic_kv_config(sparse=False))
+    # --- dense reference: sparse OFF (connector still saves, but dense forward).
+    # Use the same backend as the sparse run so the comparison is apples-to-apples.
+    llm_dense = _build_llm(
+        model,
+        kv_config=_epic_kv_config(sparse=False),
+        attention_backend="FLEX_ATTENTION",
+    )
     llm_dense.generate([warm_prompt], params)  # warm: saves the shared chunk
     dense_out = _token_ids(llm_dense.generate([reuse_prompt], params))[0]
     del llm_dense
@@ -262,6 +271,7 @@ def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
         model,
         kv_config=_epic_kv_config(sparse=True, fusion=True),
         enforce_eager=True,
+        attention_backend="FLEX_ATTENTION",
     )
     llm_sparse.generate([warm_prompt], params)  # warm: saves the shared chunk
     sparse_out = _token_ids(llm_sparse.generate([reuse_prompt], params))[0]

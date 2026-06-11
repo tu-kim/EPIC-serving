@@ -56,9 +56,11 @@ Two ways to request a k-sweep:
 `reuse-only` (= naive reuse, recompute none) maps to k=0 in the k-axis tables and
 plots, so it shares the k=0 column with `epic@0` but carries its own label.
 
-**Fairness:** all three modes run `VLLM_ATTENTION_BACKEND=FLEX_ATTENTION` +
+**Fairness:** all three modes run the `FLEX_ATTENTION` backend +
 `enforce_eager` (EPIC's hard requirement, applied to the baselines too, so only
-the algorithm differs). The harness sets the backend env per mode automatically.
+the algorithm differs). The harness passes the backend per mode automatically
+via the `attention_backend` LLM/EngineArgs kwarg (the legacy
+`VLLM_ATTENTION_BACKEND` env var was removed in vLLM v0.22).
 `--baseline-backend FLASH_ATTN` adds a non-fair reference for the baselines.
 
 ## GPU requirements
