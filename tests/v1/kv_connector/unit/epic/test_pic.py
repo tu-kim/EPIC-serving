@@ -116,3 +116,77 @@ def test_negative_delta_supported():
     k_truth = _neox_rope_reference(k_raw, new_pos, 10000.0, 16)
     rot = PICRotator(head_size=16, rotary_dim=16, base=10000.0, dtype=torch.float64)
     assert torch.allclose(rot.rotate_keys(k_old, old_pos, new_pos), k_truth, atol=1e-6)
+
+
+# Llama-3.1/3.2 rope_scaling type="llama3" (GPU blocker: loads were disabled
+# for these models). llama3 scaling is a static inv_freq transform; positions
+# are not scaled, so delta rotation stays exact.
+_LLAMA31_SCALING = {
+    "rope_type": "llama3",
+    "factor": 8.0,
+    "low_freq_factor": 1.0,
+    "high_freq_factor": 4.0,
+    "original_max_position_embeddings": 8192,
+}
+
+
+def test_llama3_inv_freq_matches_vllm_reference():
+    """PICRotator's llama3 inv_freq must equal vLLM's
+    Llama3RotaryEmbedding._compute_inv_freq exactly (float64 vs float32 ref)."""
+    from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
+        Llama3RotaryEmbedding,
+    )
+
+    head, rdim, base = 128, 128, 500000.0
+    # object.__new__: skip CustomOp __init__ (needs vLLM config context);
+    # _compute_inv_freq only reads the attrs set below.
+    ref = object.__new__(Llama3RotaryEmbedding)
+    ref.rotary_dim = rdim
+    ref.scaling_factor = _LLAMA31_SCALING["factor"]
+    ref.low_freq_factor = _LLAMA31_SCALING["low_freq_factor"]
+    ref.high_freq_factor = _LLAMA31_SCALING["high_freq_factor"]
+    ref.orig_max_position = _LLAMA31_SCALING[
+        "original_max_position_embeddings"
+    ]
+    ref_inv = ref._compute_inv_freq(base).to(torch.float64)
+
+    rot = PICRotator(
+        head_size=head, rotary_dim=rdim, base=base,
+        rope_scaling=dict(_LLAMA31_SCALING),
+    )
+    assert torch.allclose(rot.register_inv_freq, ref_inv, rtol=1e-6, atol=0.0)
+    # the transform must actually change something (not the unscaled freqs)
+    unscaled = PICRotator(head_size=head, rotary_dim=rdim, base=base)
+    assert not torch.allclose(rot.register_inv_freq, unscaled.register_inv_freq)
+
+
+def test_llama3_delta_rotation_matches_direct_rope():
+    """R(new-old)·R(old)·k == R(new)·k with llama3-scaled frequencies."""
+    torch.manual_seed(7)
+    head, rdim, base = 64, 64, 500000.0
+    rot = PICRotator(
+        head_size=head, rotary_dim=rdim, base=base,
+        dtype=torch.float64, rope_scaling=dict(_LLAMA31_SCALING),
+    )
+    n, kv_heads = 16, 2
+    k_raw = torch.randn(n, kv_heads, head, dtype=torch.float64)
+    old_pos = torch.arange(1000, 1000 + n)
+    new_pos = torch.arange(40, 40 + n)  # negative delta too
+
+    inv = rot.register_inv_freq
+
+    def direct(k, pos):
+        # same math as _neox_rope_reference but with llama3-scaled inv_freq
+        freqs = torch.einsum("i,j->ij", pos.to(torch.float64), inv)
+        cos, sin = freqs.cos().unsqueeze(1), freqs.sin().unsqueeze(1)
+        out = k.clone().to(torch.float64)
+        x1, x2 = torch.chunk(out[..., :rdim], 2, dim=-1)
+        out[..., :rdim] = torch.cat(
+            (x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1
+        )
+        return out
+
+    k_old = direct(k_raw, old_pos)
+    k_expected = direct(k_raw, new_pos)
+    k_rotated = rot.rotate_keys(k_old, old_pos, new_pos)
+    assert torch.allclose(k_rotated, k_expected, atol=1e-9)

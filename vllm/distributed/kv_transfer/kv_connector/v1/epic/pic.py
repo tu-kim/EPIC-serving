@@ -78,10 +78,41 @@ class PICRotator:
                 factor = rope_scaling.get("factor", 1.0)
                 if rope_type == "linear":
                     self._scaling_factor = float(factor)
+            elif rope_type == "llama3":
+                # Llama-3.1/3.2 rope scaling is a STATIC per-dim transformation
+                # of inv_freq (positions themselves are NOT scaled), so the
+                # delta-rotation identity R(a)R(b)=R(a+b) still holds exactly
+                # per frequency dim -- PIC works unchanged with the transformed
+                # inv_freq. Formula mirrors vLLM's
+                # Llama3RotaryEmbedding._compute_inv_freq
+                # (model_executor/layers/rotary_embedding/llama3_rope.py:33-53)
+                # and is verified against it by unit test.
+                import math
+
+                factor = float(rope_scaling["factor"])
+                low = float(rope_scaling["low_freq_factor"])
+                high = float(rope_scaling["high_freq_factor"])
+                orig_max = int(rope_scaling["original_max_position_embeddings"])
+                low_freq_wavelen = orig_max / low
+                high_freq_wavelen = orig_max / high
+                wave_len = 2 * math.pi / inv_freq
+                if low != high:
+                    smooth = (orig_max / wave_len - low) / (high - low)
+                else:
+                    smooth = torch.zeros_like(wave_len)
+                inv_freq = torch.where(
+                    wave_len < high_freq_wavelen,
+                    inv_freq,
+                    torch.where(
+                        wave_len > low_freq_wavelen,
+                        inv_freq / factor,
+                        (1 - smooth) * inv_freq / factor + smooth * inv_freq,
+                    ),
+                )
             else:
                 raise NotImplementedError(
-                    f"PICRotator Phase 1 does not support rope_scaling "
-                    f"type={rope_type!r}; only linear scaling. "
+                    f"PICRotator does not support rope_scaling "
+                    f"type={rope_type!r}; supported: linear, llama3. "
                     f"See epic/PHASE2.md."
                 )
         self.register_inv_freq = inv_freq

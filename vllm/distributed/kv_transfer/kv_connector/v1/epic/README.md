@@ -128,7 +128,7 @@ sampling  : 마지막 M 행 = 위치 N-1 → 정상 decode 진입 (num_computed=
 - sparse 혼합 배치 (현재 단독 배치; fusion_mask 2-D 확장 필요).
 - CacheBlend 전략 구현 (`IdentityAlignment` + 동적 recompute의 2-phase pre-pass —
   인터페이스는 `reuse_strategy.py`에 준비됨).
-- rope_scaling 확장 (현재 linear만; llama3/YaRN 미지원 시 로드만 비활성).
+- rope_scaling 확장 (linear·llama3 지원 — Llama-3.1/3.2 동작; YaRN/longrope 미지원 시 로드만 비활성).
 
 ## 8. 원본 EPIC과의 대응표
 
