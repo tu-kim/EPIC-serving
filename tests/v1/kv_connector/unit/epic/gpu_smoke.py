@@ -17,11 +17,25 @@ Steps (run in order; stop at the first failure):
          ``ValueError`` at engine construction (S7 safety gate).
   step3  sparse ON + FlexAttention but NOT eager -- must raise ``ValueError``
          (S7 safety gate).
-  step4  two requests sharing a NON-prefix chunk: request 1 prefills + saves the
-         chunk, request 2 (A+C+B layout, shared chunk in the MIDDLE) runs with
-         sparse ON; compare its output to the dense (sparse OFF) run and print
-         token-match rate + a hint to inspect the schedule log for single-batch
-         isolation.
+  step4  NEEDLE probe. A shared NON-prefix passage B carries K secret-code
+         needles ("The secret code for <subject> is <4-digit>."). The reuse
+         prompt's tail Q asks for one code ("...the secret code for <subject>?
+         Answer:"). A warm request seeds B's chunks into the EPIC store; the
+         reuse request (different head A, B in the MIDDLE, Q at the tail) is
+         then answered DENSE (reference) and SPARSE (across a link sweep).
+         Discriminative by construction: filler is a rotating pool of real
+         words (NOT blank space), so dense and sparse outputs are not trivially
+         identical. Verdicts (mechanical):
+           * dense must output the answer code -> else PROBE INVALID (FAIL:
+             the probe itself is broken, model/length problem, not EPIC).
+           * dense distinct-token count >= 4 -> else non-discriminative (FAIL).
+           * sparse must ENGAGE in-band (EpicConnector.debug_counters:
+             sparse_match>=1 and chunks_loaded>=1) -> else SPARSE DID NOT
+             ENGAGE (FAIL). Requires the in-process engine
+             (VLLM_ENABLE_V1_MULTIPROCESSING=0) so scheduler+worker share state.
+           * link=full-B (decisive): needle hit AND match>=0.9 -> PASS gate.
+           * link=64/8: needle hit + match + first-divergence REPORTED only
+             (approximation regime; a miss there is an algorithmic limit).
 
 Usage:
     # On a CUDA box, after `VLLM_USE_PRECOMPILED=1 uv pip install -e .`.
@@ -72,6 +86,20 @@ _PROMPT_HEAD = "Question one preamble unrelated text goes right here. "
 _PROMPT_TAIL_1 = " Now answer: what does the mitochondria do?"
 _PROMPT_TAIL_2 = " Given the above, summarize the cell's energy source."
 
+# Discriminative filler word pool (NOT blank space). Mirrors
+# benchmarks/epic_reuse/common._WORD_POOL: real, distinct words so padding a
+# prompt up to a chunk boundary produces ordinary text rather than a run of
+# identical space tokens. With blank-space filler both dense and sparse degrade
+# to emitting the same blank token -> a trivial 1.000 match with NO
+# discriminative power. Rotating real words keeps the prompt a real prompt.
+_FILLER_WORDS = (
+    "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima "
+    "mike november oscar papa quebec romeo sierra tango uniform victor whiskey "
+    "xray yankee zulu amber basil cedar dawn ember frost grove harbor ivory "
+    "jade kite lotus maple nectar opal pearl quartz river slate timber umbra "
+    "violet willow xenon yarrow zephyr anchor beacon canyon dune eagle fjord"
+).split()
+
 
 def _log(msg: str) -> None:
     print(f"[epic-gpu-smoke] {msg}", flush=True)
@@ -105,12 +133,19 @@ def _epic_kv_config(
     fusion: bool = False,
     link_tokens: int | None = None,
     debug_check_load: bool = False,
+    debug_counters: bool = False,
 ) -> dict:
     extra: dict = {}
     if sparse:
         extra["epic_sparse_forward"] = True
     if fusion:
         extra["epic_fusion_mask"] = True
+    # in-band engagement counters (Implement: sparse-engagement assertion).
+    # When on, the connector bumps EpicConnector.debug_counters at the
+    # sparse-match / sparse-emit / chunk-load sites so the in-process smoke can
+    # assert the sparse path actually engaged without scraping logs.
+    if debug_counters:
+        extra["epic_debug_counters"] = True
     # link sweep control (Implement 1): leading recomputed tokens per non-prefix
     # chunk. link == chunk_size -> the WHOLE B chunk is recomputed -> the sparse
     # machinery runs but the reuse approximation is null (M == all of B), so the
@@ -358,6 +393,7 @@ def build_aligned_token_prompts(
     reuse_tail_ids: list[int],
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     filler_id: int = 0,
+    filler_ids: list[int] | None = None,
     passage_chunks: int = 1,
 ) -> dict:
     """Token-level, chunk-aligned assembly of the warm + reuse prompts (pure).
@@ -372,11 +408,27 @@ def build_aligned_token_prompts(
       * B is truncated to exactly ``passage_chunks * chunk_size`` tokens and the
         SAME id slice is used in both prompts -> byte-identical content -> the
         connector's content hash collides -> a real non-prefix hit.
+
+    Discriminative padding: ``filler_ids`` (a non-empty list of real-word token
+    ids) is CYCLED for all padding so a padded prompt is ordinary text rather
+    than a run of one repeated (e.g. blank-space) token. Cycling deterministi-
+    cally from offset 0 keeps the SAME B id slice byte-identical between warm
+    and reuse (the reuse signal). ``filler_id`` (scalar) is the back-compat
+    fallback when ``filler_ids`` is None.
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
     if passage_chunks <= 0:
         raise ValueError("passage_chunks must be positive")
+
+    pool = list(filler_ids) if filler_ids else [filler_id]
+    if not pool:
+        pool = [filler_id]
+
+    def _fill(n: int) -> list[int]:
+        # Cycle the pool so padding is varied real-word tokens, not one token
+        # repeated. Deterministic (offset 0) -> reproducible alignment/hashes.
+        return [pool[i % len(pool)] for i in range(n)]
 
     # Pad each head UP to a chunk-size multiple so B lands on a chunk boundary.
     def _pad_to_chunk(ids: list[int]) -> list[int]:
@@ -387,7 +439,7 @@ def build_aligned_token_prompts(
         # Ensure at least one full A chunk so A is itself chunkable (prefix).
         if len(ids) == 0:
             pad = chunk_size
-        return list(ids) + [filler_id] * pad
+        return list(ids) + _fill(pad)
 
     warm_head = _pad_to_chunk(head_ids)
     reuse_head = _pad_to_chunk(reuse_head_ids)
@@ -397,7 +449,7 @@ def build_aligned_token_prompts(
     b_len = passage_chunks * chunk_size
     b_ids = list(passage_ids[:b_len])
     if len(b_ids) < b_len:
-        b_ids = b_ids + [filler_id] * (b_len - len(b_ids))
+        b_ids = b_ids + _fill(b_len - len(b_ids))
 
     warm_ids = warm_head + b_ids + list(tail_ids)
     reuse_ids = reuse_head + b_ids + list(reuse_tail_ids)
@@ -437,6 +489,84 @@ def build_aligned_token_prompts(
     }
 
 
+# ---------------------------------------------------------------------------
+# Needle probe construction (the discriminative accuracy signal).
+#
+# We embed K "secret code" facts INSIDE passage B (the shared, non-prefix
+# region) and ask for one of them in the reuse prompt's tail Q. Because the
+# answer code lives ONLY in B, a correct sparse answer proves B's reused KV
+# carries real information through the sparse forward -- not just that two blank
+# prompts collapse to the same blank output. The fact/question wording mirrors
+# benchmarks/epic_reuse/common.py's Needle (kept independent so this script
+# stays import-light: no torch/vLLM at module load).
+# ---------------------------------------------------------------------------
+class NeedleFact:
+    __slots__ = ("subject", "answer")
+
+    def __init__(self, subject: str, answer: str):
+        self.subject = subject
+        self.answer = answer
+
+    def fact_sentence(self) -> str:
+        return f"The secret code for {self.subject} is {self.answer}."
+
+    def question(self) -> str:
+        # Plain-text QA tail; the model is instruct-tuned so this is enough.
+        return (
+            f" Based on the passage above, what is the secret code for "
+            f"{self.subject}? Answer:"
+        )
+
+
+def make_needles(seed: int, k: int) -> list[NeedleFact]:
+    """K deterministic (subject, 4-digit code) facts. Subjects are two pooled
+    words joined by '-' so they are unambiguous and unlikely to collide with
+    filler; codes are 4-digit so they tokenize compactly and are easy to match.
+    """
+    out: list[NeedleFact] = []
+    pool = _FILLER_WORDS
+    n = len(pool)
+    for j in range(k):
+        subj = pool[(seed + 7 + j) % n] + "-" + pool[(seed + 13 + j * 3) % n]
+        ans = f"{(seed * 31 + j * 17) % 9000 + 1000}"
+        out.append(NeedleFact(subject=subj, answer=ans))
+    return out
+
+
+def build_needle_passage_text(
+    needles: list[NeedleFact], *, filler_seed: int, n_filler_words: int = 60
+) -> str:
+    """Passage B text: the K needle fact sentences interleaved with rotating
+    real-word filler. The answer-bearing sentences are kept verbatim; filler is
+    distinct words (not blank space) so B is a real passage. Length here is
+    approximate -- build_aligned_token_prompts truncates/pads B to an exact
+    chunk multiple at the TOKEN level afterwards (the answer sentences sit at
+    the FRONT so token truncation never drops them).
+    """
+    pool = _FILLER_WORDS
+    parts: list[str] = []
+    # Facts first (so token-level truncation of B keeps them).
+    for nd in needles:
+        parts.append(nd.fact_sentence())
+    # Then a block of rotating filler words to pad the passage body.
+    filler = [pool[(filler_seed + i) % len(pool)] for i in range(n_filler_words)]
+    parts.append(" ".join(filler) + ".")
+    return " ".join(parts)
+
+
+def _output_has_answer(text: str, answer: str) -> bool:
+    """True iff the 4-digit answer code appears as a token-ish substring in the
+    output. Digits don't get article/punct-normalized, so a plain substring on
+    the raw text is robust (and matches common.answer_containment in spirit)."""
+    if not answer:
+        return False
+    return answer in (text or "")
+
+
+def _distinct_token_count(ids: list[int]) -> int:
+    return len(set(ids))
+
+
 # Link sweep schedule (Implement 1). Each entry is a number of LINK tokens per
 # non-prefix B chunk that are recomputed. With a 256-token B chunk:
 #   256 -> M == ALL of B: the sparse machinery (match/load/scatter/mask/reduced
@@ -454,10 +584,33 @@ _LINK_SWEEP = [256, 64, 8]
 _MACHINERY_PASS_THRESHOLD = 0.9
 
 
+# Minimum distinct decoded tokens for the dense output to be considered a real,
+# discriminative answer (a blank/degenerate output has <4 distinct tokens).
+_MIN_DISTINCT_TOKENS = 4
+
+
+def _reset_epic_counters() -> None:
+    """Zero the connector's class-level engagement counters (between sparse
+    runs). Imported lazily so the module stays import-light off-GPU."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.epic_connector import (
+        EpicConnector,
+    )
+
+    EpicConnector.reset_debug_counters()
+
+
+def _read_epic_counters() -> dict:
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.epic_connector import (
+        EpicConnector,
+    )
+
+    return dict(EpicConnector.debug_counters)
+
+
 def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
     _log(
-        "step4: shared NON-prefix chunk -- DENSE reference vs sparse across a "
-        f"LINK sweep {_LINK_SWEEP} (machinery-vs-approximation separation)"
+        "step4: NEEDLE probe -- DENSE reference vs sparse across a LINK sweep "
+        f"{_LINK_SWEEP} (discriminative: answer code lives ONLY in passage B)"
     )
 
     from vllm.inputs import TokensPrompt
@@ -466,6 +619,7 @@ def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
 
     # --- dense reference engine (also gives us the tokenizer for assembly) ---
     # The dense reference is independent of the link value, so compute it ONCE.
+    # Dense reference may run multiprocess (no in-band counter assertion needed).
     llm_dense = _build_llm(
         model,
         kv_config=_epic_kv_config(sparse=False),
@@ -479,19 +633,36 @@ def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
         return list(tok.encode(text, add_special_tokens=False))
 
     chunk_size = DEFAULT_CHUNK_SIZE
-    # filler id: a stable, common token (space) so padding is innocuous text.
-    filler_id = _enc(" ")[-1] if _enc(" ") else 0
+
+    # --- needle facts: K secret codes embedded ONLY in passage B ------------
+    needles = make_needles(seed=4, k=3)
+    target = needles[0]  # the one Q asks about
+    passage_text = build_needle_passage_text(needles, filler_seed=11)
+    _log(
+        "step4: needles="
+        + "; ".join(f"{n.subject}->{n.answer}" for n in needles)
+        + f" | asking for subject={target.subject!r} answer={target.answer!r}"
+    )
+
+    # Discriminative filler: rotate REAL words (not blank space) for all padding
+    # so neither dense nor sparse can collapse to a trivial constant output.
+    filler_ids: list[int] = []
+    for w in _FILLER_WORDS:
+        filler_ids.extend(_enc(" " + w))
+    if not filler_ids:
+        filler_ids = [0]
 
     assembled = build_aligned_token_prompts(
         head_ids=_enc(_PROMPT_HEAD),
-        passage_ids=_enc(_SHARED_PASSAGE),
+        passage_ids=_enc(passage_text),
         tail_ids=_enc(_PROMPT_TAIL_1),
         reuse_head_ids=_enc(
             "Different opening sentence here for the second request entirely. "
         ),
-        reuse_tail_ids=_enc(_PROMPT_TAIL_2),
+        # Reuse tail = the needle QUESTION (asks for the code that lives in B).
+        reuse_tail_ids=_enc(target.question()),
         chunk_size=chunk_size,
-        filler_id=filler_id,
+        filler_ids=filler_ids,
         passage_chunks=1,
     )
     warm_prompt = TokensPrompt(prompt_token_ids=assembled["warm_ids"])
@@ -510,52 +681,98 @@ def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
         f"{len(assembled['expected_b_hashes'])} at offset "
         f"[{assembled['reuse_b_offset']}], then 'EPIC load emit' with "
         f"chunks={len(assembled['expected_b_hashes'])} scattering B into the "
-        "paged cache (slot_range within the reuse request's blocks). With "
-        "epic_debug_check_load on you will also see 'EPIC check_load' lines "
-        "(k/v allclose + max-abs-diff) confirming scatter fidelity in situ."
+        "paged cache. (The in-band counter assertion below replaces log-scraping "
+        "for the engagement check.)"
     )
 
     # warm: saves the shared B chunk(s). dense_out is the link-independent ref.
     llm_dense.generate([warm_prompt], params)
-    dense_out = _token_ids(llm_dense.generate([reuse_prompt], params))[0]
+    dense_outs = llm_dense.generate([reuse_prompt], params)
+    dense_out = _token_ids(dense_outs)[0]
+    dense_text = _texts(dense_outs)[0]
     del llm_dense
 
+    _log(f"step4: DENSE reference text: {dense_text!r}")
     _log(
         "step4: DENSE reference first 12 tokens: "
         + ", ".join(f"{t}:{tok.decode([t])!r}" for t in dense_out[:12])
     )
 
-    # --- link sweep: one fresh sparse engine per link value -----------------
-    results: list[tuple[int, float, int]] = []  # (link, match_rate, first_div)
+    # --- PROBE VALIDITY GATES (fail the PROBE, not EPIC, when these trip) ----
+    # (a) dense must actually answer the needle. If it cannot, the probe length /
+    #     model is the problem; the sparse comparison would be meaningless.
+    dense_hit = _output_has_answer(dense_text, target.answer)
+    distinct = _distinct_token_count(dense_out)
+    _log(
+        f"step4: dense needle_hit={dense_hit} (code {target.answer!r}) "
+        f"distinct_tokens={distinct}"
+    )
+    if not dense_hit:
+        _fail(
+            "step4",
+            f"PROBE INVALID: the DENSE (sparse-OFF) reference did not output the "
+            f"answer code {target.answer!r} for subject {target.subject!r}. The "
+            "probe itself is broken (model too weak, prompt too long, or the "
+            "needle was truncated out of B) -- this is NOT an EPIC failure. "
+            f"Dense output was {dense_text!r}. Shorten B / pick a stronger model "
+            "and retry before trusting any sparse number.",
+        )
+    # (b) the dense output must be discriminative (a blank/constant output has
+    #     almost no distinct tokens -> a 1.000 match would be vacuous).
+    if distinct < _MIN_DISTINCT_TOKENS:
+        _fail(
+            "step4",
+            f"non-discriminative output: the DENSE reference has only {distinct} "
+            f"distinct tokens (< {_MIN_DISTINCT_TOKENS}). A near-constant output "
+            "makes the sparse-vs-dense match rate vacuous (the degenerate "
+            "blank-filler bug). Check the prompt assembly / sampling params.",
+        )
+
+    # --- link sweep: one fresh IN-PROCESS sparse engine per link value ------
+    # In-process (VLLM_ENABLE_V1_MULTIPROCESSING=0) so the SCHEDULER and WORKER
+    # connectors share EpicConnector.debug_counters in THIS process -> we can
+    # assert engagement in-band (no log scraping). Reset the counters per run.
+    results: list[tuple[int, float, int, bool, dict]] = []
     for link in _LINK_SWEEP:
         b_len = assembled["b_len"]
         eff_link = min(link, b_len)
         _log(
-            f"step4[link={link}]: building sparse engine "
+            f"step4[link={link}]: building IN-PROCESS sparse engine "
             f"(epic_link_tokens={eff_link}, B_len={b_len}, "
             f"reuse_fraction={(b_len - eff_link) / b_len:.2f})"
         )
-        llm_sparse = _build_llm(
-            model,
-            kv_config=_epic_kv_config(
-                sparse=True,
-                fusion=True,
-                link_tokens=eff_link,
-                debug_check_load=True,  # Implement 2: scatter self-check on.
-            ),
-            enforce_eager=True,
-            attention_backend="FLEX_ATTENTION",
-        )
-        llm_sparse.generate([warm_prompt], params)  # warm: saves the chunk
-        sparse_out = _token_ids(llm_sparse.generate([reuse_prompt], params))[0]
-        del llm_sparse
+        _reset_epic_counters()
+        with _in_process_engine():
+            llm_sparse = _build_llm(
+                model,
+                kv_config=_epic_kv_config(
+                    sparse=True,
+                    fusion=True,
+                    link_tokens=eff_link,
+                    debug_check_load=True,   # Implement 2: scatter self-check.
+                    debug_counters=True,     # in-band engagement assertion.
+                ),
+                enforce_eager=True,
+                attention_backend="FLEX_ATTENTION",
+            )
+            llm_sparse.generate([warm_prompt], params)  # warm: saves the chunk
+            sparse_outs = llm_sparse.generate([reuse_prompt], params)
+            sparse_out = _token_ids(sparse_outs)[0]
+            sparse_text = _texts(sparse_outs)[0]
+            counters = _read_epic_counters()
+            del llm_sparse
 
         rate = _match_rate(dense_out, sparse_out)
         div = _first_divergence(dense_out, sparse_out)
         cos = _decode_cosine(model, dense_out, sparse_out)
-        results.append((link, rate, div))
+        hit = _output_has_answer(sparse_text, target.answer)
+        results.append((link, rate, div, hit, counters))
 
-        _log(f"step4[link={link}]: token-match rate sparse-vs-dense = {rate:.3f}")
+        _log(f"step4[link={link}]: sparse text: {sparse_text!r}")
+        _log(
+            f"step4[link={link}]: needle_hit={hit} (code {target.answer!r}) "
+            f"token-match rate sparse-vs-dense = {rate:.3f}"
+        )
         _log(
             f"step4[link={link}]: first divergence index = "
             f"{'NONE (identical)' if div < 0 else div}"
@@ -563,64 +780,99 @@ def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
         if cos is not None:
             _log(f"step4[link={link}]: embedding cosine similarity = {cos:.4f}")
         _log(
+            f"step4[link={link}]: EPIC engagement counters = {counters}"
+        )
+        _log(
             f"step4[link={link}]: first 12 tokens (dense | sparse):\n"
             + _head_compare(tok, dense_out, sparse_out, k=12)
         )
 
+        # --- SPARSE ENGAGEMENT gate (in-band, every run) -------------------
+        if not (counters.get("sparse_match", 0) >= 1
+                and counters.get("chunks_loaded", 0) >= 1):
+            _fail(
+                "step4",
+                f"SPARSE DID NOT ENGAGE (link={link}): the in-band counters are "
+                f"{counters}; expected sparse_match>=1 AND chunks_loaded>=1. The "
+                "reuse request did not take the non-prefix sparse branch and/or no "
+                "cached B chunk was scattered into the paged cache -- the sweep "
+                "would be measuring the dense path, not EPIC. Check that the warm "
+                "request saved B, that B is byte-identical/chunk-aligned in the "
+                "reuse prompt (content-hash collision), and that the engine ran "
+                "in-process (VLLM_ENABLE_V1_MULTIPROCESSING=0).",
+            )
+
     # --- summary table -------------------------------------------------------
     _log("step4: LINK SWEEP SUMMARY")
-    _log("    link | match_rate | first_div | regime")
-    for link, rate, div in results:
+    _log(
+        "    link | needle | match_rate | first_div | "
+        "match/emit/loaded | regime"
+    )
+    for link, rate, div, hit, counters in results:
         full = "B-FULL (decisive)" if link >= assembled["b_len"] else "approx"
+        cstr = (
+            f"{counters.get('sparse_match', 0)}/"
+            f"{counters.get('sparse_emit', 0)}/"
+            f"{counters.get('chunks_loaded', 0)}"
+        )
         _log(
-            f"    {link:4d} | {rate:10.3f} | "
-            f"{('none' if div < 0 else str(div)):>9s} | {full}"
+            f"    {link:4d} | {('HIT' if hit else 'miss'):>6s} | {rate:10.3f} | "
+            f"{('none' if div < 0 else str(div)):>9s} | {cstr:^24s} | {full}"
         )
     _log(
         "step4: HINT -- inspect the engine schedule log for the reuse request's "
-        "step; under the S7 single-batch gate it must be scheduled ALONE "
-        "(no other request in the same step)."
+        "step; under the S7 single-batch gate it must be scheduled ALONE."
     )
 
-    # --- verdict (Implement 1): the link == B-full run is the decisive gate --
-    # It runs ALL sparse machinery with reuse approximation NULL (M == all of B).
-    # If it does not closely match dense, the bug is mechanical, not algorithmic.
+    # --- verdict: the link == B-full run is the DECISIVE gate ----------------
+    # M == all of B (zero reuse approximation), so it must reproduce the needle
+    # answer AND match dense closely. A failure here is mechanical, not
+    # algorithmic.
     decisive = next((r for r in results if r[0] >= assembled["b_len"]), None)
     if decisive is None:
-        # No link covered the whole B chunk; cannot run the decisive control.
         _fail(
             "step4",
             "link sweep had no entry >= B_len so the decisive (M==all-of-B) "
             "control did not run; add B_len to _LINK_SWEEP.",
         )
-    _, decisive_rate, decisive_div = decisive
+    _, decisive_rate, decisive_div, decisive_hit, _ = decisive
+    if not decisive_hit:
+        _fail(
+            "step4",
+            f"DECISIVE FAIL: link={decisive[0]} recomputes the ENTIRE B chunk "
+            "(zero reuse approximation) yet the sparse output did NOT contain the "
+            f"needle code {target.answer!r}. Because reuse is null here, a missed "
+            "needle is a mechanical fault in the sparse path (runner positions / "
+            "seq_lens, flex logical_q, schedule accounting, or KV scatter "
+            "layout), not approximation error. Inspect the 'EPIC check_load' and "
+            "'EPIC worker sparse plan' lines.",
+        )
     if decisive_rate < _MACHINERY_PASS_THRESHOLD:
         _fail(
             "step4",
-            f"MACHINERY BUG: link={decisive[0]} recomputes the ENTIRE B chunk "
-            f"(zero reuse approximation) yet match={decisive_rate:.3f} < "
-            f"{_MACHINERY_PASS_THRESHOLD} (first divergence at "
-            f"{'none' if decisive_div < 0 else decisive_div}). Because reuse is "
-            "null here, this is NOT approximation error -- it is a mechanical "
-            "fault in the sparse path: runner positions / seq_lens, flex "
-            "logical_q, schedule accounting (computed_advance / num_scheduled), "
-            "or KV scatter layout. Inspect the 'EPIC check_load' lines (scatter "
-            "fidelity) and the 'EPIC worker sparse plan' line (effective "
-            "positions/seq_len) to localize. Fix the machinery before trusting "
-            "any approximation-regime number.",
+            f"DECISIVE FAIL: link={decisive[0]} (M==all-of-B) hit the needle but "
+            f"token-match={decisive_rate:.3f} < {_MACHINERY_PASS_THRESHOLD} "
+            f"(first divergence at {'none' if decisive_div < 0 else decisive_div})."
+            " With zero reuse approximation the sparse forward should reproduce "
+            "dense up to numerics -- a low match is a mechanical fault. Inspect "
+            "the scatter-fidelity ('EPIC check_load') and worker-plan lines.",
         )
 
     # Machinery is healthy. The smaller-link runs are an APPROXIMATION regime:
-    # a low match there is an algorithmic limit (link=8 cannot restitch B's
-    # context), not a bug -- report, do not fail.
+    # report needle hit + match + first divergence; a miss is an algorithmic
+    # limit (link cannot restitch B's lost cross-context), not a failure.
     _log(
-        f"step4: MACHINERY OK (link={decisive[0]} M==all-of-B match "
+        f"step4: DECISIVE OK (link={decisive[0]} M==all-of-B needle HIT, match "
         f"{decisive_rate:.3f} >= {_MACHINERY_PASS_THRESHOLD}). Smaller-link rows "
-        "above are the reuse APPROXIMATION regime; a low match there is an "
-        "algorithmic limit (link cannot restitch B's lost cross-context), not a "
-        "mechanical bug. See the summary table for the degradation curve."
+        "above are the reuse APPROXIMATION regime: a needle miss / low match "
+        "there is the 1st-order approximation-quality signal (reported, not a "
+        "machinery failure)."
     )
-    _log("step4: PASS (decisive B-full control matched dense; sweep reported)")
+    _log(
+        "step4: PASS (probe valid: dense answered + discriminative; sparse "
+        "engaged in-band; decisive B-full control hit the needle and matched "
+        "dense; approximation sweep reported)."
+    )
 
 
 def _decode_cosine(model: str, a: list[int], b: list[int]) -> float | None:

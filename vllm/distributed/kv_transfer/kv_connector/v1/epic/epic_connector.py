@@ -139,6 +139,39 @@ def _slot_ids_from_blocks(
 
 
 class EpicConnector(KVConnectorBase_V1):
+    # --- In-band engagement counters (test/diagnostic only) -----------------
+    # CLASS variable so a smoke test running the V1 engine IN-PROCESS
+    # (VLLM_ENABLE_V1_MULTIPROCESSING=0) can assert the sparse path actually
+    # engaged WITHOUT scraping logs: the SCHEDULER-role connector (EngineCore)
+    # and the WORKER-role connector live in the SAME process, share this class
+    # dict, and bump distinct keys at the load-bearing sites:
+    #   sparse_match  -> a request took the non-prefix sparse branch in
+    #                    get_num_new_matched_tokens (scheduler).
+    #   sparse_emit   -> a sparse recompute set M was emitted for a request in
+    #                    build_connector_meta/_emit_sparse (scheduler).
+    #   chunks_loaded -> a cached chunk was actually scattered into the paged
+    #                    cache in _load_chunk (worker).
+    # Incrementing is GATED on the ``epic_debug_counters`` extra-config so a
+    # normal run never touches shared mutable class state (no cross-engine
+    # leakage, thread-safety is a non-concern because increment only fires
+    # under the in-process single-engine smoke path). Reset between runs via
+    # reset_debug_counters().
+    debug_counters: dict[str, int] = {
+        "sparse_match": 0,
+        "sparse_emit": 0,
+        "chunks_loaded": 0,
+    }
+
+    @classmethod
+    def reset_debug_counters(cls) -> None:
+        """Zero every engagement counter (call between smoke runs)."""
+        for k in cls.debug_counters:
+            cls.debug_counters[k] = 0
+
+    @classmethod
+    def _bump_counter(cls, key: str, n: int = 1) -> None:
+        cls.debug_counters[key] = cls.debug_counters.get(key, 0) + n
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -233,6 +266,13 @@ class EpicConnector(KVConnectorBase_V1):
         # from alignment math. Inert (no read-back, no cost) when off.
         self._debug_check_load: bool = bool(
             extra.get("epic_debug_check_load", False)
+        )
+        # --- DIAGNOSTIC: in-band engagement counters (default OFF) ----------
+        # When on, the load-bearing sparse sites bump EpicConnector.debug_counters
+        # (a CLASS dict) so an in-process smoke can assert the sparse path
+        # engaged without log scraping. Inert (no shared-state writes) when off.
+        self._debug_counters: bool = bool(
+            extra.get("epic_debug_counters", False)
         )
         # One-shot latch so the per-layer compare logs only for the FIRST chunk
         # of a step (avoids log spam across many chunks/requests).
@@ -561,6 +601,8 @@ class EpicConnector(KVConnectorBase_V1):
                     external,
                     num_new,
                 )
+                if getattr(self, "_debug_counters", False):
+                    self._bump_counter("sparse_match")
                 # Phase 1 loads (prefix chunks) still happen synchronously in
                 # start_load_kv; non-prefix B loading now happens there too.
                 return num_new, False
@@ -834,6 +876,8 @@ class EpicConnector(KVConnectorBase_V1):
                 computed_advance=computed_advance,
             )
         )
+        if getattr(self, "_debug_counters", False):
+            self._bump_counter("sparse_emit")
         return set(plan.recompute_offsets)
 
     # ----- core-hook interface (S0): scheduler calls these in the NEXT batch -----
@@ -1130,6 +1174,8 @@ class EpicConnector(KVConnectorBase_V1):
         length = min(stored.length, spec.length)
         if length == 0:
             return
+        if getattr(self, "_debug_counters", False):
+            self._bump_counter("chunks_loaded")
         # Defensive defaults: unit tests build a worker via object.__new__ and
         # set attributes by hand, so the diagnostic flags may be absent. getattr
         # keeps the check inert (off) on those partially-built instances.
