@@ -42,10 +42,21 @@ uv pip install -e . --torch-backend=auto
 
 ### 2. CPU tests (no GPU needed)
 
+The EPIC unit/functional tests run on CPU. They need `pytest` plus `tblib`
+(used by the repo-wide `tests/conftest.py`); `torch` / `transformers` / `numpy`
+already come with the install in step 1:
+
 ```bash
+uv pip install pytest tblib
+
 .venv/bin/python -m pytest tests/v1/kv_connector/unit/epic/ -q   # 80 EPIC tests
 .venv/bin/python -m pytest tests/v1/core/test_scheduler.py -q    # vanilla regression
 ```
+
+> The `SwigPyObject`/`torch.jit.script_method`/`BPE.__init__` lines in the
+> output are harmless third-party `DeprecationWarning`s, not test failures.
+> Silence them with `-p no:cacheprovider -W ignore::DeprecationWarning` if
+> you want quiet output.
 
 ### 3. GPU functional verification (run this first on a CUDA box)
 
