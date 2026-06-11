@@ -43,6 +43,14 @@ import sys
 import time
 from dataclasses import dataclass
 
+
+# EPIC: fork-safety -- force NVML-based CUDA probing and spawn for vLLM child
+# processes, so any parent-side CUDA touch (user env, sitecustomize) cannot
+# break the forked EngineCore ("Cannot re-initialize CUDA in forked
+# subprocess"). Must be set before torch/vllm are imported in this process.
+os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 from benchmarks.epic_reuse.common import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_CHUNK_SIZE,

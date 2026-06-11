@@ -43,6 +43,18 @@ import argparse
 import os
 import sys
 
+# EPIC: fork-safety. This parent process probes CUDA (torch.cuda.is_available)
+# BEFORE constructing the LLM; that creates a CUDA driver context which a
+# forked EngineCore cannot re-initialize ("Cannot re-initialize CUDA in forked
+# subprocess"). vLLM's auto force-spawn only checks torch.cuda.is_initialized(),
+# which is_available() does NOT set -- so protect ourselves:
+#   1) NVML-based availability check: no CUDA context in this process.
+#   2) Force spawn for vLLM child processes as belt-and-braces (covers any
+#      other parent-side CUDA touch, e.g. user sitecustomize).
+# Both must be set before torch / vllm are imported anywhere in this process.
+os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 # Shared chunk content (a "retrieved passage" that appears in the MIDDLE of two
 # different prompts -- the RAG reuse pattern EPIC targets). Kept as explicit
 # token-ish text; the offline LLM tokenizes it. Long enough to span >= one
