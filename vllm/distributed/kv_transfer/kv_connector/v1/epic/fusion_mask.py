@@ -36,8 +36,8 @@ recomputed). In Phase 2a *all* rows are forwarded, so non-M rows must reduce to
 standard causal too. The mask is therefore expressed as:
 
     allow = causal(q_idx, kv_idx)
-            AND kv_live[kv_idx]
-            AND ( gate == 0  OR  recompute_flag[q_idx] )
+            AND ( gate == 0
+                  OR (kv_live[kv_idx] AND recompute_flag[q_idx]) )
 
 where, indexed by logical position within the request:
 
@@ -48,7 +48,8 @@ where, indexed by logical position within the request:
   * ``gate``                       -> a 1-element int tensor. ``0`` (Phase 2a:
                                       every row forwarded, recompute gating
                                       OFF) makes the whole predicate reduce to
-                                      ``causal AND kv_live`` == standard causal.
+                                      pure ``causal`` (kv_live is consulted
+                                      only when the gate is ON).
                                       ``1`` (Phase 2b: only M rows forwarded)
                                       turns on per-row recompute gating with no
                                       change to the closure / compiled graph.
@@ -218,8 +219,15 @@ def build_legolink_mask_mod(tensors: FusionMaskTensors) -> MaskMod:
             recompute_flag[q_idx.clamp(0, capacity - 1)] != 0
         )
         gate_on = gate[0] != 0
-        row_ok = (~gate_on) | is_recompute
-
-        return causal & kv_ok & row_ok
+        # GPU-debug fix (step4 decode collapse): kv_live/recompute gating must
+        # apply ONLY when the sparse gate is on. With gate == 0 the mask must
+        # be PURE causal, independent of how kv_live was last filled -- decode
+        # steps refill the tensors with that step's tiny seq_len (1), and the
+        # old `causal & kv_ok` predicate then masked decode queries down to
+        # kv_idx == 0 only, collapsing generation into a constant repetition.
+        sparse_ok = kv_ok & is_recompute
+        # Range checks stay unconditional (content-independent; capacity is
+        # fixed): out-of-range/negative indices are masked in both modes.
+        return causal & kv_in_range & q_in_range & ((~gate_on) | sparse_ok)
 
     return legolink_mask_mod

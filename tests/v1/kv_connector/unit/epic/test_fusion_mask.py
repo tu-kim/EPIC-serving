@@ -264,3 +264,21 @@ def test_reset_clears_contents_keeps_shapes():
     assert int(t.recompute_flag.sum()) == 0
     assert int(t.kv_live.sum()) == 0
     assert (t.recompute_flag.shape, t.kv_live.shape, t.gate.shape) == shapes
+
+
+def test_gate_off_is_pure_causal_even_after_tiny_decode_refill():
+    """Regression (GPU step4 decode collapse, link-sweep all 0.021):
+    decode steps refill the tensors with that step's seq_len (1). With
+    gate OFF the mask must stay PURE causal regardless of kv_live state;
+    the old predicate AND-ed kv_live unconditionally, so decode queries
+    (logical pos 523) could only attend kv_idx==0 -> constant repetition."""
+    t = FusionMaskTensors.allocate(capacity=1024, device=torch.device("cpu"))
+    mm = build_legolink_mask_mod(t)
+    # decode-style refill: only position 0 marked live
+    t.fill_request(seq_len=1)
+    q = torch.tensor(523)
+    # must attend ALL causal kv, not just kv 0
+    for kv in (0, 1, 300, 511, 523):
+        assert bool(mm(torch.tensor(0), torch.tensor(0), q, torch.tensor(kv))), kv
+    # still causal: future masked
+    assert not bool(mm(torch.tensor(0), torch.tensor(0), q, torch.tensor(524)))
