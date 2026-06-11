@@ -16,6 +16,86 @@ their new positions (PIC) and forwarding only the new/link tokens
 - **Benchmarks**: [`benchmarks/epic_reuse/`](benchmarks/epic_reuse/) — full / prefix-only / reuse-only / epic@k over |A|,|C|,|B| sweeps, synthetic-needle + SQuAD/HotpotQA accuracy
 - **All EPIC changes vs vanilla**: `git diff <baseline-commit> main` (baseline = first commit)
 
+## Build & Run
+
+### 1. Install (build)
+
+All EPIC changes are **Python-only**, so you can reuse the official v0.22.1
+compiled kernels instead of a full CUDA build:
+
+```bash
+git clone https://github.com/tu-kim/EPIC-serving.git && cd EPIC-serving
+curl -LsSf https://astral.sh/uv/install.sh | sh   # if uv is not installed
+uv venv --python 3.12
+VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
+```
+
+If the precompiled-wheel lookup fails (this repo's commits are not upstream
+vLLM commits), point it at the official v0.22.1 wheel explicitly:
+
+```bash
+uv pip download vllm==0.22.1 --no-deps -d /tmp/vllm-wheel
+VLLM_USE_PRECOMPILED=1 \
+VLLM_PRECOMPILED_WHEEL_LOCATION=$(ls /tmp/vllm-wheel/vllm-*.whl) \
+uv pip install -e . --torch-backend=auto
+```
+
+### 2. CPU tests (no GPU needed)
+
+```bash
+.venv/bin/python -m pytest tests/v1/kv_connector/unit/epic/ -q   # 80 EPIC tests
+.venv/bin/python -m pytest tests/v1/core/test_scheduler.py -q    # vanilla regression
+```
+
+### 3. GPU functional verification (run this first on a CUDA box)
+
+```bash
+VLLM_ATTENTION_BACKEND=FLEX_ATTENTION .venv/bin/python \
+  tests/v1/kv_connector/unit/epic/gpu_smoke.py --model meta-llama/Llama-3.2-1B-Instruct
+```
+
+Steps: 1) no-trace (connector on, sparse off ≡ baseline) → 2,3) fail-closed
+config gates → 4) real sparse run vs dense comparison.
+
+### 4. Serving with EPIC
+
+```bash
+# Phase 1 only: position-independent prefix reuse (any backend)
+.venv/bin/python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --kv-transfer-config '{"kv_connector":"EpicConnector","kv_role":"kv_both",
+    "kv_connector_extra_config":{"epic_chunk_size":256}}'
+
+# Full EPIC: non-prefix reuse + sparse-forward (FlexAttention + eager required)
+VLLM_ATTENTION_BACKEND=FLEX_ATTENTION .venv/bin/python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Llama-3.2-1B-Instruct --enforce-eager \
+  --kv-transfer-config '{"kv_connector":"EpicConnector","kv_role":"kv_both",
+    "kv_connector_extra_config":{"epic_chunk_size":256,"epic_sparse_forward":true,
+      "epic_fusion_mask":true,"epic_link_tokens":8}}'
+```
+
+### 5. Benchmarks (accuracy + TTFT, |A|/|C|/|B|/k sweeps)
+
+```bash
+# data: synthetic needle (offline) or --data-mode hf --hf-dataset squad
+.venv/bin/python -m benchmarks.epic_reuse.data_prep \
+  --model meta-llama/Llama-3.2-1B-Instruct --out epic_bench.jsonl
+# perf: full / prefix / reuse-only(no recompute) / epic@k
+VLLM_LOGGING_LEVEL=WARNING .venv/bin/python -m benchmarks.epic_reuse.bench_perf \
+  --data epic_bench.jsonl --model meta-llama/Llama-3.2-1B-Instruct \
+  --modes full,prefix,reuse-only,epic --link-sweep 0,8,32 --out perf.csv
+# accuracy vs dense reference
+.venv/bin/python -m benchmarks.epic_reuse.bench_accuracy \
+  --data epic_bench.jsonl --model meta-llama/Llama-3.2-1B-Instruct \
+  --modes reuse-only,epic --link-sweep 0,8,32 --out acc.csv
+# plots (TTFT/speedup vs |B|, accuracy-vs-k tradeoff, ...)
+.venv/bin/python -m benchmarks.epic_reuse.plot_results \
+  --perf perf.csv --acc acc.csv --fix-a 0 --fix-c 256 --fix-b 512 --outdir plots/
+```
+
+See [`benchmarks/epic_reuse/README.md`](benchmarks/epic_reuse/README.md) for
+grid options and result interpretation.
+
 The original vLLM README follows below.
 
 ---
