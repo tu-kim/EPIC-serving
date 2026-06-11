@@ -249,3 +249,10 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# EPIC: generated benchmark artifacts (benchmarks/epic_reuse)
+epic_bench*.jsonl
+epic_hf*.jsonl
+perf*.csv
+acc*.csv
+plots/

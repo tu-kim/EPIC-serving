@@ -1,4 +1,25 @@
 <!-- markdownlint-disable MD001 MD041 -->
+
+# EPIC-serving — Non-contiguous KV Cache Reuse on vLLM
+
+This repository is **vLLM v0.22.1 + EPIC** ([arXiv:2410.15332](https://arxiv.org/pdf/2410.15332)):
+a migration of the EPIC position-independent KV caching prototype
+([DerekHJH/epic](https://github.com/DerekHJH/epic), vLLM 0.7.0 fork) into the
+vLLM V1 engine as a proper `KVConnectorBase_V1` integration. Given a prompt
+`A + C + B` where chunks `A`/`B` are cached from earlier requests, it reuses
+both — including the **non-prefix** chunk `B` — re-rotating cached keys to
+their new positions (PIC) and forwarding only the new/link tokens
+(sparse-forward).
+
+- **Implementation & docs**: [`vllm/distributed/kv_transfer/kv_connector/v1/epic/`](vllm/distributed/kv_transfer/kv_connector/v1/epic/) — see its [README](vllm/distributed/kv_transfer/kv_connector/v1/epic/README.md), [DESIGN](vllm/distributed/kv_transfer/kv_connector/v1/epic/DESIGN.md), [PHASE2](vllm/distributed/kv_transfer/kv_connector/v1/epic/PHASE2.md)
+- **Tests**: [`tests/v1/kv_connector/unit/epic/`](tests/v1/kv_connector/unit/epic/) (80 CPU tests + `gpu_smoke.py`)
+- **Benchmarks**: [`benchmarks/epic_reuse/`](benchmarks/epic_reuse/) — full / prefix-only / reuse-only / epic@k over |A|,|C|,|B| sweeps, synthetic-needle + SQuAD/HotpotQA accuracy
+- **All EPIC changes vs vanilla**: `git diff <baseline-commit> main` (baseline = first commit)
+
+The original vLLM README follows below.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
