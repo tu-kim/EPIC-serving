@@ -396,6 +396,14 @@ class FlexAttentionMetadata:
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     block_sparsity_hint: BlockSparsityHint | None = None
 
+    # EPIC: non-contiguous KV reuse (Phase 2b, S6). When set, this is the
+    # per-query-row *logical* position (num_actual_tokens,), used in place of the
+    # implied contiguous ``local_q + decode_offset``. The runner writes the
+    # sparse (non-contiguous) RoPE positions for the M tokens here so the causal
+    # logical mask compares each query against its true logical position. None
+    # (default) -> vanilla contiguous derivation, behavior unchanged.
+    logical_q_positions: torch.Tensor | None = None
+
     @cached_property
     def logical_block_ids(self):
         return torch.arange(
@@ -432,9 +440,18 @@ class FlexAttentionMetadata:
         within_lower_bound = logical_kv_idx >= 0
         is_valid = live_block & within_upper_bound & within_lower_bound
 
-        # Convert physical query indices to logical indices
-        local_q_idx = q_idx - self.query_start_loc[q_req]
-        logical_q_idx = local_q_idx + self.decode_offset[q_req]
+        # Convert physical query indices to logical indices.
+        # EPIC (S6): under non-contiguous KV reuse the query rows do NOT sit at
+        # contiguous logical positions, so ``local_q + decode_offset`` is wrong.
+        # When the runner supplied explicit logical positions, index them by the
+        # physical query row directly. In the dense case this is the identity
+        # (positions == local_q + decode_offset), so it is also safe to leave
+        # ``logical_q_positions`` None for vanilla and keep the old derivation.
+        if self.logical_q_positions is not None:
+            logical_q_idx = self.logical_q_positions[q_idx]
+        else:
+            local_q_idx = q_idx - self.query_start_loc[q_req]
+            logical_q_idx = local_q_idx + self.decode_offset[q_req]
 
         return is_valid, logical_q_idx, logical_kv_idx
 
@@ -658,11 +675,25 @@ class FlexAttentionMetadata:
             token_indices = torch.arange(
                 self.doc_ids.shape[0], device=device, dtype=torch.long
             )
-            logical_q_idx = (
-                token_indices
-                - self.query_start_loc[self.doc_ids]
-                + self.decode_offset[self.doc_ids]
-            )
+            # EPIC (S6): use the runner-supplied non-contiguous logical positions
+            # when present (vectorized: indexed by physical token row). In the
+            # dense case this equals the contiguous derivation below.
+            if self.logical_q_positions is not None:
+                # sliding_window over sparse (non-contiguous) positions is not a
+                # supported combination (the window would be computed over
+                # logical gaps); EPIC sparse keeps gate=0 / dense mask, so guard.
+                if self.sliding_window:
+                    raise NotImplementedError(
+                        "EPIC sparse forward is not supported together with "
+                        "sliding-window FlexAttention."
+                    )
+                logical_q_idx = self.logical_q_positions[token_indices]
+            else:
+                logical_q_idx = (
+                    token_indices
+                    - self.query_start_loc[self.doc_ids]
+                    + self.decode_offset[self.doc_ids]
+                )
 
             if self.sliding_window:
                 assert self.sliding_window is not None
@@ -916,6 +947,18 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             else causal_mask_mod
         )
 
+        # EPIC (S6): when the runner flagged sparse (non-contiguous) reuse this
+        # step, feed the patched ``positions`` (which now hold each query row's
+        # true logical position) to the logical mask so causal compares against
+        # the real position, not an implied contiguous index. None otherwise ->
+        # vanilla derivation, behavior unchanged. ``positions`` is already the
+        # full ``num_actual_tokens`` slice the runner passes on common metadata.
+        epic_logical_q_positions = None
+        if getattr(common_attn_metadata, "epic_sparse_logical_q", False):
+            pos = common_attn_metadata.positions
+            if pos is not None:
+                epic_logical_q_positions = pos[:num_actual_tokens].to(torch.long)
+
         out = FlexAttentionMetadata(
             causal=common_attn_metadata.causal,
             logical_mask_mod=logical_mask_mod,
@@ -949,6 +992,7 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             persistent_kv_indices=self.persistent_kv_indices,
             persistent_kv_num_blocks=self.persistent_kv_num_blocks,
             persistent_doc_ids=self.persistent_doc_ids,
+            logical_q_positions=epic_logical_q_positions,  # EPIC (S6)
         )
 
         # Pre-build block_mask so it is ready before CUDA graph capture.

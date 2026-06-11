@@ -221,6 +221,9 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.runner_sparse import (
+        SparseRowEdit,  # EPIC: sparse-forward row edits
+    )
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
@@ -704,6 +707,12 @@ class GPUModelRunner(
         # Encoder timing registry for observability
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
         self._encoder_timing_lock = threading.Lock()
+
+        # EPIC: per-step flag set in _prepare_inputs when this step forwards a
+        # sparse (non-contiguous KV reuse) request. When True the attention
+        # builder feeds the patched ``positions`` to FlexAttention as logical
+        # query positions (S6). Default False -> vanilla, every consumer inert.
+        self._epic_sparse_active: bool = False
 
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
@@ -1860,6 +1869,33 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    def _build_epic_sparse_edits(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        cu_num_tokens: np.ndarray,
+    ) -> list["SparseRowEdit"]:
+        """EPIC: resolve the scheduler's sparse plan to row-range edits.
+
+        Returns an empty list (fast path) when EPIC sparse forward is off, so
+        the vanilla forward never allocates or iterates. Otherwise maps each
+        sparse request's logical RoPE positions / N to the absolute packed-token
+        rows it owns this step. Pure (no device ops) -> unit-testable on CPU.
+        """
+        sparse_positions = scheduler_output.epic_sparse_positions
+        if not sparse_positions:
+            return []
+        from vllm.distributed.kv_transfer.kv_connector.v1.epic.runner_sparse import (
+            build_sparse_row_edits,
+        )
+
+        return build_sparse_row_edits(
+            req_ids=list(self.input_batch.req_ids[:num_reqs]),
+            cu_num_tokens=[int(x) for x in cu_num_tokens[:num_reqs]],
+            epic_sparse_positions=sparse_positions,
+            epic_seq_len=scheduler_output.epic_seq_len,
+        )
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1897,6 +1933,36 @@ class GPUModelRunner(
             self.input_batch.num_computed_tokens_cpu[req_indices]
             + self.query_pos.np[: cu_num_tokens[-1]]
         )
+
+        # EPIC: non-contiguous KV reuse sparse-forward positions (Phase 2b, S4).
+        # When the scheduler stamped explicit sparse RoPE positions for any
+        # request (epic_sparse_positions non-empty), the M tokens actually
+        # forwarded sit at non-contiguous *logical* positions, not the
+        # contiguous ``computed_prefix + arange`` above. Overwrite those rows in
+        # ``positions_np`` BEFORE the token-id gather (:~1915) and slot_mapping
+        # derivation (:~2093), both of which derive from positions and therefore
+        # follow automatically. Empty dict (sparse OFF) -> this whole block is
+        # skipped and the vanilla path is byte-for-byte unchanged.
+        epic_sparse_edits = self._build_epic_sparse_edits(
+            scheduler_output, num_reqs, cu_num_tokens
+        )
+        # Per-step flag so the attention-metadata builder knows to feed the
+        # (now non-contiguous) ``positions`` to FlexAttention as the logical
+        # query positions (S6). Reset each step; False -> vanilla.
+        self._epic_sparse_active = bool(epic_sparse_edits)
+        if epic_sparse_edits:
+            for edit in epic_sparse_edits:
+                positions_np[edit.row_start : edit.row_end] = edit.positions
+
+        # EPIC: sparse-forward positions are 1-D logical RoPE positions and do
+        # not (yet) flow through the M-RoPE / XD-RoPE multi-dimensional position
+        # builders. Fail loud rather than silently mis-position those models.
+        if epic_sparse_edits and (self.uses_mrope or self.uses_xdrope_dim > 0):
+            raise NotImplementedError(
+                "EPIC sparse (non-contiguous KV reuse) forward is not supported "
+                "with M-RoPE / XD-RoPE models; disable epic_sparse_forward for "
+                "these models."
+            )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -2089,6 +2155,25 @@ class GPUModelRunner(
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
+
+        # EPIC: overwrite the GPU positions / seq_lens for sparse-forward reqs
+        # (Phase 2b, S4 GPU + S5). The CPU ``positions_np`` was already patched
+        # above; the GPU positions are recomputed from scratch here, so copy the
+        # sparse rows back in place (no fresh persistent buffer -> CUDA-graph
+        # safe). seq_lens is overridden to N (full reused-KV span) because the
+        # vanilla ``num_computed + num_scheduled`` is not N under sparse reuse
+        # (external A/B KV overlaps the M forward rows). Skipped entirely when
+        # epic_sparse_forward is off (no edits) -> vanilla path unchanged.
+        if epic_sparse_edits:
+            for edit in epic_sparse_edits:
+                pos_t = torch.tensor(
+                    edit.positions,
+                    dtype=self.positions.dtype,
+                    device=self.positions.device,
+                )
+                self.positions[edit.row_start : edit.row_end] = pos_t
+                req_idx = self.input_batch.req_id_to_index[edit.req_id]
+                self.seq_lens[req_idx] = edit.seq_len
 
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
@@ -2293,6 +2378,10 @@ class GPUModelRunner(
             causal=True,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
+            # EPIC: tell a custom-mask backend that ``positions`` carries
+            # non-contiguous logical query positions this step (S6). False ->
+            # vanilla; the flag is reset per step in _prepare_inputs.
+            epic_sparse_logical_q=self._epic_sparse_active,
         )
 
         if self.dcp_world_size > 1:

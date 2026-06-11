@@ -217,3 +217,10 @@ KVConnectorFactory.register_connector(
     "vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_connector",
     "HF3FSKVConnector",
 )
+
+# EPIC: position-independent (non-contiguous) KV reuse connector, Phase 1.
+KVConnectorFactory.register_connector(
+    "EpicConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.epic.epic_connector",
+    "EpicConnector",
+)

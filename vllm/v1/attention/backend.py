@@ -397,6 +397,15 @@ class CommonAttentionMetadata:
     has positions available so that builders can pre-compute position-dependent
     metadata (e.g. C128A topk indices for DeepSeek V4)."""
 
+    # EPIC: non-contiguous KV reuse (Phase 2b, S6). When True the runner has
+    # written sparse (non-contiguous) logical RoPE positions into ``positions``
+    # for one or more requests; a custom-mask backend (FlexAttention) must then
+    # use ``positions`` as the per-query *logical* index instead of the implied
+    # contiguous ``local_q + decode_offset`` (flex_attention.py
+    # _convert_physical_to_logical). Default False -> builders ignore it and the
+    # vanilla contiguous-position path is unchanged.
+    epic_sparse_logical_q: bool = False
+
     is_prefilling: torch.Tensor | None = None
     """(batch_size,) bool tensor: True if request is still in prefill phase
     (num_computed_tokens < num_prompt_tokens). Used by some backends to

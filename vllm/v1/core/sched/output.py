@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -239,6 +239,26 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # EPIC: non-contiguous KV reuse sparse-forward plumbing (Phase 2b, S3).
+    # All three default to empty dicts; when EPIC sparse forward is OFF (or no
+    # EpicConnector is installed) they stay empty and every consumer below
+    # short-circuits, so the default (vanilla) forward path is byte-for-byte
+    # unchanged. Populated by the scheduler from EpicConnector hooks AFTER
+    # build_connector_meta (the connector is a pure metadata producer; the
+    # scheduler is the sole writer of these fields). The Batch-3 runner reads
+    # them to build sparse RoPE positions for the reduced M-token forward.
+    #
+    #   epic_sparse_positions: req_id -> explicit logical RoPE positions of the
+    #     M tokens actually forwarded (len == num_scheduled_tokens[req_id]).
+    #   epic_seq_len:          req_id -> N, the full prompt length (logical
+    #     positions [0, N)) this sparse plan describes.
+    #   epic_computed_advance: req_id -> how much to advance num_computed_tokens
+    #     after this step so it converges to N (NOT num_scheduled_tokens, which
+    #     is the M forward-row count and may overlap reused KV positions).
+    epic_sparse_positions: dict[str, list[int]] = field(default_factory=dict)
+    epic_seq_len: dict[str, int] = field(default_factory=dict)
+    epic_computed_advance: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

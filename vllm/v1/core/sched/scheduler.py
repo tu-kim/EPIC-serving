@@ -545,6 +545,17 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
+            # EPIC (Phase 2b, S7): once an EPIC sparse (non-contiguous reuse)
+            # request is scheduled this step, no other request may join the
+            # batch. The sparse forward shares a single per-step FlexAttention
+            # fusion-mask tensor and a reduced (|M|) forward-row layout that has
+            # only been validated for a singleton batch; mixed batches are an
+            # explicit TODO. The gate below (`if epic_sparse and ...`) defers a
+            # sparse request that would otherwise join a non-empty batch, and the
+            # `break` after a sparse request closes the batch. Both are inert on
+            # every non-sparse step -> default batching is byte-for-byte
+            # unchanged. See epic/PHASE2.md S7.
+
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -718,6 +729,38 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
+                # EPIC: for a sparse (non-contiguous reuse) request, the blocks
+                # covering the reused A/B regions hold approximate (rotated /
+                # not-yet-recomputed) KV this step, not canonical KV. Skip
+                # registering them in the native prefix cache (delay_cache_blocks)
+                # so a later request cannot prefix-match against poisoned blocks.
+                # Inert when no EpicConnector / sparse forward off (duck-typed
+                # hook absent or returns False -> same value as before).
+                epic_sparse = False
+                _is_sparse = getattr(self.connector, "is_sparse_request", None)
+                if _is_sparse is not None and _is_sparse(request_id) is True:
+                    # `is True` (not just truthy): a non-Epic connector exposing
+                    # a same-named attr (e.g. unittest.Mock) returns a truthy
+                    # non-bool; require the exact True the EPIC hook contracts.
+                    epic_sparse = True
+
+                # EPIC (Phase 2b, S7): single-batch gate for sparse requests.
+                # A sparse request must be the ONLY request in its step (shared
+                # fusion-mask tensor + |M| forward layout are not validated for
+                # mixed batches). If anything is already scheduled this step
+                # (a running req, an encoder prefill, or a prior waiting req),
+                # defer this sparse request to a later step rather than
+                # co-scheduling it. The match bookkeeping recorded by
+                # get_num_new_matched_tokens (in self.connector._sparse_reqs) is
+                # cleared in build_connector_meta; since this request will not be
+                # in scheduled_new_reqs, no sparse meta is emitted for it and the
+                # next step re-runs the match cleanly. Inert when no request is
+                # sparse (epic_sparse stays False -> default scheduling).
+                if epic_sparse and num_scheduled_tokens:
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -725,7 +768,7 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
+                    delay_cache_blocks=load_kv_async or epic_sparse,  # EPIC
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                 )
@@ -818,6 +861,14 @@ class Scheduler(SchedulerInterface):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
+                # EPIC (Phase 2b, S7): an EPIC sparse request was just scheduled.
+                # Close the batch so it stays a singleton (see the gate above and
+                # epic/PHASE2.md S7). The gate above already prevented joining a
+                # non-empty batch, so this only fires when the sparse request is
+                # the first one this step. No-op on non-sparse steps.
+                if epic_sparse:
+                    break
+
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
@@ -909,6 +960,12 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
+            # EPIC: apply sparse (non-contiguous reuse) forward overrides. Reads
+            # the connector's per-step metadata (built just above) and rewrites
+            # num_scheduled_tokens / num_computed advance for sparse requests.
+            # Inert when no EpicConnector or no sparse plan this step (the hooks
+            # return None -> nothing is touched, default path preserved).
+            self._apply_epic_sparse_overrides(self.connector, scheduler_output, meta)
 
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:
@@ -925,6 +982,72 @@ class Scheduler(SchedulerInterface):
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
+
+    # EPIC: non-contiguous KV reuse sparse-forward override (Phase 2b, S3).
+    def _apply_epic_sparse_overrides(
+        self,
+        connector: KVConnectorBase_V1,
+        scheduler_output: SchedulerOutput,
+        meta: KVConnectorMetadata,
+    ) -> None:
+        """Rewrite the schedule for EPIC sparse (non-contiguous reuse) requests.
+
+        Called AFTER build_connector_meta (which produced the per-request sparse
+        plan on ``meta``) and BEFORE _update_after_schedule (which advances
+        num_computed_tokens). For each request that has a sparse plan:
+
+          * ``num_scheduled_tokens[req_id]`` is overridden to ``len(M)`` -- the
+            number of token *rows* actually forwarded. The connector reported
+            external=|A|+|B| at match time, so the scheduler's original count was
+            num_new = N-|A|-|B| = |C|; M = C ∪ link(B) ∪ {N-1} may be larger
+            (link/last tokens), so the forward row count must be |M|, not |C|.
+          * the three ``epic_*`` SchedulerOutput dicts are stamped so the Batch-3
+            runner can build sparse RoPE positions and so _update_after_schedule
+            advances num_computed by ``N-external`` (converging to N) instead of
+            ``+= num_scheduled_tokens`` (which would double-count M ∩ B).
+
+        Duck-typed: a non-Epic connector lacks ``get_sparse_num_scheduled_tokens``
+        and this is a no-op. When the connector has no sparse plan this step every
+        hook returns None and nothing is mutated -> default path unchanged.
+        """
+        get_m = getattr(connector, "get_sparse_num_scheduled_tokens", None)
+        if get_m is None:
+            return
+        get_positions = getattr(connector, "get_sparse_positions", None)
+        get_advance = getattr(connector, "get_sparse_computed_advance", None)
+
+        num_scheduled = scheduler_output.num_scheduled_tokens
+        delta_total = 0
+        for req_id in list(num_scheduled.keys()):
+            m_rows = get_m(meta, req_id)
+            # Strict typing (not just `is None`): a non-Epic connector that
+            # happens to expose a same-named attribute (e.g. a unittest.Mock)
+            # would return a non-int; treat anything that is not a real int as
+            # "not sparse" so the vanilla path is never corrupted.
+            if type(m_rows) is not int:
+                continue  # not sparse -> leave the contiguous count untouched.
+            # Forward-row count override: |C| (original) -> |M|.
+            old_rows = num_scheduled[req_id]
+            num_scheduled[req_id] = m_rows
+            delta_total += m_rows - old_rows
+
+            # Explicit per-token sparse RoPE positions for the Batch-3 runner.
+            if get_positions is not None:
+                positions = get_positions(meta, req_id)
+                if isinstance(positions, list):
+                    scheduler_output.epic_sparse_positions[req_id] = positions
+                    scheduler_output.epic_seq_len[req_id] = (
+                        positions[-1] + 1 if positions else 0
+                    )
+            # num_computed advance = N - external (converges to N), overriding
+            # the default += num_scheduled_tokens (= +=|M|) which double-counts.
+            if get_advance is not None:
+                advance = get_advance(meta, req_id)
+                if type(advance) is int:
+                    scheduler_output.epic_computed_advance[req_id] = advance
+
+        # Keep the aggregate consistent with the per-request override.
+        scheduler_output.total_num_scheduled_tokens += delta_total
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
@@ -959,9 +1082,16 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        # EPIC: sparse requests advance num_computed by N-external (so it lands
+        # exactly on N at prefill end), not by num_scheduled_tokens (= |M|, the
+        # forward-row count, which overlaps reused KV positions and would
+        # double-count). Empty dict (no sparse / non-Epic) -> default advance.
+        epic_advance = scheduler_output.epic_computed_advance
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
-            request.num_computed_tokens += num_scheduled_token
+            # EPIC: advance override is inert (dict empty) on the default path.
+            advance = epic_advance.get(req_id, num_scheduled_token)
+            request.num_computed_tokens += advance
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
