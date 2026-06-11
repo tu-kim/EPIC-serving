@@ -623,8 +623,12 @@ class EpicConnector(KVConnectorBase_V1):
         if max_seq_len <= 0:
             return None
 
-        # Strategy-owned M (Phase 2a: empty -> dense). RecomputePlan.is_sparse
-        # is False, so gate stays OFF and the mask == standard causal.
+        # Strategy-owned M. With selection=None the policy returns the dense
+        # plan in BOTH 2a (phase1_dense) and 2b (sparse) modes -- in sparse
+        # mode the fusion mask intentionally stays causal-equivalent (all
+        # logical KV positions are live; per-request sparse M travels via
+        # EpicReqSparse instead). RecomputePlan.is_sparse is False, so the
+        # gate stays OFF and the mask == standard causal.
         plan: RecomputePlan = self._recompute.plan_recompute(
             request=None,  # type: ignore[arg-type]
             selection=None,  # type: ignore[arg-type]

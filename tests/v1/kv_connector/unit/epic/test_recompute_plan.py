@@ -196,3 +196,20 @@ def test_full_prefix_degenerate_is_dense():
     plan = _plan(256, [], n)
     assert plan.recompute_offsets == []
     assert plan.is_sparse is False
+
+
+def test_sparse_policy_without_selection_returns_dense_plan():
+    """Regression (GPU step4 crash): _build_fusion_mask_plan calls
+    plan_recompute(selection=None) even when sparse mode is on
+    (epic_fusion_mask + epic_sparse_forward together). The policy must fall
+    through to the dense plan instead of asserting."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.reuse_strategy import (
+        LegoLinkRecompute,
+        RecomputePlan,
+    )
+
+    policy = LegoLinkRecompute(num_link_tokens=8, phase1_dense=False)  # 2b mode
+    plan = policy.plan_recompute(request=None, selection=None, block_size=16)
+    assert isinstance(plan, RecomputePlan)
+    assert not plan.recompute_offsets  # dense
+    assert not plan.is_sparse  # gate stays off

@@ -367,7 +367,14 @@ class LegoLinkRecompute(RecomputePolicy):
             return RecomputePlan()
 
         # Phase 2b sparse M derivation.
-        assert selection is not None, "plan_recompute needs a selection in 2b"
+        if selection is None:
+            # Legitimate dense fall-through: the per-step fusion-mask plan
+            # (_build_fusion_mask_plan) calls without a selection even when
+            # sparse mode is on. In sparse mode the fusion mask intentionally
+            # stays DENSE (standard causal): all logical KV positions are live
+            # (reused A/B loaded + M computed), and the per-request sparse M is
+            # carried separately via EpicReqSparse. Empty plan == gate OFF.
+            return RecomputePlan()
         n = self._seq_len(request, selection)
         if n <= 0:
             return RecomputePlan()
