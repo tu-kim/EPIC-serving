@@ -56,7 +56,9 @@ imports it for a structure check is not penalized).
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import subprocess
 import sys
 
 # EPIC: fork-safety. This parent process probes CUDA (torch.cuda.is_available)
@@ -169,14 +171,16 @@ def _build_llm(
     kv_config: dict | None,
     enforce_eager: bool = True,
     attention_backend: str | None = None,
+    gpu_memory_utilization: float = 0.45,
+    max_model_len: int = 2048,
 ):
     from vllm import LLM
 
     kwargs: dict = dict(
         model=model,
         enforce_eager=enforce_eager,
-        gpu_memory_utilization=0.45,
-        max_model_len=2048,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
     )
     if kv_config is not None:
         kwargs["kv_transfer_config"] = kv_config
@@ -186,6 +190,37 @@ def _build_llm(
         # AttentionConfig.validate_backend_before (upper-cased enum lookup).
         kwargs["attention_backend"] = attention_backend
     return LLM(**kwargs)
+
+
+class SmokeConfig:
+    """Parent-side knobs threaded into every worker spec (CLI-exposed)."""
+
+    __slots__ = ("model", "gpu_memory_utilization", "max_model_len")
+
+    def __init__(self, model: str, gpu_memory_utilization: float,
+                 max_model_len: int):
+        self.model = model
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_model_len = max_model_len
+
+    def engine_kwargs(self) -> dict:
+        return {
+            "gpu_memory_utilization": self.gpu_memory_utilization,
+            "max_model_len": self.max_model_len,
+        }
+
+
+def _parent_tokenizer(model: str):
+    """CPU-only tokenizer loaded in the PARENT for prompt assembly.
+
+    Uses transformers AutoTokenizer (no torch CUDA init) so the parent can build
+    token-id prompts without ever constructing an LLM / touching the GPU. The
+    parent already probes CUDA availability via NVML (no context); loading a
+    tokenizer keeps it that way.
+    """
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(model)
 
 
 def _texts(outputs) -> list[str]:
@@ -245,23 +280,236 @@ def _head_compare(
 
 
 # ---------------------------------------------------------------------------
+# SUBPROCESS ISOLATION (VRAM-leak fix)
+#
+# Root cause: step1 (2 engines) and step4 (1 dense + 3 sparse engines) built
+# multiple LLMs in ONE process and relied on `del llm` to free VRAM. With the
+# IN-PROCESS engine (VLLM_ENABLE_V1_MULTIPROCESSING=0, required by step4 so the
+# scheduler+worker connectors share EpicConnector.debug_counters), `del llm`
+# does NOT return the device memory: the CUDA context, allocator pool and any
+# cached compiled artifacts persist in the live Python process. Engine N+1 then
+# tries to grab gpu_memory_utilization of the WHOLE device while engine N's
+# allocation is still resident -> "Free memory ... less than desired GPU memory
+# utilization" at construction.
+#
+# Fix: run EACH engine in a FRESH subprocess (`python gpu_smoke.py
+# --_worker-json <spec>`). The worker builds exactly ONE engine, runs its warm
+# + generate prompts, prints `RESULT_JSON: {...}` as its last stdout line, and
+# exits. Process exit returns ALL device memory unconditionally (no reliance on
+# Python-level cleanup). The parent assembles prompts (token ids), dispatches a
+# worker per run, and parses RESULT_JSON. stderr is inherited so the engine and
+# EPIC diagnostic logs still stream to the console; only stdout is parsed.
+#
+# The spec is plain JSON (below) so it is trivially serialise/parse round-trip
+# testable on CPU with no GPU.
+# ---------------------------------------------------------------------------
+
+# Sentinel that prefixes the single machine-readable result line on worker
+# stdout. The parser scans for the LAST line starting with this so arbitrary
+# engine log noise (even lines that happen to contain the word) is tolerated.
+_RESULT_PREFIX = "RESULT_JSON:"
+
+
+def build_worker_spec(
+    *,
+    role: str,
+    model: str,
+    kv_config: dict | None,
+    prompts: list[list[int]],
+    warm_prompts: list[list[int]] | None = None,
+    max_tokens: int,
+    enforce_eager: bool = True,
+    attention_backend: str | None = None,
+    gpu_memory_utilization: float = 0.45,
+    max_model_len: int = 2048,
+    in_process: bool = False,
+    read_counters: bool = False,
+) -> dict:
+    """Build the JSON-serialisable spec for ONE isolated engine run (pure).
+
+    role             -- "dense" or "sparse" (label only; behaviour is driven by
+                        kv_config / in_process / read_counters).
+    prompts          -- list of token-id lists generated and returned.
+    warm_prompts     -- token-id lists generated BEFORE `prompts` to seed the
+                        EPIC store (their outputs are discarded). The warm +
+                        reuse pair MUST run in the SAME engine/process (the store
+                        is per-engine), which is exactly what one worker gives.
+    read_counters    -- if True the worker reads EpicConnector.debug_counters
+                        after the run and returns them (sparse engagement check).
+    in_process       -- if True the worker sets VLLM_ENABLE_V1_MULTIPROCESSING=0
+                        so the scheduler+worker connectors share state in-band.
+    """
+    return {
+        "role": role,
+        "model": model,
+        "kv_config": kv_config,
+        "prompts": [list(p) for p in prompts],
+        "warm_prompts": [list(p) for p in (warm_prompts or [])],
+        "max_tokens": int(max_tokens),
+        "enforce_eager": bool(enforce_eager),
+        "attention_backend": attention_backend,
+        "gpu_memory_utilization": float(gpu_memory_utilization),
+        "max_model_len": int(max_model_len),
+        "in_process": bool(in_process),
+        "read_counters": bool(read_counters),
+    }
+
+
+def serialize_spec(spec: dict) -> str:
+    """Spec -> single-line JSON string (subprocess argv-safe)."""
+    return json.dumps(spec, separators=(",", ":"))
+
+
+def parse_spec(s: str) -> dict:
+    """Single-line JSON string -> spec dict (inverse of serialize_spec)."""
+    return json.loads(s)
+
+
+def parse_result_json(stdout: str) -> dict:
+    """Extract the worker's result dict from captured stdout.
+
+    Scans for the LAST line beginning with ``_RESULT_PREFIX`` so that arbitrary
+    preceding log noise (engine banners, EPIC diagnostics, even lines that
+    mention RESULT_JSON in prose) does not confuse the parse. Raises ValueError
+    with the tail of stdout if no result line is present (a worker that crashed
+    before emitting one).
+    """
+    found: str | None = None
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(_RESULT_PREFIX):
+            found = stripped[len(_RESULT_PREFIX):].strip()
+    if found is None:
+        tail = "\n".join(stdout.splitlines()[-20:])
+        raise ValueError(
+            "no RESULT_JSON line in worker stdout; tail was:\n" + tail
+        )
+    return json.loads(found)
+
+
+def _emit_result(result: dict) -> None:
+    """Print the single machine-readable result line (worker side)."""
+    print(f"{_RESULT_PREFIX} {json.dumps(result)}", flush=True)
+
+
+def run_worker(spec: dict) -> dict:
+    """Worker entry point: build ONE engine, run warm + prompts, return result.
+
+    Returns a result dict (NOT printed here; the caller emits it). On any failure
+    the dict carries {"ok": False, "error": ...} so the parent gets a clean,
+    structured failure instead of a non-zero traceback it must scrape. Device
+    memory is freed by PROCESS EXIT, not by this function.
+    """
+    from vllm.inputs import TokensPrompt
+
+    role = spec.get("role", "?")
+    try:
+        if spec.get("in_process"):
+            # In-band counters: scheduler + worker connectors share state.
+            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
+        params = _greedy_params(max_tokens=int(spec["max_tokens"]))
+        llm = _build_llm(
+            spec["model"],
+            kv_config=spec.get("kv_config"),
+            enforce_eager=bool(spec.get("enforce_eager", True)),
+            attention_backend=spec.get("attention_backend"),
+            gpu_memory_utilization=float(spec.get("gpu_memory_utilization", 0.45)),
+            max_model_len=int(spec.get("max_model_len", 2048)),
+        )
+
+        # Warm runs seed the EPIC store; outputs discarded. Same engine/process
+        # as the measured prompts so the per-engine store is visible to them.
+        for wp in spec.get("warm_prompts", []):
+            llm.generate([TokensPrompt(prompt_token_ids=list(wp))], params)
+
+        token_ids: list[list[int]] = []
+        texts: list[str] = []
+        for p in spec["prompts"]:
+            outs = llm.generate(
+                [TokensPrompt(prompt_token_ids=list(p))], params
+            )
+            token_ids.append(_token_ids(outs)[0])
+            texts.append(_texts(outs)[0])
+
+        result: dict = {
+            "ok": True,
+            "role": role,
+            "token_ids": token_ids,
+            "texts": texts,
+        }
+        if spec.get("read_counters"):
+            # Read the connector's class-level counters from THIS process (the
+            # in-process engine bumped them in-band).
+            result["counters"] = _read_epic_counters()
+        return result
+    except Exception as e:  # noqa: BLE001
+        import traceback
+
+        return {
+            "ok": False,
+            "role": role,
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc(),
+        }
+
+
+def run_engine_subprocess(spec: dict) -> dict:
+    """Parent side: run one engine in a FRESH subprocess and parse its result.
+
+    The subprocess builds exactly one LLM, so its exit returns all device memory
+    -- no VRAM accumulates across runs. stderr is inherited (engine + EPIC logs
+    stream live); only stdout is captured and parsed for the RESULT_JSON line.
+    Raises RuntimeError if the worker crashed without emitting a result.
+    """
+    cmd = [sys.executable, os.path.abspath(__file__),
+           "--_worker-json", serialize_spec(spec)]
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=None,  # inherit -> engine/EPIC logs visible on the console
+        text=True,
+    )
+    try:
+        result = parse_result_json(proc.stdout)
+    except ValueError as e:
+        raise RuntimeError(
+            f"worker (role={spec.get('role')}) produced no RESULT_JSON "
+            f"(exit code {proc.returncode}): {e}"
+        ) from None
+    return result
+
+
+# ---------------------------------------------------------------------------
 # step1 -- connector ON (sparse OFF) is a generation no-op
 # ---------------------------------------------------------------------------
-def step1_no_trace(model: str) -> None:
+def step1_no_trace(model: str, cfg: "SmokeConfig") -> None:
     _log("step1: connector ON (sparse OFF) vs no connector -- output identity")
-    prompts = [
+    # Tokenize in the PARENT (CPU-only AutoTokenizer; no CUDA touch) so the two
+    # engine runs receive byte-identical token ids and each runs in its own
+    # subprocess (fresh VRAM per engine; see SUBPROCESS ISOLATION above).
+    tok = _parent_tokenizer(model)
+    prompt_texts = [
         _PROMPT_HEAD + _SHARED_PASSAGE + _PROMPT_TAIL_1,
         "A completely different prompt about astronomy and telescopes.",
     ]
-    params = _greedy_params()
+    prompts = [list(tok.encode(t)) for t in prompt_texts]
 
-    llm_base = _build_llm(model, kv_config=None)
-    base_out = _token_ids(llm_base.generate(prompts, params))
-    del llm_base
+    base_res = run_engine_subprocess(build_worker_spec(
+        role="dense", model=model, kv_config=None, prompts=prompts,
+        max_tokens=32, **cfg.engine_kwargs(),
+    ))
+    if not base_res.get("ok"):
+        _fail("step1", f"baseline engine failed: {base_res.get('error')}")
+    base_out = base_res["token_ids"]
 
-    llm_epic = _build_llm(model, kv_config=_epic_kv_config(sparse=False))
-    epic_out = _token_ids(llm_epic.generate(prompts, params))
-    del llm_epic
+    epic_res = run_engine_subprocess(build_worker_spec(
+        role="dense", model=model, kv_config=_epic_kv_config(sparse=False),
+        prompts=prompts, max_tokens=32, **cfg.engine_kwargs(),
+    ))
+    if not epic_res.get("ok"):
+        _fail("step1", f"connector-on engine failed: {epic_res.get('error')}")
+    epic_out = epic_res["token_ids"]
 
     for i, (b, e) in enumerate(zip(base_out, epic_out)):
         if b != e:
@@ -300,7 +548,7 @@ class _in_process_engine:
 
 def _expect_gate_failure(
     step: str, model: str, *, enforce_eager: bool, attention_backend: str,
-    must_mention: str,
+    must_mention: str, cfg: "SmokeConfig",
 ) -> None:
     try:
         with _in_process_engine():
@@ -309,6 +557,7 @@ def _expect_gate_failure(
                 kv_config=_epic_kv_config(sparse=True),
                 enforce_eager=enforce_eager,
                 attention_backend=attention_backend,
+                **cfg.engine_kwargs(),
             )
     except ValueError as e:
         if must_mention not in str(e):
@@ -344,24 +593,24 @@ def _expect_gate_failure(
 # ---------------------------------------------------------------------------
 # step2 -- sparse ON + wrong backend must fail fast
 # ---------------------------------------------------------------------------
-def step2_wrong_backend_fails(model: str) -> None:
+def step2_wrong_backend_fails(model: str, cfg: "SmokeConfig") -> None:
     _log("step2: sparse ON + non-FlexAttention backend must raise ValueError")
     _expect_gate_failure(
         "step2", model,
         enforce_eager=True, attention_backend="FLASH_ATTN",
-        must_mention="FLEX_ATTENTION",
+        must_mention="FLEX_ATTENTION", cfg=cfg,
     )
 
 
 # ---------------------------------------------------------------------------
 # step3 -- sparse ON + FlexAttention but NOT eager must fail fast
 # ---------------------------------------------------------------------------
-def step3_non_eager_fails(model: str) -> None:
+def step3_non_eager_fails(model: str, cfg: "SmokeConfig") -> None:
     _log("step3: sparse ON + FlexAttention + NOT eager must raise ValueError")
     _expect_gate_failure(
         "step3", model,
         enforce_eager=False, attention_backend="FLEX_ATTENTION",
-        must_mention="enforce_eager",
+        must_mention="enforce_eager", cfg=cfg,
     )
 
 
@@ -607,25 +856,17 @@ def _read_epic_counters() -> dict:
     return dict(EpicConnector.debug_counters)
 
 
-def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
+def step4_shared_chunk_sparse_vs_dense(model: str, cfg: "SmokeConfig") -> None:
     _log(
         "step4: NEEDLE probe -- DENSE reference vs sparse across a LINK sweep "
         f"{_LINK_SWEEP} (discriminative: answer code lives ONLY in passage B)"
     )
 
-    from vllm.inputs import TokensPrompt
+    max_tokens = 48
 
-    params = _greedy_params(max_tokens=48)
-
-    # --- dense reference engine (also gives us the tokenizer for assembly) ---
-    # The dense reference is independent of the link value, so compute it ONCE.
-    # Dense reference may run multiprocess (no in-band counter assertion needed).
-    llm_dense = _build_llm(
-        model,
-        kv_config=_epic_kv_config(sparse=False),
-        attention_backend="FLEX_ATTENTION",
-    )
-    tok = llm_dense.get_tokenizer()
+    # Tokenizer in the PARENT (CPU-only) for prompt assembly + decode logging.
+    # Each engine run goes to its own subprocess (fresh VRAM per engine).
+    tok = _parent_tokenizer(model)
 
     def _enc(text: str) -> list[int]:
         # add_special_tokens=False: we control boundaries ourselves; a leading
@@ -665,8 +906,8 @@ def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
         filler_ids=filler_ids,
         passage_chunks=1,
     )
-    warm_prompt = TokensPrompt(prompt_token_ids=assembled["warm_ids"])
-    reuse_prompt = TokensPrompt(prompt_token_ids=assembled["reuse_ids"])
+    warm_ids = assembled["warm_ids"]
+    reuse_ids = assembled["reuse_ids"]
 
     _log(
         f"step4: chunk_size={chunk_size} B_len={assembled['b_len']} "
@@ -685,12 +926,27 @@ def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
         "for the engagement check.)"
     )
 
-    # warm: saves the shared B chunk(s). dense_out is the link-independent ref.
-    llm_dense.generate([warm_prompt], params)
-    dense_outs = llm_dense.generate([reuse_prompt], params)
-    dense_out = _token_ids(dense_outs)[0]
-    dense_text = _texts(dense_outs)[0]
-    del llm_dense
+    # --- DENSE reference engine (subprocess; link-independent, computed ONCE) -
+    # The warm prompt seeds B's chunks; the reuse prompt is the measured output.
+    # Both run in the SAME worker so the per-engine store is shared. Dense may be
+    # multiprocess (no in-band counter assertion needed) but a subprocess gives
+    # us the VRAM isolation for free, so use one worker.
+    dense_res = run_engine_subprocess(build_worker_spec(
+        role="dense",
+        model=model,
+        kv_config=_epic_kv_config(sparse=False),
+        warm_prompts=[warm_ids],
+        prompts=[reuse_ids],
+        max_tokens=max_tokens,
+        enforce_eager=True,
+        attention_backend="FLEX_ATTENTION",
+        **cfg.engine_kwargs(),
+    ))
+    if not dense_res.get("ok"):
+        _fail("step4", f"DENSE reference engine failed: {dense_res.get('error')}\n"
+              + dense_res.get("traceback", ""))
+    dense_out = dense_res["token_ids"][0]
+    dense_text = dense_res["texts"][0]
 
     _log(f"step4: DENSE reference text: {dense_text!r}")
     _log(
@@ -728,39 +984,52 @@ def step4_shared_chunk_sparse_vs_dense(model: str) -> None:
             "blank-filler bug). Check the prompt assembly / sampling params.",
         )
 
-    # --- link sweep: one fresh IN-PROCESS sparse engine per link value ------
-    # In-process (VLLM_ENABLE_V1_MULTIPROCESSING=0) so the SCHEDULER and WORKER
-    # connectors share EpicConnector.debug_counters in THIS process -> we can
-    # assert engagement in-band (no log scraping). Reset the counters per run.
+    # --- link sweep: one fresh SUBPROCESS sparse engine per link value ------
+    # Each run is an IN-PROCESS engine (VLLM_ENABLE_V1_MULTIPROCESSING=0, set by
+    # the worker) so the SCHEDULER and WORKER connectors share
+    # EpicConnector.debug_counters within THAT subprocess; the worker reads the
+    # counters there and returns them. Running each link in its OWN subprocess is
+    # the VRAM-leak fix: an in-process engine does NOT free device memory on
+    # `del llm`, so building 3 of them in one parent process accumulated VRAM and
+    # tripped the "Free memory < utilization" gate. Subprocess exit frees it all.
     results: list[tuple[int, float, int, bool, dict]] = []
     for link in _LINK_SWEEP:
         b_len = assembled["b_len"]
         eff_link = min(link, b_len)
         _log(
-            f"step4[link={link}]: building IN-PROCESS sparse engine "
+            f"step4[link={link}]: launching SUBPROCESS sparse engine "
             f"(epic_link_tokens={eff_link}, B_len={b_len}, "
             f"reuse_fraction={(b_len - eff_link) / b_len:.2f})"
         )
-        _reset_epic_counters()
-        with _in_process_engine():
-            llm_sparse = _build_llm(
-                model,
-                kv_config=_epic_kv_config(
-                    sparse=True,
-                    fusion=True,
-                    link_tokens=eff_link,
-                    debug_check_load=True,   # Implement 2: scatter self-check.
-                    debug_counters=True,     # in-band engagement assertion.
-                ),
-                enforce_eager=True,
-                attention_backend="FLEX_ATTENTION",
+        sparse_res = run_engine_subprocess(build_worker_spec(
+            role="sparse",
+            model=model,
+            kv_config=_epic_kv_config(
+                sparse=True,
+                fusion=True,
+                link_tokens=eff_link,
+                debug_check_load=True,   # Implement 2: scatter self-check.
+                debug_counters=True,     # in-band engagement assertion.
+            ),
+            warm_prompts=[warm_ids],     # warm: saves the chunk (same engine)
+            prompts=[reuse_ids],
+            max_tokens=max_tokens,
+            enforce_eager=True,
+            attention_backend="FLEX_ATTENTION",
+            in_process=True,             # share counters scheduler<->worker
+            read_counters=True,          # return them in the result json
+            **cfg.engine_kwargs(),
+        ))
+        if not sparse_res.get("ok"):
+            _fail(
+                "step4",
+                f"sparse engine (link={link}) failed: "
+                f"{sparse_res.get('error')}\n"
+                + sparse_res.get("traceback", ""),
             )
-            llm_sparse.generate([warm_prompt], params)  # warm: saves the chunk
-            sparse_outs = llm_sparse.generate([reuse_prompt], params)
-            sparse_out = _token_ids(sparse_outs)[0]
-            sparse_text = _texts(sparse_outs)[0]
-            counters = _read_epic_counters()
-            del llm_sparse
+        sparse_out = sparse_res["token_ids"][0]
+        sparse_text = sparse_res["texts"][0]
+        counters = sparse_res.get("counters", {})
 
         rate = _match_rate(dense_out, sparse_out)
         div = _first_divergence(dense_out, sparse_out)
@@ -912,7 +1181,27 @@ def _parse_steps(arg: str | None) -> list[int]:
     return out
 
 
-def main() -> int:
+def _worker_main(spec_json: str) -> int:
+    """Hidden self-invocation entry: build ONE engine, emit RESULT_JSON, exit.
+
+    Always returns 0 -- success/failure is carried IN the RESULT_JSON ("ok"
+    field), so a worker that cleanly reports a build failure (e.g. no GPU) is
+    distinguishable from a worker that crashed without emitting a result (the
+    parent then sees a missing RESULT_JSON and raises). Device memory is freed by
+    this process exiting.
+    """
+    try:
+        spec = parse_spec(spec_json)
+    except Exception as e:  # noqa: BLE001
+        _emit_result({"ok": False, "role": "?",
+                      "error": f"bad spec: {type(e).__name__}: {e}"})
+        return 0
+    result = run_worker(spec)
+    _emit_result(result)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="EPIC GPU smoke test")
     ap.add_argument(
         "--model",
@@ -924,7 +1213,29 @@ def main() -> int:
         default=None,
         help="Comma-separated step numbers to run (default: 1,2,3,4).",
     )
-    args = ap.parse_args()
+    ap.add_argument(
+        "--gpu-mem-util",
+        type=float,
+        default=0.45,
+        help="gpu_memory_utilization passed to every engine (default 0.45).",
+    )
+    ap.add_argument(
+        "--max-model-len",
+        type=int,
+        default=2048,
+        help="max_model_len passed to every engine (default 2048).",
+    )
+    ap.add_argument(
+        "--_worker-json",
+        dest="worker_json",
+        default=None,
+        help=argparse.SUPPRESS,  # hidden: per-engine subprocess self-invocation.
+    )
+    args = ap.parse_args(argv)
+
+    # --- hidden worker mode: build ONE engine, print RESULT_JSON, exit --------
+    if args.worker_json is not None:
+        return _worker_main(args.worker_json)
 
     if not _has_cuda():
         _log(
@@ -934,13 +1245,23 @@ def main() -> int:
         )
         return 0
 
+    cfg = SmokeConfig(
+        model=args.model,
+        gpu_memory_utilization=args.gpu_mem_util,
+        max_model_len=args.max_model_len,
+    )
     steps = _parse_steps(args.steps)
-    _log(f"model={args.model} steps={steps}")
+    _log(
+        f"model={args.model} steps={steps} "
+        f"gpu_mem_util={cfg.gpu_memory_utilization} "
+        f"max_model_len={cfg.max_model_len} "
+        "(each engine runs in a FRESH subprocess for VRAM isolation)"
+    )
     for s in steps:
         fn = _STEPS.get(s)
         if fn is None:
             _fail("main", f"unknown step {s}; valid: {sorted(_STEPS)}")
-        fn(args.model)
+        fn(args.model, cfg)
     _log(f"ALL REQUESTED STEPS PASSED: {steps}")
     return 0
 
