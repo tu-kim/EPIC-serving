@@ -43,6 +43,21 @@ Steps (run in order; stop at the first failure):
            * link=full-B (decisive): needle hit AND match>=0.9 -> PASS gate.
            * link=64/8: needle hit + match + first-divergence REPORTED only
              (approximation regime; a miss there is an algorithmic limit).
+  step5  CROSS-CONTEXT approximation-quality probe. Where step4's needle is a
+         discrete, B-self-contained fact (nearly link-INVARIANT, so a weak probe
+         of what LegoLink buys), step5 measures CONTINUOUS output fidelity: a
+         contentful shared passage B is reused NON-PREFIX under a NEW context
+         A/C; the DENSE (full-recompute) continuation C* is generated once, then
+         each sparse link L re-scores the fixed (reuse_prompt + C*) sequence via
+         teacher-forced prompt_logprobs and reports distance(L) = mean NLL of C*
+         under sparse-L (smaller == closer to dense). The link sweep includes
+         the extremes: link=0 (reuse-only, pure stale KV) and link=B_full (full
+         recompute, == dense up to numerics). Verdicts: B_full distance ~= dense
+         self-NLL else MACHINERY FAIL; reuse-only > B_full means recompute does
+         something (else "LINK HAS NO EFFECT" diagnostic); middle links are
+         REPORTED (distance + monotonicity), never hard-thresholded. A
+         monotone-decreasing distance with link is the evidence the EPIC
+         approximation converges to dense.
 
 Usage:
     # On a CUDA box, after `VLLM_USE_PRECOMPILED=1 uv pip install -e .`.
@@ -331,6 +346,8 @@ def build_worker_spec(
     max_model_len: int = 2048,
     in_process: bool = False,
     read_counters: bool = False,
+    prompt_logprobs: int | None = None,
+    logprob_prefix_lens: list[int] | None = None,
 ) -> dict:
     """Build the JSON-serialisable spec for ONE isolated engine run (pure).
 
@@ -345,6 +362,19 @@ def build_worker_spec(
                         after the run and returns them (sparse engagement check).
     in_process       -- if True the worker sets VLLM_ENABLE_V1_MULTIPROCESSING=0
                         so the scheduler+worker connectors share state in-band.
+    prompt_logprobs  -- if not None, run each prompt as a TEACHER-FORCED scoring
+                        pass (SamplingParams(prompt_logprobs=N, max_tokens=1))
+                        and return, per prompt, the per-position logprob of the
+                        ACTUAL prompt token (the step5 fidelity metric: the
+                        likelihood the engine assigns to a fixed token sequence).
+                        N==0 is enough (vLLM always includes the real prompt
+                        token's logprob at each position regardless of top-N).
+    logprob_prefix_lens -- per prompt, the prompt-token offset BEFORE which the
+                        teacher-forced logprob is not scored (the reuse-prompt
+                        prefix); only positions >= this offset (the appended
+                        dense continuation) are summed into the NLL. Defaults to
+                        0 (score the whole prompt). Length must match ``prompts``
+                        when given.
     """
     return {
         "role": role,
@@ -359,6 +389,11 @@ def build_worker_spec(
         "max_model_len": int(max_model_len),
         "in_process": bool(in_process),
         "read_counters": bool(read_counters),
+        # step5 teacher-forced scoring (None -> plain generation, unchanged).
+        "prompt_logprobs": (None if prompt_logprobs is None
+                            else int(prompt_logprobs)),
+        "logprob_prefix_lens": (None if logprob_prefix_lens is None
+                                else [int(x) for x in logprob_prefix_lens]),
     }
 
 
@@ -399,6 +434,88 @@ def _emit_result(result: dict) -> None:
     print(f"{_RESULT_PREFIX} {json.dumps(result)}", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# step5 teacher-forced logprob extraction + serialisation (pure, CPU-testable)
+#
+# vLLM's RequestOutput.prompt_logprobs is, per prompt position, a
+# dict[int, Logprob] that ALWAYS includes the actual prompt token id at that
+# position (its rank lookup guarantees it, regardless of top-N). So with
+# SamplingParams(prompt_logprobs=0, max_tokens=1) we get, for free, the
+# log P(prompt_token[pos] | prompt[:pos]) the model assigns to a FIXED token
+# sequence -- exactly the teacher-forced score step5 needs. We extract only the
+# ACTUAL-token logprob per position into a flat list[float | None] (None where
+# vLLM has no entry, e.g. position 0), which is trivially JSON-serialisable and
+# round-trip testable on CPU with no torch/vLLM.
+# ---------------------------------------------------------------------------
+def extract_actual_token_logprobs(
+    prompt_token_ids: list[int], prompt_logprobs
+) -> list[float | None]:
+    """Per prompt position, the logprob the engine assigned to the ACTUAL
+    prompt token at that position (or None if unavailable).
+
+    ``prompt_logprobs`` is a vLLM ``PromptLogprobs`` (list-like of
+    ``dict[int, Logprob]`` per position, with ``None`` for position 0). We index
+    each position's dict by the real token id and pull its ``.logprob``. Pure
+    apart from reading the (already-pythonised) vLLM objects, so the parsing
+    half is unit-testable with plain dicts of floats.
+    """
+    out: list[float | None] = []
+    n = len(prompt_token_ids)
+    for pos in range(n):
+        lp_at_pos = None
+        if prompt_logprobs is not None and pos < len(prompt_logprobs):
+            entry = prompt_logprobs[pos]
+            if entry:
+                tid = prompt_token_ids[pos]
+                lp = entry.get(tid)
+                if lp is not None:
+                    # vLLM Logprob dataclass -> .logprob; tolerate a bare float
+                    # (the CPU parsing test feeds plain floats).
+                    lp_at_pos = float(getattr(lp, "logprob", lp))
+        out.append(lp_at_pos)
+    return out
+
+
+def teacher_forced_nll(
+    token_logprobs: list[float | None], prefix_len: int
+) -> tuple[float, int]:
+    """Sum of -logprob over the SCORED region [prefix_len, end), and the count
+    of positions actually scored. Positions with a None logprob (no entry) are
+    skipped (they cannot be scored). Returns (sum_nll, n_scored).
+
+    The scored region is the appended dense-continuation tokens; the reuse
+    prompt prefix (B + A/C + Q) is excluded so the metric reflects fidelity of
+    the CONTINUATION the engine would produce, not the fixed prompt.
+    """
+    sum_nll = 0.0
+    n = 0
+    for pos in range(max(prefix_len, 0), len(token_logprobs)):
+        lp = token_logprobs[pos]
+        if lp is None:
+            continue
+        sum_nll += -float(lp)
+        n += 1
+    return sum_nll, n
+
+
+def mean_nll_to_perplexity(sum_nll: float, n_scored: int) -> tuple[float, float]:
+    """(mean NLL, perplexity) over n_scored positions. Perplexity = exp(meanNLL)
+    is reported alongside for readability; the PRIMARY distance is mean NLL
+    (smaller == closer to dense, the metric-direction convention). Returns
+    (inf, inf) when nothing was scored so a degenerate run is obvious rather
+    than silently 0."""
+    import math
+
+    if n_scored <= 0:
+        return float("inf"), float("inf")
+    mean = sum_nll / n_scored
+    try:
+        ppl = math.exp(mean)
+    except OverflowError:
+        ppl = float("inf")
+    return mean, ppl
+
+
 def run_worker(spec: dict) -> dict:
     """Worker entry point: build ONE engine, run warm + prompts, return result.
 
@@ -407,9 +524,11 @@ def run_worker(spec: dict) -> dict:
     structured failure instead of a non-zero traceback it must scrape. Device
     memory is freed by PROCESS EXIT, not by this function.
     """
+    from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
 
     role = spec.get("role", "?")
+    plp_n = spec.get("prompt_logprobs")
     try:
         if spec.get("in_process"):
             # In-band counters: scheduler + worker connectors share state.
@@ -430,6 +549,42 @@ def run_worker(spec: dict) -> dict:
         for wp in spec.get("warm_prompts", []):
             llm.generate([TokensPrompt(prompt_token_ids=list(wp))], params)
 
+        # --- step5 teacher-forced scoring branch -------------------------------
+        # prompt_logprobs != None -> we are SCORING a fixed token sequence
+        # (reuse_prompt + dense_continuation), not generating. max_tokens=1 keeps
+        # the forward minimal; we only read RequestOutput.prompt_logprobs.
+        if plp_n is not None:
+            score_params = SamplingParams(
+                temperature=0.0, max_tokens=1, prompt_logprobs=int(plp_n)
+            )
+            prefix_lens = spec.get("logprob_prefix_lens") or [
+                0 for _ in spec["prompts"]
+            ]
+            token_logprobs: list[list[float | None]] = []
+            nll_sums: list[float] = []
+            nll_counts: list[int] = []
+            for p, pre in zip(spec["prompts"], prefix_lens):
+                pid = list(p)
+                outs = llm.generate(
+                    [TokensPrompt(prompt_token_ids=pid)], score_params
+                )
+                plp = outs[0].prompt_logprobs
+                per_pos = extract_actual_token_logprobs(pid, plp)
+                s, c = teacher_forced_nll(per_pos, int(pre))
+                token_logprobs.append(per_pos)
+                nll_sums.append(s)
+                nll_counts.append(c)
+            result: dict = {
+                "ok": True,
+                "role": role,
+                "token_logprobs": token_logprobs,
+                "nll_sums": nll_sums,
+                "nll_counts": nll_counts,
+            }
+            if spec.get("read_counters"):
+                result["counters"] = _read_epic_counters()
+            return result
+
         token_ids: list[list[int]] = []
         texts: list[str] = []
         for p in spec["prompts"]:
@@ -439,7 +594,7 @@ def run_worker(spec: dict) -> dict:
             token_ids.append(_token_ids(outs)[0])
             texts.append(_texts(outs)[0])
 
-        result: dict = {
+        result = {
             "ok": True,
             "role": role,
             "token_ids": token_ids,
@@ -971,6 +1126,86 @@ _LINK_SWEEP = [256, 64, 8]
 # (used only for the link == B-full decisive gate).
 _MACHINERY_PASS_THRESHOLD = 0.9
 
+# step5 link sweep (cross-context approximation-quality probe). Includes the two
+# extremes that bracket the regime:
+#   0      -> reuse-only: ZERO recompute of the non-prefix B chunk (pure stale
+#             reused KV computed under the WARM context, never seeing the reuse
+#             context A/C). Maximum approximation.
+#   8, 64  -> increasing LegoLink boundary recompute (B's leading tokens made
+#             fresh) -> output should move TOWARD dense.
+#   B_full -> the whole B chunk recomputed == dense up to numerics (the control:
+#             distance MUST be ~0; a non-zero distance here is a MACHINERY FAIL,
+#             same meaning as step4's decisive gate).
+# B_full is appended at runtime (= chunk_size) so the constant stays B-agnostic.
+_STEP5_LINK_SWEEP = [0, 8, 64]
+
+# Distance (mean NLL of the dense continuation under the sparse model) below
+# which the B-full control is considered "== dense up to numerics". Teacher-
+# forced NLL on the SAME continuation tokens with full recompute should be
+# essentially the dense self-NLL; a small positive epsilon absorbs fp/kernel
+# nondeterminism. This is the step5 MACHINERY gate (mirror of step4 decisive).
+_STEP5_BFULL_NLL_EPS = 0.05
+
+# Relative gap below which reuse-only (link=0) is judged INDISTINGUISHABLE from
+# full recompute -> "LINK HAS NO EFFECT" diagnostic (NOT a failure: it is a real
+# finding that, for this prompt, the link boundary recompute buys nothing).
+_STEP5_NO_EFFECT_REL = 0.02
+
+
+def is_monotonic_nonincreasing(values: list[float], *, tol: float = 1e-6) -> bool:
+    """True iff ``values`` never INCREASES by more than ``tol`` step-to-step.
+
+    Used to test the step5 expectation that distance-to-dense (mean NLL)
+    (weakly) DECREASES as the link recompute budget grows -- i.e. more recompute
+    -> output closer to dense. ``tol`` absorbs fp jitter so a numerically flat
+    sequence still reads as monotonic. Infs/NaNs make it False (a degenerate
+    run is not 'monotonic')."""
+    import math
+
+    prev: float | None = None
+    for v in values:
+        if not math.isfinite(v):
+            return False
+        if prev is not None and v > prev + tol:
+            return False
+        prev = v
+    return True
+
+
+def monotonicity_report(
+    links: list[int], distances: list[float]
+) -> dict:
+    """Summarise the step5 sweep's monotonicity (pure, CPU-testable).
+
+    Returns a dict with:
+      ``ordered_by_link``  -- distances sorted by ASCENDING link (recompute);
+      ``nonincreasing``    -- is_monotonic_nonincreasing over that order;
+      ``n_violations``     -- count of step-to-step INCREASES (jitter-tolerant);
+      ``first_distance``/``last_distance`` -- endpoints of the link-ordered list.
+
+    The expectation: distance is non-increasing in link (more recompute is at
+    least as close to dense). Violations are REPORTED, not failed (step5 forbids
+    hard thresholds on the middle links).
+    """
+    pairs = sorted(zip(links, distances), key=lambda t: t[0])
+    ordered = [d for _, d in pairs]
+    import math
+
+    n_viol = 0
+    prev: float | None = None
+    for v in ordered:
+        if prev is not None and math.isfinite(v) and math.isfinite(prev) \
+                and v > prev + 1e-6:
+            n_viol += 1
+        prev = v
+    return {
+        "ordered_by_link": ordered,
+        "nonincreasing": is_monotonic_nonincreasing(ordered),
+        "n_violations": n_viol,
+        "first_distance": ordered[0] if ordered else None,
+        "last_distance": ordered[-1] if ordered else None,
+    }
+
 
 # Minimum distinct decoded tokens for the dense output to be considered a real,
 # discriminative answer (a blank/degenerate output has <4 distinct tokens).
@@ -1398,6 +1633,371 @@ def _step4_one_offset(
     )
 
 
+# ---------------------------------------------------------------------------
+# step5 -- CROSS-CONTEXT APPROXIMATION-QUALITY PROBE
+#
+# WHY (design rationale -- read before changing): step4's needle is a DISCRETE,
+# B-self-contained fact. Because the reuse prompt's tail Q is always recomputed
+# and attends over the WHOLE KV (A . B), a B-only answer is retrievable by
+# Q->B attention without ANY link recompute -- so the needle is nearly link-
+# INVARIANT and a poor probe of what link buys. To measure the VALUE of LegoLink
+# boundary recompute we need a CONTINUOUS output-fidelity signal: B's reused KV
+# was computed under the WARM context and is "stale" w.r.t. the reuse context
+# (A/C); link recompute makes B's leading tokens FRESH. As the recompute budget
+# grows, the sparse model's continuation should converge to the DENSE (full
+# recompute) continuation. That monotone convergence is the evidence the EPIC
+# approximation works.
+#
+# METRIC (chosen: teacher-forced NLL of the dense continuation under sparse):
+#   1. DENSE run (sparse OFF) generates a continuation C* for the reuse prompt.
+#   2. For each sparse link L, we SCORE the fixed sequence (reuse_prompt + C*)
+#      with SamplingParams(prompt_logprobs=0, max_tokens=1) and sum -logP over
+#      the C* positions: NLL_L = teacher-forced negative log-likelihood the
+#      sparse-L model assigns to the DENSE continuation.
+#   distance(L) = mean NLL_L (smaller == closer to dense). Direction unified:
+#   KL/NLL both "distance to dense", smaller is better.
+#
+#   Why prompt_logprobs and not first-token top-K KL: vLLM's
+#   RequestOutput.prompt_logprobs cleanly returns, per prompt position, the
+#   ACTUAL token's logprob in the OFFLINE LLM API (it always includes the real
+#   prompt token regardless of top-N), giving a multi-token, low-variance,
+#   teacher-forced fidelity score in ONE forward per (link). A first-token KL
+#   would need top-K sample logprobs aligned across runs and only scores ONE
+#   position (higher variance, link signal weaker). prompt_logprobs is the
+#   clean path in vLLM offline mode, so it is the primary metric.
+#
+# VERDICTS (mechanical):
+#   * link=B_full distance ~= dense self-NLL (<= dense + eps) -> else MACHINERY
+#     FAIL (same meaning as step4 decisive: a non-zero distance with ZERO reuse
+#     approximation is a mechanical bug, not an algorithm limit).
+#   * link=0 (reuse-only) distance > link=B_full distance -> recompute does
+#     something. If reuse-only ~= full -> "LINK HAS NO EFFECT" diagnostic
+#     (reported, NOT a failure).
+#   * middle links: REPORT distance + monotonicity; NO hard threshold.
+# ---------------------------------------------------------------------------
+
+# Passage A: a shared, contentful DISTRACTOR document (appears as the prefix
+# head of BOTH prompts -- a prefix the reuse request can also hit, but the focus
+# is B). Real sentences (not blank filler) so the context is genuinely rich.
+_STEP5_PASSAGE_A = (
+    "The river delta supports a dense network of fishing villages whose "
+    "economies have depended on the seasonal floods for centuries. Engineers "
+    "later built a series of levees and pumping stations to manage the water, "
+    "which changed the sediment patterns downstream and forced the villages to "
+    "adapt their methods. Historians note that the same delta hosted three "
+    "successive trading civilizations, each leaving distinct pottery styles. "
+)
+
+# Passage B: the SHARED, REUSED passage spliced NON-PREFIX into the reuse
+# prompt. It is contentful and CONNECTED to A/C (it refers to "the delta" and to
+# "the council") so that the reuse context genuinely matters -- stale B (warm
+# context) vs fresh B (link recompute) should produce measurably different
+# continuations. Truncated/padded to exactly chunk_size at the token level.
+_STEP5_PASSAGE_B = (
+    "Within the delta the regional council debated whether to restore the old "
+    "wetlands or expand the levee system further inland. Proponents of "
+    "restoration argued that the wetlands buffered storm surges and revived the "
+    "fisheries, while the engineering faction warned that uncontrolled flooding "
+    "would threaten the new rail corridor. The council commissioned a study "
+    "weighing the long term sediment economy against short term flood risk, and "
+    "its findings shaped the policy that the following paragraphs analyze in "
+    "detail across several competing scenarios and stakeholder positions. "
+)
+
+# Per-request context C (the reuse prompt's distinct head) plus a tail that asks
+# for a CONTINUATION grounded in A+B (so the answer depends on the reused KV
+# being aligned to the reuse context, not the warm one).
+_STEP5_REUSE_HEAD = (
+    "An analyst for the rail authority is preparing a briefing and must "
+    "reconcile the council's deliberations with the delta's history. "
+)
+_STEP5_REUSE_TAIL = (
+    " Summarize the council's central tradeoff and explain, in a few "
+    "sentences, what the policy should prioritize and why:"
+)
+# The warm prompt's own tail (seeds B under the warm context). Different from the
+# reuse tail so B is genuinely non-prefix-reused under a NEW context.
+_STEP5_WARM_TAIL = (
+    " Describe the delta's geography for a general encyclopedia entry:"
+)
+
+
+def step5_cross_context_fidelity(model: str, cfg: "SmokeConfig") -> None:
+    """CROSS-CONTEXT approximation-quality probe (see module comment above)."""
+    _log(
+        "step5: CROSS-CONTEXT fidelity -- teacher-forced NLL of the DENSE "
+        "continuation under each sparse link "
+        f"{_STEP5_LINK_SWEEP}+[B_full] (smaller NLL == closer to dense)"
+    )
+
+    cont_tokens = 32  # dense continuation length we score the sparse runs on.
+    chunk_size = DEFAULT_CHUNK_SIZE
+
+    tok = _parent_tokenizer(model)
+
+    def _enc(text: str) -> list[int]:
+        return list(tok.encode(text, add_special_tokens=False))
+
+    # B as EXACTLY chunk_size tokens (byte-identical warm vs reuse -> hash hit).
+    b_src = _enc(_STEP5_PASSAGE_B)
+    if len(b_src) < chunk_size:
+        # pad with rotating real-word filler (never blank) up to chunk_size.
+        fill: list[int] = []
+        i = 0
+        while len(b_src) + len(fill) < chunk_size:
+            fill.extend(_enc(" " + _FILLER_WORDS[i % len(_FILLER_WORDS)]))
+            i += 1
+        b_src = (b_src + fill)[:chunk_size]
+    b_ids = b_src[:chunk_size]
+    assert len(b_ids) == chunk_size
+
+    # Discriminative filler ids (real words) for head padding.
+    filler_ids: list[int] = []
+    for w in _FILLER_WORDS:
+        filler_ids.extend(_enc(" " + w))
+    if not filler_ids:
+        filler_ids = [0]
+
+    assembled = build_aligned_token_prompts(
+        head_ids=_enc(_STEP5_PASSAGE_A),
+        passage_ids=b_ids,
+        tail_ids=_enc(_STEP5_WARM_TAIL),
+        reuse_head_ids=_enc(_STEP5_PASSAGE_A + _STEP5_REUSE_HEAD),
+        reuse_tail_ids=_enc(_STEP5_REUSE_TAIL),
+        chunk_size=chunk_size,
+        filler_ids=filler_ids,
+        passage_chunks=1,
+    )
+    warm_ids = assembled["warm_ids"]
+    reuse_ids = assembled["reuse_ids"]
+    reuse_len = len(reuse_ids)
+
+    _log(
+        f"step5: chunk_size={chunk_size} B_len={assembled['b_len']} "
+        f"reuse_B_offset={assembled['reuse_b_offset']} "
+        f"reuse_prompt_len={reuse_len} "
+        f"B_hash_prefixes={[h[:12] for h in assembled['expected_b_hashes']]}"
+    )
+
+    # --- DENSE reference: generate the continuation C* (sparse OFF) ----------
+    dense_res = run_engine_subprocess(build_worker_spec(
+        role="dense",
+        model=model,
+        kv_config=_epic_kv_config(sparse=False),
+        warm_prompts=[warm_ids],
+        prompts=[reuse_ids],
+        max_tokens=cont_tokens,
+        enforce_eager=True,
+        attention_backend="FLEX_ATTENTION",
+        **cfg.engine_kwargs(),
+    ))
+    if not dense_res.get("ok"):
+        _fail("step5", f"DENSE reference engine failed: {dense_res.get('error')}\n"
+              + dense_res.get("traceback", ""))
+    dense_cont = dense_res["token_ids"][0]
+    dense_text = dense_res["texts"][0]
+    if not dense_cont:
+        _fail("step5", "DENSE produced an empty continuation; cannot score.")
+    _log(f"step5: DENSE continuation ({len(dense_cont)} tok): {dense_text!r}")
+
+    # The fixed scoring sequence: reuse_prompt + dense_continuation. We score the
+    # CONTINUATION region only (prefix_len = reuse_len).
+    scored_seq = list(reuse_ids) + list(dense_cont)
+
+    # --- DENSE self-NLL: score C* under DENSE (sparse OFF) as the 0-distance
+    # reference. With sparse off this is the model's own likelihood of its
+    # greedy continuation; the B-full sparse run must match it up to numerics.
+    dense_score = run_engine_subprocess(build_worker_spec(
+        role="dense",
+        model=model,
+        kv_config=_epic_kv_config(sparse=False),
+        warm_prompts=[warm_ids],
+        prompts=[scored_seq],
+        prompt_logprobs=0,
+        logprob_prefix_lens=[reuse_len],
+        max_tokens=1,
+        enforce_eager=True,
+        attention_backend="FLEX_ATTENTION",
+        **cfg.engine_kwargs(),
+    ))
+    if not dense_score.get("ok"):
+        _fail("step5", f"DENSE self-score engine failed: "
+              f"{dense_score.get('error')}\n" + dense_score.get("traceback", ""))
+    dense_nll, dense_ppl = mean_nll_to_perplexity(
+        dense_score["nll_sums"][0], dense_score["nll_counts"][0]
+    )
+    _log(
+        f"step5: DENSE self-NLL (reference 0-distance) = {dense_nll:.4f} "
+        f"(ppl {dense_ppl:.3f}, scored {dense_score['nll_counts'][0]} tok)"
+    )
+
+    # --- link sweep: score C* under each sparse link -------------------------
+    sweep = list(_STEP5_LINK_SWEEP) + [chunk_size]  # append B_full control
+    # rows: (link, reuse_frac, mean_nll, ppl, n_scored, counters)
+    rows: list[tuple[int, float, float, float, int, dict]] = []
+    b_len = assembled["b_len"]
+    for link in sweep:
+        eff_link = min(link, b_len)
+        reuse_frac = (b_len - eff_link) / b_len
+        _log(
+            f"step5[link={link}]: SUBPROCESS sparse score "
+            f"(epic_link_tokens={eff_link}, reuse_frac={reuse_frac:.2f})"
+        )
+        sparse_res = run_engine_subprocess(build_worker_spec(
+            role="sparse",
+            model=model,
+            kv_config=_epic_kv_config(
+                sparse=True,
+                fusion=True,
+                link_tokens=eff_link,
+                debug_check_load=True,
+                debug_counters=True,
+            ),
+            warm_prompts=[warm_ids],
+            prompts=[scored_seq],
+            prompt_logprobs=0,
+            logprob_prefix_lens=[reuse_len],
+            max_tokens=1,
+            enforce_eager=True,
+            attention_backend="FLEX_ATTENTION",
+            in_process=True,
+            read_counters=True,
+            **cfg.engine_kwargs(),
+        ))
+        if not sparse_res.get("ok"):
+            _fail(
+                "step5",
+                f"sparse score engine (link={link}) failed: "
+                f"{sparse_res.get('error')}\n"
+                + sparse_res.get("traceback", ""),
+            )
+        counters = sparse_res.get("counters", {})
+        mean_nll, ppl = mean_nll_to_perplexity(
+            sparse_res["nll_sums"][0], sparse_res["nll_counts"][0]
+        )
+        rows.append((link, reuse_frac, mean_nll, ppl,
+                     sparse_res["nll_counts"][0], counters))
+        _log(
+            f"step5[link={link}]: distance(meanNLL)={mean_nll:.4f} "
+            f"ppl={ppl:.3f} scored={sparse_res['nll_counts'][0]} "
+            f"counters={counters}"
+        )
+
+        # SPARSE ENGAGEMENT gate (in-band, every run) -- same as step4.
+        if not (counters.get("sparse_match", 0) >= 1
+                and counters.get("chunks_loaded", 0) >= 1):
+            _fail(
+                "step5",
+                f"SPARSE DID NOT ENGAGE (link={link}): in-band counters are "
+                f"{counters}; expected sparse_match>=1 AND chunks_loaded>=1. The "
+                "reuse/score request did not take the non-prefix sparse branch "
+                "and/or no cached B chunk was scattered -- the sweep would be "
+                "measuring the dense path. Check warm save, B byte-identity, and "
+                "in-process engine.",
+            )
+
+    # --- summary table -------------------------------------------------------
+    _log("step5: CROSS-CONTEXT FIDELITY SUMMARY")
+    _log(f"step5: DENSE self-NLL reference = {dense_nll:.4f}")
+    _log("    link | reuse_frac | distance(meanNLL) | ppl       | regime")
+    for link, frac, mean_nll, ppl, _n, _c in rows:
+        if link == 0:
+            regime = "reuse-only (max approx)"
+        elif link >= b_len:
+            regime = "B-FULL (control == dense)"
+        else:
+            regime = "approx"
+        _log(
+            f"    {link:4d} | {frac:10.2f} | {mean_nll:17.4f} | "
+            f"{ppl:9.3f} | {regime}"
+        )
+
+    # --- monotonicity (reported, not gated on the middle links) --------------
+    links = [r[0] for r in rows]
+    dists = [r[2] for r in rows]
+    mono = monotonicity_report(links, dists)
+    _log(
+        "step5: MONOTONICITY (distance vs ASCENDING link/recompute) -- "
+        f"ordered={[round(d, 4) for d in mono['ordered_by_link']]} "
+        f"nonincreasing={mono['nonincreasing']} "
+        f"violations={mono['n_violations']}"
+    )
+    if mono["nonincreasing"]:
+        _log(
+            "step5: distance DECREASES (or is flat) as recompute grows -> the "
+            "EPIC approximation behaves: more boundary recompute pulls the "
+            "output toward dense."
+        )
+    else:
+        _log(
+            "step5: NOTE -- distance is NOT monotone non-increasing "
+            f"({mono['n_violations']} step-up(s)). Reported, not failed: the "
+            "middle links carry no hard threshold (could be fp jitter or a "
+            "non-monotone region of the approximation)."
+        )
+
+    # --- VERDICT 1: B-full machinery gate (decisive) -------------------------
+    bfull = next((r for r in rows if r[0] >= b_len), None)
+    if bfull is None:
+        _fail("step5", "no B-full row in the sweep; cannot run the decisive "
+                       "machinery gate.")
+    bfull_nll = bfull[2]
+    if bfull_nll > dense_nll + _STEP5_BFULL_NLL_EPS:
+        _fail(
+            "step5",
+            f"MACHINERY FAIL: link=B_full (full recompute, ZERO reuse "
+            f"approximation) distance meanNLL={bfull_nll:.4f} exceeds the DENSE "
+            f"self-NLL {dense_nll:.4f} by more than eps {_STEP5_BFULL_NLL_EPS} "
+            "-- with the whole B chunk recomputed the sparse forward must "
+            "reproduce dense up to numerics. A gap here is a MECHANICAL fault "
+            "(runner positions/seq_lens, flex logical_q, schedule accounting, or "
+            "KV scatter layout), NOT the reuse approximation. Same meaning as "
+            "step4's decisive gate. Inspect 'EPIC check_load' / worker-plan logs.",
+        )
+    _log(
+        f"step5: DECISIVE OK -- B-full meanNLL {bfull_nll:.4f} ~= dense self-NLL "
+        f"{dense_nll:.4f} (within eps {_STEP5_BFULL_NLL_EPS}): full recompute "
+        "reproduces dense, machinery healthy."
+    )
+
+    # --- VERDICT 2: does link buy anything? (diagnostic, not a hard fail) -----
+    reuse_only = next((r for r in rows if r[0] == 0), None)
+    if reuse_only is not None:
+        ro_nll = reuse_only[2]
+        # Relative gap of reuse-only above the B-full control.
+        denom = max(abs(bfull_nll), 1e-6)
+        rel = (ro_nll - bfull_nll) / denom
+        _log(
+            f"step5: reuse-only(link=0) meanNLL={ro_nll:.4f} vs B-full "
+            f"{bfull_nll:.4f} -> relative gap {rel:+.4f}"
+        )
+        if ro_nll <= bfull_nll + _STEP5_BFULL_NLL_EPS or rel <= _STEP5_NO_EFFECT_REL:
+            _log(
+                "step5: WARNING -- LINK HAS NO EFFECT: reuse-only is "
+                "indistinguishable from full recompute on this prompt. This is "
+                "NOT a failure; it is an important DIAGNOSTIC -- for this "
+                "context the LegoLink boundary recompute buys ~nothing (B's "
+                "stale reused KV already encodes enough). Try a prompt where "
+                "A/C are more entangled with B, or a stronger cross-context "
+                "dependency, to expose the link's value."
+            )
+        else:
+            _log(
+                "step5: LINK IS EFFECTIVE -- reuse-only is measurably farther "
+                "from dense than full recompute; the boundary recompute pulls "
+                "the output toward dense (the EPIC approximation does work)."
+            )
+    else:
+        _log("step5: NOTE -- no reuse-only(link=0) row; add 0 to "
+             "_STEP5_LINK_SWEEP to measure the pure-stale endpoint.")
+
+    _log(
+        "step5: PASS (B-full machinery gate met == dense up to numerics; "
+        "sparse engaged in-band on every link; distances + monotonicity + "
+        "link-effect diagnostic reported)."
+    )
+
+
 def _decode_cosine(model: str, a: list[int], b: list[int]) -> float | None:
     """Optional bag-of-token cosine similarity (cheap, tokenizer-only)."""
     try:
@@ -1421,12 +2021,13 @@ _STEPS = {
     2: step2_wrong_backend_fails,
     3: step3_non_eager_fails,
     4: step4_shared_chunk_sparse_vs_dense,
+    5: step5_cross_context_fidelity,
 }
 
 
 def _parse_steps(arg: str | None) -> list[int]:
     if not arg:
-        return [1, 2, 3, 4]
+        return [1, 2, 3, 4, 5]
     out = []
     for tok in arg.split(","):
         tok = tok.strip()
@@ -1485,7 +2086,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--steps",
         default=None,
-        help="Comma-separated step numbers to run (default: 1,2,3,4).",
+        help="Comma-separated step numbers to run (default: 1,2,3,4,5).",
     )
     ap.add_argument(
         "--gpu-mem-util",
