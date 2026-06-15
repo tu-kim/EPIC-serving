@@ -238,6 +238,146 @@ def test_two_samples_same_ctx_same_hash_diff_ctx_diff_hash():
 
 
 # ---------------------------------------------------------------------------
+# system segment (LegoLink-engagement fix): prepended NON-warmed instruction
+# chunk breaks position-0 contiguity so EVERY ctx becomes a non-prefix hit.
+# ---------------------------------------------------------------------------
+def _mirror_select(chunks, warm_hashes):
+    """Pure mirror of EpicSelection.select's prefix/non-prefix walk (no torch).
+
+    ``chunks`` = [(start, length, hash), ...]; ``warm_hashes`` = set of hashes
+    present in the (warm-seeded) store. Returns (prefix_extent, non_prefix_count,
+    non_prefix_offsets) -- the same classification the connector performs.
+    """
+    prefix_extent = 0
+    contiguous = True
+    non_prefix = []
+    for start, length, h in chunks:
+        hit = h in warm_hashes
+        if contiguous and start == prefix_extent and hit:
+            prefix_extent += length
+        else:
+            contiguous = False
+            if hit:
+                non_prefix.append(start)
+    return prefix_extent, len(non_prefix), non_prefix
+
+
+def _chunks_of(a):
+    """[(start, length, hash)] for every whole ctx chunk in an AssembledPrompt
+    (sys-padded leading region produces extra leading chunks that are NOT in the
+    ctx hash list -> they are non-hits unless warmed)."""
+    chunks = []
+    # leading sys region: one (start, len, hash) per chunk, hash = sentinel not in
+    # any warm set (the sys segment is never warmed).
+    cs = a.chunk_size
+    for i in range(a.sys_len // cs):
+        chunks.append((i * cs, cs, f"__sys__{i}"))
+    for off, ln, hashes in zip(a.ctx_offsets, a.ctx_token_lens, a.ctx_chunk_hashes):
+        for c, h in enumerate(hashes):
+            chunks.append((off + c * cs, cs, h))
+    return chunks
+
+
+def test_sys_segment_prepended_and_padded_to_chunk_multiple():
+    cs = 8
+    a = assemble_musique_prompt(
+        ctx_token_lists=[_ids(1, 2, 3, 4, 5), _ids(6, 7, 8)],
+        question_ids=_ids(99),
+        chunk_size=cs,
+        filler_ids=[200, 201],
+        sys_ids=_ids(50, 51, 52),  # 3 sys tokens -> padded to 8
+    )
+    assert a.sys_len == cs  # 3 -> padded up to one whole chunk
+    # ctx offsets are shifted by sys_len yet still chunk-aligned.
+    assert a.ctx_offsets == [cs, 2 * cs]
+    assert all(off % cs == 0 for off in a.ctx_offsets)
+    # prompt = sys(8) + ctx0(8) + ctx1(8) + question(1) = 25
+    assert len(a.prompt_ids) == 25
+    # sys ids are the literal prefix (then filler pad) -- NOT in any warm prompt.
+    assert a.prompt_ids[:3] == [50, 51, 52]
+
+
+def test_sys_segment_makes_every_ctx_non_prefix():
+    cs = 8
+    a = assemble_musique_prompt(
+        ctx_token_lists=[_ids(1, 2, 3, 4, 5, 6, 7, 8),
+                         _ids(9, 10, 11, 12, 13, 14, 15, 16),
+                         _ids(17, 18, 19)],
+        question_ids=_ids(99),
+        chunk_size=cs,
+        filler_ids=[0],
+        sys_ids=_ids(50, 51),  # leading non-warmed sys -> one chunk
+    )
+    # WARM each ctx (its chunk hashes are in the store); sys is NEVER warmed.
+    warm = {h for hs in a.ctx_chunk_hashes for h in hs}
+    prefix_extent, n_non_prefix, offsets = _mirror_select(_chunks_of(a), warm)
+    # sys chunk at pos 0 is a non-hit -> contiguity broken at chunk 0 -> NOTHING
+    # is in the contiguous prefix and every ctx chunk is a non-prefix hit.
+    assert prefix_extent == 0
+    n_ctx_chunks = sum(a.ctx_chunk_counts)
+    assert n_non_prefix == n_ctx_chunks
+    # offsets are the ctx chunk starts (all >= sys_len, never 0).
+    assert all(o >= a.sys_len for o in offsets)
+
+
+def test_no_sys_segment_reverts_to_all_prefix_control():
+    cs = 8
+    a = assemble_musique_prompt(
+        ctx_token_lists=[_ids(1, 2, 3, 4, 5, 6, 7, 8),
+                         _ids(9, 10, 11, 12, 13, 14, 15, 16)],
+        question_ids=_ids(99),
+        chunk_size=cs,
+        filler_ids=[0],
+        sys_ids=None,  # --no-system control
+    )
+    assert a.sys_len == 0
+    assert a.ctx_offsets == [0, cs]  # ctx0 at position 0
+    warm = {h for hs in a.ctx_chunk_hashes for h in hs}
+    prefix_extent, n_non_prefix, _ = _mirror_select(_chunks_of(a), warm)
+    # No sys -> ctx0 hits at pos 0, ctx1 hits at pos 8 contiguously -> ALL fold
+    # into the contiguous prefix -> ZERO non-prefix hits -> LegoLink INERT.
+    assert prefix_extent == 2 * cs
+    assert n_non_prefix == 0
+
+
+def test_sys_segment_keeps_ctx_byte_identical_and_hashes_stable():
+    cs = 8
+    ctxs = [_ids(1, 2, 3, 4, 5), _ids(20, 21, 22)]
+    q = _ids(77)
+    with_sys = assemble_musique_prompt(
+        ctx_token_lists=ctxs, question_ids=q, chunk_size=cs,
+        filler_ids=[5, 6], sys_ids=_ids(50, 51, 52),
+    )
+    no_sys = assemble_musique_prompt(
+        ctx_token_lists=ctxs, question_ids=q, chunk_size=cs,
+        filler_ids=[5, 6], sys_ids=None,
+    )
+    # ctx chunk hashes depend only on the (padded) ctx ids, not absolute offset,
+    # so adding the sys segment must NOT change them -> warm-side hashes still
+    # collide with reuse-side hashes.
+    assert with_sys.ctx_chunk_hashes == no_sys.ctx_chunk_hashes
+    # warm ctx prefills are identical too (sys is excluded from warming).
+    assert with_sys.warm_ctx_ids == no_sys.warm_ctx_ids
+    # and each warm ctx is byte-identical to its slice in the sys-shifted prompt.
+    for i, off in enumerate(with_sys.ctx_offsets):
+        ln = with_sys.ctx_token_lens[i]
+        assert with_sys.warm_ctx_ids[i] == with_sys.prompt_ids[off:off + ln]
+
+
+def test_full_and_reuse_prompts_both_include_sys_identically():
+    # The bench uses the SAME AssembledPrompt.prompt_ids for full and reuse, so
+    # both modes share the leading sys + identical ctx bytes (fair comparison).
+    cs = 8
+    a = assemble_musique_prompt(
+        ctx_token_lists=[_ids(1, 2, 3, 4)], question_ids=_ids(9),
+        chunk_size=cs, filler_ids=[0], sys_ids=_ids(50, 51),
+    )
+    # prompt begins with the sys ids; warm prompts (reuse warm side) do NOT.
+    assert a.prompt_ids[:2] == [50, 51]
+    assert all(w[:2] != [50, 51] for w in a.warm_ctx_ids)
+
+
+# ---------------------------------------------------------------------------
 # answer scoring (reused from common) -- spot check via the bench's import
 # ---------------------------------------------------------------------------
 def test_answer_normalisation_and_containment():

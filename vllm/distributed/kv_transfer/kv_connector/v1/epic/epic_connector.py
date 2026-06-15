@@ -162,11 +162,28 @@ class EpicConnector(KVConnectorBase_V1):
         "chunks_loaded": 0,
     }
 
+    # EPIC diagnostics: per-request SELECTION summary so a probe (musique_blend)
+    # can SEE whether selection found non-prefix content -- the difference
+    # between "LegoLink recompute fired" and "everything silently fell into the
+    # contiguous prefix so link is INERT". One dict per get_num_new_matched_tokens
+    # call (request_id may repeat across the warm/measured pair; the LAST entry
+    # for a given prompt is the measured one). Gated on epic_debug_counters like
+    # the counters above. Each entry:
+    #   {request_id, N, prefix_extent, num_non_prefix, non_prefix_offsets,
+    #    sparse_branch}  -- sparse_branch True iff the non-prefix sparse path was
+    # taken (i.e. LegoLink can recompute). num_non_prefix==0 -> LINK INERT.
+    debug_selection: list[dict] = []
+
     @classmethod
     def reset_debug_counters(cls) -> None:
         """Zero every engagement counter (call between smoke runs)."""
         for k in cls.debug_counters:
             cls.debug_counters[k] = 0
+        cls.debug_selection = []
+
+    @classmethod
+    def _record_selection(cls, entry: dict) -> None:
+        cls.debug_selection.append(entry)
 
     @classmethod
     def _bump_counter(cls, key: str, n: int = 1) -> None:
@@ -548,6 +565,24 @@ class EpicConnector(KVConnectorBase_V1):
         if self._sparse_forward:
             self._selections[request.request_id] = sel
 
+        # EPIC diagnostics: record the SELECTION for every request (gated) so a
+        # probe can see when a prompt fell ENTIRELY into the contiguous prefix
+        # (num_non_prefix==0 -> LegoLink recompute is INERT). ``sparse_branch``
+        # is provisional here (set True below only if the sparse path is taken).
+        if getattr(self, "_debug_counters", False):
+            self._record_selection(
+                {
+                    "request_id": str(request.request_id),
+                    "N": len(token_ids),
+                    "prefix_extent": int(sel.prefix_extent),
+                    "num_non_prefix": len(sel.non_prefix_hits),
+                    "non_prefix_offsets": [
+                        int(h.prompt_offset) for h in sel.non_prefix_hits
+                    ],
+                    "sparse_branch": False,
+                }
+            )
+
         # ---- sparse (non-prefix) reuse path (Phase 2b, S3) ----------------
         # When sparse forward is ON *and* this prompt has non-prefix content
         # matches, report external = |A| + |B| (prefix extent + sum of
@@ -603,6 +638,10 @@ class EpicConnector(KVConnectorBase_V1):
                 )
                 if getattr(self, "_debug_counters", False):
                     self._bump_counter("sparse_match")
+                    # Mark the diagnostic entry we just recorded for this request
+                    # as having taken the sparse branch (LegoLink can recompute).
+                    if self.debug_selection:
+                        self.debug_selection[-1]["sparse_branch"] = True
                 # Phase 1 loads (prefix chunks) still happen synchronously in
                 # start_load_kv; non-prefix B loading now happens there too.
                 return num_new, False

@@ -10,8 +10,9 @@ multi-hop question with 10 retrieved Wikipedia contexts and a gold answer list.
 
 WHAT IT DOES (per the task spec)
 --------------------------------
-For each of N samples we assemble a prompt ``[ctx0][ctx1]...[ctxK][question]``
-at the TOKEN level and run it through four engine modes, each in a FRESH
+For each of N samples we assemble a prompt
+``[sys][ctx0][ctx1]...[ctxK][question]`` at the TOKEN level and run it through
+four engine modes, each in a FRESH
 subprocess (one in-process engine per mode, processing all N samples
 sequentially so the per-engine EPIC store accumulates harmlessly -- content
 hashes differ across samples):
@@ -25,6 +26,30 @@ hashes differ across samples):
   * ``epic@k``      -- same as reuse-only but LegoLink recomputes the leading
                        ``k`` tokens of EACH non-prefix chunk
                        (``epic_link_tokens=k``).
+
+LEGOLINK / SYSTEM SEGMENT (why the prompt starts with ``[sys]``)
+----------------------------------------------------------------
+EpicSelection walks chunks from prompt position 0 and absorbs every contiguous
+hit into the *prefix* extent; only chunks that fall OUTSIDE that contiguous
+prefix become ``non_prefix_hits``, and the connector's sparse/LegoLink recompute
+path is gated on ``non_prefix_hits`` being non-empty. If we lay out
+``[ctx0][ctx1]...[ctxK][question]`` and warm EVERY ctx, then ctx0 (pos 0), ctx1
+(pos len0), ... are each a hit starting exactly where the previous chunk ended,
+so they ALL fold into the contiguous prefix -> ``non_prefix_hits == []`` ->
+LegoLink is INERT: link=k recomputes NOTHING for any k, contexts are reused
+STALE, output degrades, and the "speedup" is an artefact of skipping all
+recompute. (Confirmed on GPU: link=256 gave 3.48x and garbage output.)
+
+FIX (mirrors CacheBlend's ``[system][docs][query]`` layout): prepend a leading
+instruction/system segment that is chunk-padded but is **NOT warmed** into the
+store. Its chunk at position 0 is therefore a NON-hit -> contiguity is broken at
+the first chunk -> ctx0..K can no longer be absorbed into the prefix and ALL
+become non-prefix hits -> LegoLink can engage. The sys segment is included in
+both the full and reuse prompts (fair comparison) and is always part of M (new
+tokens), as is the question. ``--no-system`` reverts to the buggy all-prefix
+layout as a control. Per-request SELECTION diagnostics (prefix_extent /
+non_prefix count+offsets / sparse_branch) are surfaced from the connector so the
+silent INERT case is flagged loudly rather than mistaken for a working speedup.
 
 ``full`` runs the connector OFF (sparse off). ``reuse-only`` / ``epic@k`` run
 sparse ON + fusion mask + FLEX_ATTENTION + enforce_eager (the S7 safety gate
@@ -271,7 +296,7 @@ class AssembledPrompt:
     reuse/full prompt is ``prompt_ids``.
     """
 
-    prompt_ids: list[int]            # [ctx0..ctxK][question]  (reuse / full)
+    prompt_ids: list[int]            # [sys][ctx0..ctxK][question] (reuse / full)
     warm_ctx_ids: list[list[int]]    # one warm prefill per ctx (seeds store)
     ctx_offsets: list[int]           # start offset of each ctx in prompt_ids
     ctx_token_lens: list[int]        # padded token length of each ctx
@@ -281,6 +306,13 @@ class AssembledPrompt:
     chunk_size: int
     real_tokens: int                 # ctx tokens BEFORE padding (content)
     pad_tokens: int                  # filler tokens added for alignment
+    # Leading NON-warmed system/instruction segment. Chunk-padded so the FIRST
+    # ctx still starts on a chunk boundary, but NEVER warmed into the store. Its
+    # presence makes prompt position 0 a NON-hit -> breaks contiguity ->
+    # EpicSelection cannot absorb ctx0..K into the contiguous prefix, so EVERY
+    # ctx becomes a non_prefix hit and the LegoLink recompute path can engage.
+    # See the module-level "LEGOLINK / SYSTEM SEGMENT" note and the task spec.
+    sys_len: int = 0                 # padded length of the leading sys segment
 
 
 def assemble_musique_prompt(
@@ -290,11 +322,22 @@ def assemble_musique_prompt(
     chunk_size: int,
     filler_ids: list[int],
     warm_lead_ids: list[int] | None = None,
+    sys_ids: list[int] | None = None,
 ) -> AssembledPrompt:
-    """Assemble ``[ctx0..ctxK][question]`` with EACH ctx padded to a chunk
-    multiple, returning the reuse/full prompt + per-ctx warm prefills (pure).
+    """Assemble ``[sys][ctx0..ctxK][question]`` with EACH ctx (and the leading
+    sys segment) padded to a chunk multiple, returning the reuse/full prompt +
+    per-ctx warm prefills (pure).
 
     Alignment invariants (the whole reason this exists):
+      * the OPTIONAL leading ``sys_ids`` (instruction/system text) is padded UP
+        to a multiple of ``chunk_size`` and prepended to the reuse/full prompt
+        but is **NOT warmed** into the store. Because it lands on prompt
+        position 0 and is never saved, its chunk is a NON-hit -> contiguity is
+        broken at the very first chunk -> EpicSelection cannot fold ctx0..K into
+        the contiguous prefix, so EVERY ctx becomes a non_prefix hit and the
+        LegoLink recompute path can engage. With ``sys_ids`` empty (or None) the
+        legacy behaviour is preserved: ctx0 starts at position 0 and the whole
+        ctx run is a single contiguous prefix (link INERT).
       * each ctx is padded UP to a multiple of ``chunk_size`` with cycled
         real-word filler, so it occupies whole hashable chunks and the NEXT ctx
         starts on a chunk boundary;
@@ -304,9 +347,16 @@ def assemble_musique_prompt(
       * the question is appended AFTER all ctxs as a trailing (partial) chunk --
         never hashed/saved, matching the connector's whole-chunks-only rule.
 
+    Because the sys segment is padded to a chunk multiple, every ctx offset is
+    SHIFTED by ``sys_len`` yet remains chunk-aligned, so the per-ctx chunk
+    hashes (which depend only on the ctx ids, not their absolute offset) are
+    UNCHANGED -> the warm-side hashes still collide with the reuse-side hashes.
+
     The warm prefill for a ctx is ``warm_lead_ids + padded_ctx``; ``warm_lead``
     is padded to a chunk multiple too so the ctx still starts on a chunk
-    boundary in the warm prompt (default lead is empty -> ctx starts at 0).
+    boundary in the warm prompt (default lead is empty -> ctx starts at 0). The
+    sys segment is deliberately EXCLUDED from the warm prefills (warming it would
+    re-introduce the position-0 hit and re-collapse everything into the prefix).
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
@@ -331,7 +381,14 @@ def assemble_musique_prompt(
     if lead:
         lead, _, _ = _pad_to_chunk(lead)
 
-    prompt_ids: list[int] = []
+    # Leading system/instruction segment: pad to a chunk multiple so ctx0 stays
+    # chunk-aligned in the reuse/full prompt, but DO NOT warm it (see docstring).
+    sys_seg: list[int] = []
+    raw_sys = list(sys_ids or [])
+    if raw_sys:
+        sys_seg, _, _ = _pad_to_chunk(raw_sys)
+
+    prompt_ids: list[int] = list(sys_seg)  # sys occupies prompt positions [0, sys_len)
     warm_ctx_ids: list[list[int]] = []
     ctx_offsets: list[int] = []
     ctx_token_lens: list[int] = []
@@ -371,6 +428,7 @@ def assemble_musique_prompt(
         chunk_size=chunk_size,
         real_tokens=total_real,
         pad_tokens=total_pad,
+        sys_len=len(sys_seg),
     )
 
 
@@ -639,6 +697,12 @@ def run_musique_worker(spec: dict) -> dict:
             )
 
             result["counters"] = dict(EpicConnector.debug_counters)
+            # Per-request SELECTION diagnostics (prefix_extent / non_prefix
+            # count+offsets / sparse_branch). Lets the parent flag the silent
+            # "everything fell into the prefix -> LINK INERT" failure mode.
+            result["selection"] = [
+                dict(e) for e in EpicConnector.debug_selection
+            ]
         return result
     except Exception as e:  # noqa: BLE001
         import traceback
@@ -717,14 +781,23 @@ def prepare_samples(
     tok,
     chunk_size: int,
     ctx_per_sample: int,
+    system_text: str | None = None,
 ) -> list[PreparedSample]:
     """Tokenize + chunk-align N musique samples (parent side, CPU-only).
 
     Each ctx is encoded independently (so its ids are stable) and the prompt is
-    assembled at the token level with per-ctx chunk padding. Returns the
-    prepared prompts + answers; logging of padding waste is the caller's job.
+    assembled at the token level with per-ctx chunk padding. When
+    ``system_text`` is non-empty it is tokenized once and prepended (chunk-padded
+    but NOT warmed) to EVERY sample's reuse/full prompt -- this is the fix that
+    breaks position-0 contiguity so the LegoLink recompute path can engage (see
+    ``assemble_musique_prompt``). Returns the prepared prompts + answers; logging
+    of padding waste is the caller's job.
     """
     enc = _encode(tok)
+    # Tokenize the leading system/instruction segment ONCE (same ids for every
+    # sample -> identical position-0 non-hit chunk). Empty/None -> no sys (legacy
+    # all-prefix behaviour, --no-system).
+    sys_ids = enc(system_text) if system_text else []
     prepared: list[PreparedSample] = []
     for s in samples:
         ctxs = s.ctxs[:ctx_per_sample]
@@ -740,6 +813,7 @@ def prepare_samples(
             question_ids=q_ids,
             chunk_size=chunk_size,
             filler_ids=_filler_token_pool(enc),
+            sys_ids=sys_ids,
         )
         prepared.append(
             PreparedSample(
@@ -805,7 +879,7 @@ def _print_sample_table(mode_results: dict[str, dict]) -> None:
             )
 
 
-def _print_aggregate_table(aggs: list[ModeAggregate]) -> None:
+def _print_aggregate_table(aggs: list[ModeAggregate], *, chunk_size: int) -> None:
     _log("AGGREGATE (mode | answer_hit_rate | mean_prefill_ms | speedup_vs_full)")
     _log("    mode        | hit_rate (n)   | mean_prefill_ms | speedup_vs_full")
     for a in aggs:
@@ -818,6 +892,32 @@ def _print_aggregate_table(aggs: list[ModeAggregate]) -> None:
             f"    {a.label:11s} | {a.answer_hit_rate:5.2f} ({a.answer_hits}/"
             f"{a.n}) | {a.mean_prefill_ms:15.1f} | {sp}"
         )
+    # link >= chunk_size CONTROL interpretation. When the per-chunk link covers
+    # the WHOLE chunk, every non-prefix chunk's tokens are recomputed -> the
+    # forward is effectively full over the reused span. With the system-segment
+    # fix engaged (all ctx are non-prefix), epic@k with k>=chunk_size should give
+    # answer_hit_rate ~= full and speedup ~= 1x (or <1x from load overhead). If
+    # such a mode is instead MUCH faster than full, the recompute did NOT happen
+    # (LINK INERT) -- which is exactly the bug this fix targets.
+    for a in aggs:
+        if a.label.startswith("epic@"):
+            try:
+                k = int(a.label.split("@", 1)[1])
+            except ValueError:
+                continue
+            if k >= chunk_size:
+                verdict = (
+                    "as expected (recompute engaged)"
+                    if a.speedup_vs_full <= 1.5
+                    else "SUSPECT: too fast -> recompute likely did NOT fire "
+                         "(LINK INERT?)"
+                )
+                _log(
+                    f"    CONTROL {a.label} (link>=chunk_size {chunk_size}): "
+                    f"recomputes every non-prefix chunk -> expect "
+                    f"speedup~=1x + hit_rate~=full. Observed speedup="
+                    f"{a.speedup_vs_full:.2f}x -> {verdict}."
+                )
 
 
 def _check_sparse_engagement(label: str, res: dict) -> None:
@@ -835,6 +935,58 @@ def _check_sparse_engagement(label: str, res: dict) -> None:
         )
     else:
         _log(f"  mode={label}: sparse engaged in-band, counters={counters}")
+    _report_selection(label, res)
+
+
+def _report_selection(label: str, res: dict) -> None:
+    """Print the connector's per-request SELECTION diagnostics for a sparse mode.
+
+    The load-bearing observability for this whole fix: it surfaces, per request,
+    what the connector ACTUALLY saw -- ``prefix_extent``, the number/offsets of
+    non-prefix hits, and whether the sparse (LegoLink-capable) branch fired. The
+    silent failure mode this guards is "every ctx folded into the contiguous
+    prefix -> num_non_prefix==0 -> LegoLink link is INERT (no recompute, fast but
+    stale)". We emit an explicit ``LINK INERT`` warning so the reader sees it
+    rather than mistaking a 3.5x speedup for a working reuse path.
+    """
+    sel = res.get("selection") or []
+    if not sel:
+        _log(
+            f"  mode={label}: NO selection diagnostics recorded "
+            "(epic_debug_counters off or no request reached selection?)."
+        )
+        return
+    # Measured requests are the ones with the largest N (sys + all ctx + Q);
+    # warm prefills (single ctx) have small N. Report every distinct entry but
+    # focus the INERT check on requests that have at least one ctx-sized prompt.
+    inert = [e for e in sel if int(e.get("num_non_prefix", 0)) == 0]
+    engaged = [e for e in sel if int(e.get("num_non_prefix", 0)) > 0]
+    _log(
+        f"  mode={label}: selection over {len(sel)} request(s): "
+        f"{len(engaged)} with non-prefix hits (LegoLink can recompute), "
+        f"{len(inert)} with NONE."
+    )
+    # Show a few entries (the measured prompts have the largest N).
+    for e in sorted(sel, key=lambda x: -int(x.get("N", 0)))[:5]:
+        _log(
+            f"      req={e.get('request_id')} N={e.get('N')} "
+            f"prefix_extent={e.get('prefix_extent')} "
+            f"non_prefix={e.get('num_non_prefix')} "
+            f"offsets={e.get('non_prefix_offsets')} "
+            f"sparse_branch={e.get('sparse_branch')}"
+        )
+    # The big-prompt (measured) requests are the ones we care about: if the
+    # LARGEST-N request had zero non-prefix hits, link is inert for that mode.
+    biggest = max(sel, key=lambda x: int(x.get("N", 0)))
+    if int(biggest.get("num_non_prefix", 0)) == 0:
+        _log(
+            f"  *** WARNING: mode={label}: the measured prompt (N="
+            f"{biggest.get('N')}) had non_prefix_hits=0 -> LINK INERT. Every "
+            "context folded into the contiguous prefix, so LegoLink recomputes "
+            "NOTHING regardless of --link. Reuse is STALE (fast but degraded). "
+            "Enable the system segment (drop --no-system) to break position-0 "
+            "contiguity. ***"
+        )
 
 
 def run_all(args) -> int:
@@ -857,10 +1009,29 @@ def run_all(args) -> int:
     if not is_real:
         _fail("could not load a real tokenizer; cannot build model prompts")
 
+    # System segment: ON by default (the LegoLink-engagement fix). --no-system
+    # disables it -> legacy all-prefix behaviour where link is INERT (kept as a
+    # control to demonstrate the bug).
+    system_text = None if args.no_system else args.system_prompt
     prepared = prepare_samples(
         samples, tok=tok, chunk_size=chunk_size,
         ctx_per_sample=args.ctx_per_sample,
+        system_text=system_text,
     )
+    sys_lens = {p.assembled.sys_len for p in prepared}
+    if system_text:
+        _log(
+            f"system segment ON: leading NON-warmed instruction chunk, "
+            f"padded length={sorted(sys_lens)} tokens (chunk_size={chunk_size}). "
+            "This breaks position-0 contiguity so EVERY ctx is a non-prefix hit "
+            "and LegoLink recompute can engage."
+        )
+    else:
+        _log(
+            "system segment OFF (--no-system): ctx0 starts at position 0 -> the "
+            "whole ctx run folds into the contiguous prefix -> LegoLink link is "
+            "INERT (control / legacy behaviour)."
+        )
     _print_padding_report(prepared, chunk_size)
 
     # Length sanity vs max_model_len.
@@ -920,7 +1091,7 @@ def run_all(args) -> int:
 
     fill_speedups(aggs)
     _print_sample_table(mode_results)
-    _print_aggregate_table(aggs)
+    _print_aggregate_table(aggs, chunk_size=chunk_size)
     _log("DONE")
     return 0
 
@@ -961,6 +1132,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--link", type=int, default=8,
                     help="epic@k LegoLink leading-recompute tokens per "
                          "non-prefix chunk (default 8).")
+    ap.add_argument(
+        "--system-prompt",
+        type=str,
+        default="Answer the question using the documents below.\n",
+        help="Leading instruction/system segment prepended (chunk-padded, NOT "
+             "warmed) to EVERY reuse/full prompt. Breaks position-0 contiguity "
+             "so all contexts become non-prefix hits and LegoLink recompute can "
+             "engage. Mirrors CacheBlend's non-reusable system prefix. ON by "
+             "default.")
+    ap.add_argument(
+        "--no-system",
+        action="store_true",
+        help="Disable the leading system segment (control). ctx0 then starts at "
+             "position 0, the whole ctx run folds into the contiguous prefix, "
+             "and LegoLink link is INERT (the pre-fix bug).")
     ap.add_argument("--link-sweep", type=str, default=None,
                     help="comma-separated link values to run epic@k for each "
                          "(overrides --link), e.g. '0,8,64'.")
