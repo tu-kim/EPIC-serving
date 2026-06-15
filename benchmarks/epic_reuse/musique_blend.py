@@ -51,6 +51,29 @@ layout as a control. Per-request SELECTION diagnostics (prefix_extent /
 non_prefix count+offsets / sparse_branch) are surfaced from the connector so the
 silent INERT case is flagged loudly rather than mistaken for a working speedup.
 
+RESIDUAL BUG + NONCE FIX (why "not warmed" was not enough)
+----------------------------------------------------------
+"Not warmed by the bench" does NOT keep the sys chunk a non-hit. The connector's
+SAVE path (``epic_connector.py`` ``build_connector_meta``) saves every whole
+chunk fully inside M. For a REUSE request the sys segment is entirely in M (it is
+recomputed, never loaded), so the FIRST reuse request SAVES the sys chunk into
+the per-engine store. Since one mode subprocess processes all N samples against a
+single shared store, sample 0's reuse saves sys -> sample 1+ sees sys as a HIT at
+position 0 -> the ctx run folds back into the contiguous prefix ->
+``non_prefix_hits == 0`` -> LegoLink INERT (and with ``--warmup-discard`` the
+MEASURED samples are exactly the post-sample-0 ones that hit this). FIX: make the
+sys segment UNIQUE PER SAMPLE by prepending a per-sample NONCE (the sample index
+encoded as tokens) to the sys content. The nonce lands in the first sys chunk, so
+that chunk's content hash differs per sample and can never collide with a sys
+chunk an earlier sample saved -> position 0 is ALWAYS a non-hit -> every ctx
+stays non-prefix on every measured sample. The nonce is confined to the sys
+region: ctx ids / chunk hashes / byte-identity vs. the warm prefills are
+UNCHANGED, and the same sample's full and reuse modes share the same nonce (fair
+comparison). This is a deliberate test-side workaround for a KNOWN connector
+limitation -- EpicSelection treats any contiguous run of hits from position 0 as
+prefix, so a hit sys would drag the docs into the prefix; to MEASURE non-prefix
+doc reuse we keep sys intentionally non-hit. The connector is NOT changed.
+
 ``full`` runs the connector OFF (sparse off). ``reuse-only`` / ``epic@k`` run
 sparse ON + fusion mask + FLEX_ATTENTION + enforce_eager (the S7 safety gate
 requires exactly this) and assert in-band engagement
@@ -323,6 +346,7 @@ def assemble_musique_prompt(
     filler_ids: list[int],
     warm_lead_ids: list[int] | None = None,
     sys_ids: list[int] | None = None,
+    sys_nonce_ids: list[int] | None = None,
 ) -> AssembledPrompt:
     """Assemble ``[sys][ctx0..ctxK][question]`` with EACH ctx (and the leading
     sys segment) padded to a chunk multiple, returning the reuse/full prompt +
@@ -332,12 +356,44 @@ def assemble_musique_prompt(
       * the OPTIONAL leading ``sys_ids`` (instruction/system text) is padded UP
         to a multiple of ``chunk_size`` and prepended to the reuse/full prompt
         but is **NOT warmed** into the store. Because it lands on prompt
-        position 0 and is never saved, its chunk is a NON-hit -> contiguity is
-        broken at the very first chunk -> EpicSelection cannot fold ctx0..K into
-        the contiguous prefix, so EVERY ctx becomes a non_prefix hit and the
-        LegoLink recompute path can engage. With ``sys_ids`` empty (or None) the
-        legacy behaviour is preserved: ctx0 starts at position 0 and the whole
-        ctx run is a single contiguous prefix (link INERT).
+        position 0 and is never saved by the bench's WARM step, the intent is
+        that its chunk is a NON-hit -> contiguity is broken at the very first
+        chunk -> EpicSelection cannot fold ctx0..K into the contiguous prefix,
+        so EVERY ctx becomes a non_prefix hit and the LegoLink recompute path
+        can engage. With ``sys_ids`` empty (or None) the legacy behaviour is
+        preserved: ctx0 starts at position 0 and the whole ctx run is a single
+        contiguous prefix (link INERT).
+
+      * RESIDUAL-BUG FIX (sys nonce): "never warmed by the bench" is NOT
+        sufficient to keep the sys chunk a non-hit. The connector's SAVE path
+        (epic_connector.py build_connector_meta) saves every whole chunk that is
+        fully inside M (the freshly computed tokens). For a REUSE request the
+        sys segment IS entirely in M (it is recomputed, never loaded), so the
+        very first reuse request SAVES the sys chunk into the per-engine store.
+        Because one mode subprocess processes all N samples sequentially with a
+        single shared store, sample 0's reuse saves sys -> sample 1+ sees sys as
+        a HIT at position 0 -> the ctx run folds back into the contiguous prefix
+        -> ``non_prefix_hits == 0`` -> LegoLink INERT again (exactly the case the
+        --warmup-discard measured samples land in). The fix is to make the sys
+        segment UNIQUE PER SAMPLE by prepending ``sys_nonce_ids`` (e.g. the
+        sample index encoded as tokens) to the sys content BEFORE padding. The
+        nonce lands in the FIRST sys chunk, so that chunk's content hash differs
+        per sample and can NEVER collide with a sys chunk an EARLIER sample
+        saved -> position 0 is ALWAYS a non-hit -> ctx0..K stay non-prefix ->
+        LegoLink engages on every measured sample. The nonce does NOT touch the
+        ctx ids (it is confined to the sys region), so ctx chunk hashes and
+        byte-identity vs. the warm prefills are UNCHANGED.
+
+        Why this is legitimate for the probe (and a known connector limitation
+        we are deliberately working around): the sys instruction is recomputed
+        on every request (always in M), so in real serving a SHARED sys would be
+        a legitimate reusable prefix. But EpicSelection absorbs any contiguous
+        run of hits starting at position 0 into the prefix, so if sys is a hit it
+        drags ctx0..K in with it. To MEASURE non-prefix doc reuse we must keep
+        sys intentionally non-hit; the per-sample nonce is the simplest way to
+        guarantee that without changing the connector. Fairness is preserved
+        because the SAME sample's full and reuse modes both use this prompt_ids
+        (same nonce), so the comparison is apples-to-apples within a sample.
       * each ctx is padded UP to a multiple of ``chunk_size`` with cycled
         real-word filler, so it occupies whole hashable chunks and the NEXT ctx
         starts on a chunk boundary;
@@ -383,8 +439,14 @@ def assemble_musique_prompt(
 
     # Leading system/instruction segment: pad to a chunk multiple so ctx0 stays
     # chunk-aligned in the reuse/full prompt, but DO NOT warm it (see docstring).
+    # The per-sample ``sys_nonce_ids`` are prepended to the sys content BEFORE
+    # padding so they land in the FIRST sys chunk -> that chunk's content hash is
+    # unique per sample -> it can never collide with a sys chunk an earlier
+    # sample's reuse request SAVED into the shared store -> position 0 stays a
+    # non-hit (see the docstring's RESIDUAL-BUG FIX note). The nonce is confined
+    # to the sys region, so ctx ids / hashes / warm prefills are unaffected.
     sys_seg: list[int] = []
-    raw_sys = list(sys_ids or [])
+    raw_sys = list(sys_nonce_ids or []) + list(sys_ids or [])
     if raw_sys:
         sys_seg, _, _ = _pad_to_chunk(raw_sys)
 
@@ -790,18 +852,33 @@ def prepare_samples(
     ``system_text`` is non-empty it is tokenized once and prepended (chunk-padded
     but NOT warmed) to EVERY sample's reuse/full prompt -- this is the fix that
     breaks position-0 contiguity so the LegoLink recompute path can engage (see
-    ``assemble_musique_prompt``). Returns the prepared prompts + answers; logging
-    of padding waste is the caller's job.
+    ``assemble_musique_prompt``). To keep that position-0 chunk a non-hit DESPITE
+    the connector saving the sys chunk on the first reuse request (one mode
+    subprocess processes all N samples against one shared store), each sample's
+    sys segment is made UNIQUE with a per-sample NONCE (the sample index encoded
+    as tokens) prepended to the sys content; see ``assemble_musique_prompt``'s
+    RESIDUAL-BUG FIX note. The nonce is confined to the sys region so ctx hashes
+    and warm prefills are identical across samples that share a ctx. Returns the
+    prepared prompts + answers; logging of padding waste is the caller's job.
     """
     enc = _encode(tok)
-    # Tokenize the leading system/instruction segment ONCE (same ids for every
-    # sample -> identical position-0 non-hit chunk). Empty/None -> no sys (legacy
-    # all-prefix behaviour, --no-system).
+    # Tokenize the leading system/instruction segment ONCE (same TEXT for every
+    # sample). Empty/None -> no sys (legacy all-prefix behaviour, --no-system).
     sys_ids = enc(system_text) if system_text else []
     prepared: list[PreparedSample] = []
-    for s in samples:
+    for idx, s in enumerate(samples):
         ctxs = s.ctxs[:ctx_per_sample]
         ctx_token_lists = [enc(c) for c in ctxs]
+        # Per-sample sys NONCE: a sample-unique marker prepended to the sys
+        # content so the FIRST sys chunk's content hash differs per sample. Only
+        # emitted when there IS a sys segment (no sys -> no position-0 chunk to
+        # protect). Encoded from the sample index: deterministic, unique within a
+        # run, and -- crucially -- a value the store cannot already hold (sample
+        # i's nonce chunk differs from every j<i that was saved). Same sample ->
+        # same nonce, so a sample's full and reuse modes share the exact same
+        # prompt_ids (fair comparison), and the same idx across the per-mode
+        # subprocesses yields the same nonce (consistent within-sample pairing).
+        sys_nonce_ids = enc(f"[sample-{idx} sys]\n") if sys_ids else []
         # Question with a small instruction tail so an instruct model answers.
         q_text = (
             f"\n\nQuestion: {s.question}\nAnswer the question using ONLY the "
@@ -814,6 +891,7 @@ def prepare_samples(
             chunk_size=chunk_size,
             filler_ids=_filler_token_pool(enc),
             sys_ids=sys_ids,
+            sys_nonce_ids=sys_nonce_ids,
         )
         prepared.append(
             PreparedSample(

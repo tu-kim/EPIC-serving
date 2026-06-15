@@ -364,6 +364,127 @@ def test_sys_segment_keeps_ctx_byte_identical_and_hashes_stable():
         assert with_sys.warm_ctx_ids[i] == with_sys.prompt_ids[off:off + ln]
 
 
+def test_sys_nonce_makes_first_sys_chunk_hash_differ_per_sample():
+    # (a) Two samples that share the SAME sys text but get a different per-sample
+    # nonce must have a DIFFERENT first sys chunk hash -> the chunk an earlier
+    # sample's reuse request saved can never be a hit for a later sample. This is
+    # the residual-bug fix (connector saves the sys chunk on the first reuse).
+    cs = 8
+    sys_ids = _ids(50, 51)
+    a0 = assemble_musique_prompt(
+        ctx_token_lists=[_ids(1, 2, 3, 4)], question_ids=_ids(9),
+        chunk_size=cs, filler_ids=[0],
+        sys_ids=sys_ids, sys_nonce_ids=_ids(900),  # sample 0 nonce
+    )
+    a1 = assemble_musique_prompt(
+        ctx_token_lists=[_ids(1, 2, 3, 4)], question_ids=_ids(9),
+        chunk_size=cs, filler_ids=[0],
+        sys_ids=sys_ids, sys_nonce_ids=_ids(901),  # sample 1 nonce
+    )
+    h0 = epic_chunk_hash(a0.prompt_ids[0:cs])
+    h1 = epic_chunk_hash(a1.prompt_ids[0:cs])
+    assert h0 != h1, "per-sample sys nonce must change the first sys chunk hash"
+    # the nonce token is literally in the first chunk (so it is hashed).
+    assert a0.prompt_ids[0] == 900
+    assert a1.prompt_ids[0] == 901
+
+
+def test_sys_nonce_same_sample_full_and_reuse_share_sys():
+    # (b) The SAME sample (same nonce) must produce the SAME prompt_ids -- the
+    # bench uses one AssembledPrompt.prompt_ids for both full and reuse, so they
+    # are trivially identical; this asserts the nonce is deterministic per nonce
+    # value (no hidden randomness) so re-assembling sample i in another mode's
+    # subprocess yields the byte-identical sys.
+    cs = 8
+    kw = dict(
+        ctx_token_lists=[_ids(1, 2, 3, 4)], question_ids=_ids(9),
+        chunk_size=cs, filler_ids=[0], sys_ids=_ids(50, 51),
+        sys_nonce_ids=_ids(900),
+    )
+    a = assemble_musique_prompt(**kw)
+    b = assemble_musique_prompt(**kw)
+    assert a.prompt_ids == b.prompt_ids
+    assert a.sys_len == b.sys_len
+
+
+def test_sys_nonce_does_not_change_ctx_hashes_or_alignment():
+    # (c) The nonce is confined to the sys region: ctx chunk hashes, ctx
+    # byte-identity vs. warm prefills, and chunk alignment must be invariant to
+    # the nonce (only the sys offset shifts, but the sys stays a chunk multiple).
+    cs = 8
+    ctxs = [_ids(1, 2, 3, 4, 5), _ids(20, 21, 22)]
+    q = _ids(77)
+    base = assemble_musique_prompt(
+        ctx_token_lists=ctxs, question_ids=q, chunk_size=cs,
+        filler_ids=[5, 6], sys_ids=_ids(50, 51, 52), sys_nonce_ids=None,
+    )
+    nonced = assemble_musique_prompt(
+        ctx_token_lists=ctxs, question_ids=q, chunk_size=cs,
+        filler_ids=[5, 6], sys_ids=_ids(50, 51, 52), sys_nonce_ids=_ids(900, 901),
+    )
+    # ctx hashes + warm prefills unchanged by the nonce.
+    assert base.ctx_chunk_hashes == nonced.ctx_chunk_hashes
+    assert base.warm_ctx_ids == nonced.warm_ctx_ids
+    # offsets still chunk-aligned in both (sys length may differ but stays a
+    # chunk multiple, so ctx0 still lands on a boundary).
+    assert all(off % cs == 0 for off in nonced.ctx_offsets)
+    assert nonced.sys_len % cs == 0
+    # each warm ctx is still byte-identical to its slice in the nonced prompt.
+    for i, off in enumerate(nonced.ctx_offsets):
+        ln = nonced.ctx_token_lens[i]
+        assert nonced.warm_ctx_ids[i] == nonced.prompt_ids[off:off + ln]
+
+
+def test_sys_nonce_all_ctx_non_prefix_regardless_of_sample_index():
+    # (d) Mirror-select check: with a (nonced) sys chunk at position 0 that is
+    # NOT in the warm/saved set, EVERY ctx is a non-prefix hit, independent of the
+    # sample index. We also model the residual bug it fixes: a PRIOR sample saved
+    # its OWN nonced sys chunk into the store; because this sample's nonce differs
+    # the prior sys chunk is NOT a hit here, so position 0 stays a non-hit.
+    cs = 8
+    ctxs = [_ids(1, 2, 3, 4, 5, 6, 7, 8), _ids(9, 10, 11, 12, 13, 14, 15, 16)]
+    for idx in (0, 1, 5):
+        a = assemble_musique_prompt(
+            ctx_token_lists=ctxs, question_ids=_ids(99), chunk_size=cs,
+            filler_ids=[0], sys_ids=_ids(50, 51),
+            sys_nonce_ids=_ids(900 + idx),
+        )
+        # store holds: every ctx chunk (warmed) PLUS every PRIOR sample's nonced
+        # sys chunk (saved by their reuse request). This sample's sys nonce is
+        # unique so its own sys chunk is NOT in the store -> non-hit at pos 0.
+        warm = {h for hs in a.ctx_chunk_hashes for h in hs}
+        for prior in range(idx):
+            prior_a = assemble_musique_prompt(
+                ctx_token_lists=ctxs, question_ids=_ids(99), chunk_size=cs,
+                filler_ids=[0], sys_ids=_ids(50, 51),
+                sys_nonce_ids=_ids(900 + prior),
+            )
+            warm.add(epic_chunk_hash(prior_a.prompt_ids[0:cs]))
+        chunks = _chunks_of_with_real_sys_hash(a)
+        prefix_extent, n_non_prefix, offsets = _mirror_select(chunks, warm)
+        assert prefix_extent == 0, f"sample {idx}: sys must not be a prefix hit"
+        assert n_non_prefix == sum(a.ctx_chunk_counts)
+        assert all(o >= a.sys_len for o in offsets)
+
+
+def _chunks_of_with_real_sys_hash(a):
+    """Like ``_chunks_of`` but uses the REAL content hash for the leading sys
+    chunks (so a store that contains a saved sys chunk can match it). This models
+    the residual bug: the connector saves the sys chunk on the first reuse, so a
+    later sample could see it as a hit -- unless the nonce makes the hash unique.
+    """
+    chunks = []
+    cs = a.chunk_size
+    for i in range(a.sys_len // cs):
+        chunks.append(
+            (i * cs, cs, epic_chunk_hash(a.prompt_ids[i * cs:(i + 1) * cs]))
+        )
+    for off, ln, hashes in zip(a.ctx_offsets, a.ctx_token_lens, a.ctx_chunk_hashes):
+        for c, h in enumerate(hashes):
+            chunks.append((off + c * cs, cs, h))
+    return chunks
+
+
 def test_full_and_reuse_prompts_both_include_sys_identically():
     # The bench uses the SAME AssembledPrompt.prompt_ids for full and reuse, so
     # both modes share the leading sys + identical ctx bytes (fair comparison).
