@@ -16,16 +16,28 @@ import pytest
 from tests.v1.kv_connector.unit.epic.gpu_smoke import (
     DEFAULT_CHUNK_SIZE,
     NeedleFact,
+    _DEFAULT_NEEDLE_OFFSET_FRAC,
     _distinct_token_count,
     _epic_kv_config,
+    _LINK_SWEEP,
     _output_has_answer,
+    _parse_needle_offsets,
     build_aligned_token_prompts,
     build_needle_passage_text,
+    build_needle_passage_tokens,
     make_needles,
+    needle_in_link,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.chunk_store import (
     hash_chunk_tokens,
 )
+
+
+def _char_enc(text: str) -> list[int]:
+    """Deterministic, tokenizer-free encoder for the token-level placement
+    tests: one id per character (often >1 token per word, like a real BPE), so
+    the offset arithmetic is exercised without loading a tokenizer/torch."""
+    return [ord(c) % 1000 for c in text]
 
 # ---------------------------------------------------------------------------
 # Needle facts + question
@@ -180,6 +192,127 @@ def test_short_passage_padded_with_rotating_filler_keeps_hash_stable():
     # Reconstruct the padded B and confirm the recorded hash matches it.
     b = [200, 201] + [pool[i % len(pool)] for i in range(cs - 2)]
     assert out["expected_b_hashes"] == [hash_chunk_tokens(b)]
+
+
+# ---------------------------------------------------------------------------
+# Token-level TARGET-needle placement (the link-overlap bias fix)
+#
+# Bias being fixed: build_needle_passage_text put the facts at the FRONT of B,
+# but EPIC LegoLink RECOMPUTES the leading eff_link tokens of each non-prefix
+# chunk (reuse_strategy.py "(2) link tokens"). At link=8/64 a front-loaded
+# target needle lands in the recomputed region, so a HIT cannot be attributed
+# to reused KV vs. recompute. build_needle_passage_tokens places the TARGET at
+# a deep token offset so it sits OUTSIDE the recomputed region for non-full
+# links -- a HIT there is a pure reused-KV proof.
+# ---------------------------------------------------------------------------
+
+
+def test_needle_tokens_target_lands_exactly_at_offset_and_B_is_exact():
+    cs = 256
+    needles = make_needles(seed=4, k=3)
+    target = needles[0]
+    off = 179
+    b = build_needle_passage_tokens(
+        needles, target, encode=_char_enc, chunk_size=cs,
+        needle_offset=off, filler_seed=11,
+    )
+    # B is EXACTLY chunk_size tokens.
+    assert len(b) == cs
+    # The TARGET needle tokens occupy exactly [off, off+len).
+    tt = _char_enc(" " + target.fact_sentence())
+    assert b[off : off + len(tt)] == tt
+
+
+def test_needle_tokens_warm_reuse_byte_identical_hash_collision():
+    # The same prebuilt B spliced into warm + reuse prompts must stay
+    # byte-identical (the hash-collision reuse signal) and remain exactly
+    # chunk_size tokens after assembly, with the target still at its offset.
+    cs = 256
+    needles = make_needles(seed=4, k=3)
+    target = needles[0]
+    off = 179
+    b = build_needle_passage_tokens(
+        needles, target, encode=_char_enc, chunk_size=cs,
+        needle_offset=off, filler_seed=11,
+    )
+    out = build_aligned_token_prompts(
+        head_ids=_char_enc("Question head here. "),
+        passage_ids=b,                       # prebuilt, exactly cs tokens
+        tail_ids=_char_enc(" tail"),
+        reuse_head_ids=_char_enc("Different opening sentence entirely. "),
+        reuse_tail_ids=_char_enc(target.question()),
+        chunk_size=cs,
+        filler_ids=[11, 12, 13],
+        passage_chunks=1,
+    )
+    assert out["b_len"] == cs
+    warm_b = out["warm_ids"][out["warm_b_offset"] : out["warm_b_offset"] + cs]
+    reuse_b = out["reuse_ids"][out["reuse_b_offset"] : out["reuse_b_offset"] + cs]
+    # Byte-identical B in both prompts -> the content hash collides (reuse).
+    assert warm_b == reuse_b == b
+    # The recorded B-chunk hash equals the hash of the prebuilt B.
+    assert out["expected_b_hashes"] == [hash_chunk_tokens(b)]
+    # Target survived the splice at its offset in BOTH prompts.
+    tt = _char_enc(" " + target.fact_sentence())
+    assert warm_b[off : off + len(tt)] == tt
+    assert reuse_b[off : off + len(tt)] == tt
+
+
+def test_needle_in_link_classification_for_default_sweep():
+    # With the default sweep [256, 64, 8] and a deep offset (>= 64), the target
+    # is OUTSIDE the recomputed region for the non-full links and INSIDE only at
+    # link == B-full (the control).
+    cs = 256
+    off = round(_DEFAULT_NEEDLE_OFFSET_FRAC * cs)  # ~179
+    assert off >= 64
+    eff = {link: min(link, cs) for link in _LINK_SWEEP}
+    assert needle_in_link(off, eff[256]) is True    # full recompute: control
+    assert needle_in_link(off, eff[64]) is False     # reused-KV proof row
+    assert needle_in_link(off, eff[8]) is False      # reused-KV proof row
+
+
+def test_needle_in_link_boundary_is_strict_less_than():
+    # offset == eff_link is OUTSIDE the recomputed [0, eff_link) region.
+    assert needle_in_link(64, 64) is False
+    assert needle_in_link(63, 64) is True
+    assert needle_in_link(0, 8) is True
+    assert needle_in_link(8, 8) is False
+
+
+def test_needle_tokens_overrun_raises():
+    # offset + needle_len > chunk_size must error (a silent truncation would
+    # drop the answer and invalidate the probe).
+    cs = 64
+    needles = make_needles(seed=4, k=3)
+    target = needles[0]
+    needle_len = len(_char_enc(" " + target.fact_sentence()))
+    bad_off = cs - needle_len + 1  # one past the last fitting offset
+    with pytest.raises(ValueError, match="overruns B"):
+        build_needle_passage_tokens(
+            needles, target, encode=_char_enc, chunk_size=cs,
+            needle_offset=bad_off, filler_seed=11,
+        )
+
+
+def test_needle_tokens_default_offset_is_outside_largest_nonfull_link():
+    # The default offset must be strictly past the largest NON-full link in the
+    # sweep so the headline rows are reused-KV proofs, not controls.
+    cs = DEFAULT_CHUNK_SIZE
+    off = round(_DEFAULT_NEEDLE_OFFSET_FRAC * cs)
+    nonfull = [link for link in _LINK_SWEEP if link < cs]
+    assert nonfull, "sweep must contain a non-full link for the proof rows"
+    assert off >= max(nonfull)
+
+
+def test_parse_needle_offsets():
+    assert _parse_needle_offsets(None) is None
+    assert _parse_needle_offsets("") is None
+    assert _parse_needle_offsets("4,128,240") == [4, 128, 240]
+    assert _parse_needle_offsets(" 179 ") == [179]
+    with pytest.raises(ValueError):
+        _parse_needle_offsets("-1")
+    with pytest.raises(ValueError):
+        _parse_needle_offsets("abc")
 
 
 # ---------------------------------------------------------------------------

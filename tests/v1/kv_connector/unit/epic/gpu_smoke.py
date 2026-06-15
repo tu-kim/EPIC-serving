@@ -20,9 +20,16 @@ Steps (run in order; stop at the first failure):
   step4  NEEDLE probe. A shared NON-prefix passage B carries K secret-code
          needles ("The secret code for <subject> is <4-digit>."). The reuse
          prompt's tail Q asks for one code ("...the secret code for <subject>?
-         Answer:"). A warm request seeds B's chunks into the EPIC store; the
-         reuse request (different head A, B in the MIDDLE, Q at the tail) is
-         then answered DENSE (reference) and SPARSE (across a link sweep).
+         Answer:"). The TARGET needle (the one Q asks for) is placed at a DEEP
+         token offset in B (~0.70*B_len) -- OUTSIDE the LegoLink recomputed
+         leading region for non-full links -- so a needle HIT there proves the
+         REUSED (never-recomputed) KV carried the answer, rather than the needle
+         simply being recomputed (the front-loaded bias the rewrite fixes). A
+         warm request seeds B's chunks into the EPIC store; the reuse request
+         (different head A, B in the MIDDLE, Q at the tail) is then answered
+         DENSE (reference) and SPARSE (across a link sweep). Each link logs
+         ``needle_in_link`` (= needle_offset < eff_link): False rows are the
+         reused-KV proof, True rows (link==B-full) are the control.
          Discriminative by construction: filler is a rotating pool of real
          words (NOT blank space), so dense and sparse outputs are not trivially
          identical. Verdicts (mechanical):
@@ -791,6 +798,15 @@ def build_needle_passage_text(
     approximate -- build_aligned_token_prompts truncates/pads B to an exact
     chunk multiple at the TOKEN level afterwards (the answer sentences sit at
     the FRONT so token truncation never drops them).
+
+    NOTE (bias caveat, why build_needle_passage_tokens exists): putting the
+    facts at the FRONT of B collides with EPIC LegoLink, which RECOMPUTES the
+    leading ``eff_link`` tokens of every non-prefix chunk (reuse_strategy.py
+    "(2) link tokens"). At link=8/64 the front-loaded target needle lands in the
+    RECOMPUTED region, so a needle HIT cannot be attributed to reused KV vs. the
+    target simply being recomputed. This helper is kept for the older
+    text-level tests; step4 now uses ``build_needle_passage_tokens`` to place
+    the TARGET needle at a deep token offset (outside the link region).
     """
     pool = _FILLER_WORDS
     parts: list[str] = []
@@ -801,6 +817,129 @@ def build_needle_passage_text(
     filler = [pool[(filler_seed + i) % len(pool)] for i in range(n_filler_words)]
     parts.append(" ".join(filler) + ".")
     return " ".join(parts)
+
+
+# Default depth (as a FRACTION of B_len) at which the TARGET needle is placed.
+# It must sit OUTSIDE the largest non-full link value in the sweep so that, at
+# every approximation link, the target needle is in the REUSED (not recomputed)
+# region. With B_len=256 and the sweep [256, 64, 8], the largest non-full link
+# is 64; ~0.70 * 256 = ~179 tokens is comfortably past it. Only link=256 (full
+# recompute) ever covers the target.
+_DEFAULT_NEEDLE_OFFSET_FRAC = 0.70
+
+
+def needle_in_link(needle_offset: int, eff_link: int) -> bool:
+    """Classify whether the TARGET needle (placed at token ``needle_offset`` in
+    B) falls inside the LegoLink RECOMPUTED region (the leading ``eff_link``
+    tokens of B). True  -> the needle is recomputed (control / not a reuse
+    proof). False -> the needle is served purely from REUSED KV (the thing we
+    are trying to prove carries information).
+
+    Mirrors reuse_strategy.py's link rule: M includes ``range(lo, lo+eff_link)``
+    of each non-prefix chunk, i.e. token offsets ``[0, eff_link)`` within B.
+    """
+    return int(needle_offset) < int(eff_link)
+
+
+def build_needle_passage_tokens(
+    needles: list[NeedleFact],
+    target: NeedleFact,
+    *,
+    encode,
+    chunk_size: int,
+    needle_offset: int,
+    filler_seed: int,
+) -> list[int]:
+    """Build passage B as EXACTLY ``chunk_size`` token ids with the TARGET
+    needle sentence placed at token offset ``needle_offset`` (TOKEN-level, pure
+    apart from the injected ``encode`` callable).
+
+    Layout of the returned B token list (length == chunk_size):
+
+        [ rotating-filler ... ] [ TARGET needle tokens ] [ rotating-filler ... ]
+        ^ 0                     ^ needle_offset          ^ needle_offset + len   ^ chunk_size
+
+    The distractor needles (every needle except ``target``) are folded into the
+    LEADING filler region so B is still a real multi-fact passage, but only the
+    TARGET (the one Q asks about) is offset-guaranteed -- that is all the
+    discrimination needs (task spec 1).
+
+    ``encode`` is ``tok.encode(text, add_special_tokens=False) -> list[int]`` so
+    this stays tokenizer-agnostic and the caller controls special tokens (a
+    stray BOS would break B byte-identity vs. the same B in another prompt).
+
+    Raises ValueError if ``needle_offset + len(target tokens) > chunk_size``
+    (the needle would be truncated -- a silent drop would invalidate the probe).
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if needle_offset < 0:
+        raise ValueError("needle_offset must be >= 0")
+
+    pool = _FILLER_WORDS
+
+    def _filler_tokens(n_words: int, seed: int) -> list[int]:
+        ids: list[int] = []
+        for i in range(n_words):
+            ids.extend(encode(" " + pool[(seed + i) % len(pool)]))
+        return ids
+
+    target_tokens = list(encode(" " + target.fact_sentence()))
+    needle_len = len(target_tokens)
+    if needle_offset + needle_len > chunk_size:
+        raise ValueError(
+            f"target needle ({needle_len} tokens) at offset {needle_offset} "
+            f"overruns B (chunk_size={chunk_size}): "
+            f"{needle_offset}+{needle_len} > {chunk_size}. Lower the offset or "
+            "raise chunk_size."
+        )
+
+    # Distractor fact sentences (everything except the target). Their tokens go
+    # at the very front so B reads as a genuine multi-fact passage.
+    distractor_tokens: list[int] = []
+    for nd in needles:
+        if nd is target or (nd.subject == target.subject and nd.answer == target.answer):
+            continue
+        distractor_tokens.extend(encode(" " + nd.fact_sentence()))
+
+    # LEADING region: distractor facts, then rotating filler, truncated/padded
+    # to EXACTLY needle_offset tokens so the target lands precisely at the
+    # offset. (If distractors already exceed needle_offset we truncate them; the
+    # target placement is what the probe asserts on, not distractor fidelity.)
+    lead = list(distractor_tokens)
+    if len(lead) < needle_offset:
+        lead = lead + _filler_tokens(
+            # plenty of filler words; trimmed to size below.
+            n_words=needle_offset, seed=filler_seed,
+        )
+    lead = lead[:needle_offset]
+    # Pad the (rare) shortfall when filler tokens were multi-token-per-word and
+    # over/undershot: top up with single-id cycling so we hit needle_offset
+    # exactly without re-tokenizing.
+    if len(lead) < needle_offset and lead:
+        i = 0
+        while len(lead) < needle_offset:
+            lead.append(lead[i % len(lead)])
+            i += 1
+
+    # TRAILING region: rotating filler to fill the remainder up to chunk_size.
+    trail_target = chunk_size - needle_offset - needle_len
+    trail = _filler_tokens(n_words=max(trail_target, 0), seed=filler_seed + 31)
+    trail = trail[:trail_target]
+    if len(trail) < trail_target and trail:
+        i = 0
+        while len(trail) < trail_target:
+            trail.append(trail[i % len(trail)])
+            i += 1
+    elif trail_target > 0 and not trail:
+        # Degenerate empty pool: pad with the first target token id.
+        trail = [target_tokens[0]] * trail_target
+
+    b_ids = lead + target_tokens + trail
+    assert len(b_ids) == chunk_size, (
+        f"B assembled to {len(b_ids)} tokens, expected exactly {chunk_size}"
+    )
+    return b_ids
 
 
 def _output_has_answer(text: str, answer: str) -> bool:
@@ -856,7 +995,9 @@ def _read_epic_counters() -> dict:
     return dict(EpicConnector.debug_counters)
 
 
-def step4_shared_chunk_sparse_vs_dense(model: str, cfg: "SmokeConfig") -> None:
+def step4_shared_chunk_sparse_vs_dense(
+    model: str, cfg: "SmokeConfig", needle_offsets: list[int] | None = None
+) -> None:
     _log(
         "step4: NEEDLE probe -- DENSE reference vs sparse across a LINK sweep "
         f"{_LINK_SWEEP} (discriminative: answer code lives ONLY in passage B)"
@@ -878,11 +1019,19 @@ def step4_shared_chunk_sparse_vs_dense(model: str, cfg: "SmokeConfig") -> None:
     # --- needle facts: K secret codes embedded ONLY in passage B ------------
     needles = make_needles(seed=4, k=3)
     target = needles[0]  # the one Q asks about
-    passage_text = build_needle_passage_text(needles, filler_seed=11)
+
+    # TARGET-needle depth (token offset within B). Default: a single DEEP offset
+    # (~0.70 * B_len) so the target is OUTSIDE the LegoLink recomputed region for
+    # every non-full link (8, 64); only link=256 (full recompute) covers it. The
+    # optional mini-sweep (--needle-offsets) repeats the probe at several depths
+    # to trace HIT vs. depth (task spec 4).
+    if needle_offsets is None:
+        needle_offsets = [int(round(_DEFAULT_NEEDLE_OFFSET_FRAC * chunk_size))]
     _log(
         "step4: needles="
         + "; ".join(f"{n.subject}->{n.answer}" for n in needles)
         + f" | asking for subject={target.subject!r} answer={target.answer!r}"
+        + f" | needle_offsets={needle_offsets} (B_len={chunk_size})"
     )
 
     # Discriminative filler: rotate REAL words (not blank space) for all padding
@@ -893,15 +1042,62 @@ def step4_shared_chunk_sparse_vs_dense(model: str, cfg: "SmokeConfig") -> None:
     if not filler_ids:
         filler_ids = [0]
 
+    for needle_offset in needle_offsets:
+        _step4_one_offset(
+            model=model,
+            cfg=cfg,
+            tok=tok,
+            enc=_enc,
+            chunk_size=chunk_size,
+            needles=needles,
+            target=target,
+            needle_offset=needle_offset,
+            filler_ids=filler_ids,
+            max_tokens=max_tokens,
+        )
+    _log(
+        "step4: PASS (all needle offsets passed the probe-validity + decisive "
+        "B-full gates; deep-offset reused-KV interpretation logged per link)."
+    )
+
+
+def _step4_one_offset(
+    *,
+    model: str,
+    cfg: "SmokeConfig",
+    tok,
+    enc,
+    chunk_size: int,
+    needles: list[NeedleFact],
+    target: NeedleFact,
+    needle_offset: int,
+    filler_ids: list[int],
+    max_tokens: int,
+) -> None:
+    """Run the full needle probe for ONE target-needle depth (offset)."""
+    _log(f"step4: ===== needle_offset={needle_offset} (B depth) =====")
+
+    # --- TOKEN-LEVEL passage B: target needle placed at exactly needle_offset --
+    # (Bias fix.) The TARGET needle sentence is positioned at token offset
+    # ``needle_offset`` so that, for the small/mid links, it sits OUTSIDE the
+    # recomputed leading region -- a HIT there can only come from REUSED KV.
+    b_ids = build_needle_passage_tokens(
+        needles, target, encode=enc, chunk_size=chunk_size,
+        needle_offset=needle_offset, filler_seed=11,
+    )
+    assert len(b_ids) == chunk_size  # exact B (byte-identical warm vs reuse)
+
     assembled = build_aligned_token_prompts(
-        head_ids=_enc(_PROMPT_HEAD),
-        passage_ids=_enc(passage_text),
-        tail_ids=_enc(_PROMPT_TAIL_1),
-        reuse_head_ids=_enc(
+        head_ids=enc(_PROMPT_HEAD),
+        # Pass B PRE-BUILT and exactly chunk_size: build_aligned_token_prompts
+        # slices passage_ids[:b_len] verbatim, so our offset survives intact.
+        passage_ids=b_ids,
+        tail_ids=enc(_PROMPT_TAIL_1),
+        reuse_head_ids=enc(
             "Different opening sentence here for the second request entirely. "
         ),
         # Reuse tail = the needle QUESTION (asks for the code that lives in B).
-        reuse_tail_ids=_enc(target.question()),
+        reuse_tail_ids=enc(target.question()),
         chunk_size=chunk_size,
         filler_ids=filler_ids,
         passage_chunks=1,
@@ -992,14 +1188,21 @@ def step4_shared_chunk_sparse_vs_dense(model: str, cfg: "SmokeConfig") -> None:
     # the VRAM-leak fix: an in-process engine does NOT free device memory on
     # `del llm`, so building 3 of them in one parent process accumulated VRAM and
     # tripped the "Free memory < utilization" gate. Subprocess exit frees it all.
-    results: list[tuple[int, float, int, bool, dict]] = []
+    # results row = (link, rate, first_div, needle_hit, counters, in_link)
+    results: list[tuple[int, float, int, bool, dict, bool]] = []
     for link in _LINK_SWEEP:
         b_len = assembled["b_len"]
         eff_link = min(link, b_len)
+        # Is the TARGET needle inside the recomputed leading region? If so the
+        # HIT could be due to recompute, not reuse (control). If NOT, a HIT is a
+        # pure reused-KV information-preservation proof.
+        in_link = needle_in_link(needle_offset, eff_link)
         _log(
             f"step4[link={link}]: launching SUBPROCESS sparse engine "
             f"(epic_link_tokens={eff_link}, B_len={b_len}, "
-            f"reuse_fraction={(b_len - eff_link) / b_len:.2f})"
+            f"reuse_fraction={(b_len - eff_link) / b_len:.2f}, "
+            f"needle_offset={needle_offset}, needle_in_link={in_link} -> "
+            f"{'RECOMPUTED (control)' if in_link else 'REUSED-KV (proof)'})"
         )
         sparse_res = run_engine_subprocess(build_worker_spec(
             role="sparse",
@@ -1035,13 +1238,34 @@ def step4_shared_chunk_sparse_vs_dense(model: str, cfg: "SmokeConfig") -> None:
         div = _first_divergence(dense_out, sparse_out)
         cos = _decode_cosine(model, dense_out, sparse_out)
         hit = _output_has_answer(sparse_text, target.answer)
-        results.append((link, rate, div, hit, counters))
+        results.append((link, rate, div, hit, counters, in_link))
 
         _log(f"step4[link={link}]: sparse text: {sparse_text!r}")
         _log(
             f"step4[link={link}]: needle_hit={hit} (code {target.answer!r}) "
+            f"needle_in_link={in_link} "
             f"token-match rate sparse-vs-dense = {rate:.3f}"
         )
+        if not in_link:
+            _log(
+                f"step4[link={link}]: INTERPRETATION -- needle is OUTSIDE the "
+                f"recomputed region (offset {needle_offset} >= eff_link "
+                f"{eff_link}). "
+                + (
+                    "HIT => the REUSED (non-recomputed) KV carried the answer: "
+                    "direct proof that reused KV preserves information."
+                    if hit else
+                    "MISS => reuse ALONE did not preserve enough to answer at "
+                    "this link (algorithmic limit, reported not failed)."
+                )
+            )
+        else:
+            _log(
+                f"step4[link={link}]: INTERPRETATION -- needle is INSIDE the "
+                f"recomputed region (offset {needle_offset} < eff_link "
+                f"{eff_link}); this is a CONTROL row (a HIT may be due to "
+                "recompute, not reuse)."
+            )
         _log(
             f"step4[link={link}]: first divergence index = "
             f"{'NONE (identical)' if div < 0 else div}"
@@ -1072,12 +1296,12 @@ def step4_shared_chunk_sparse_vs_dense(model: str, cfg: "SmokeConfig") -> None:
             )
 
     # --- summary table -------------------------------------------------------
-    _log("step4: LINK SWEEP SUMMARY")
+    _log(f"step4: LINK SWEEP SUMMARY (needle_offset={needle_offset})")
     _log(
-        "    link | needle | match_rate | first_div | "
+        "    link | needle | needle_in_link | match_rate | first_div | "
         "match/emit/loaded | regime"
     )
-    for link, rate, div, hit, counters in results:
+    for link, rate, div, hit, counters, in_link in results:
         full = "B-FULL (decisive)" if link >= assembled["b_len"] else "approx"
         cstr = (
             f"{counters.get('sparse_match', 0)}/"
@@ -1085,8 +1309,28 @@ def step4_shared_chunk_sparse_vs_dense(model: str, cfg: "SmokeConfig") -> None:
             f"{counters.get('chunks_loaded', 0)}"
         )
         _log(
-            f"    {link:4d} | {('HIT' if hit else 'miss'):>6s} | {rate:10.3f} | "
+            f"    {link:4d} | {('HIT' if hit else 'miss'):>6s} | "
+            f"{str(in_link):>14s} | {rate:10.3f} | "
             f"{('none' if div < 0 else str(div)):>9s} | {cstr:^24s} | {full}"
+        )
+    # Headline reused-KV proof rows: needle OUTSIDE the recomputed region.
+    proof_rows = [r for r in results if not r[5]]
+    proof_hits = [r for r in proof_rows if r[3]]
+    if proof_rows:
+        _log(
+            "step4: REUSED-KV PROOF rows (needle_in_link=False): "
+            + ", ".join(
+                f"link={r[0]}:{'HIT' if r[3] else 'miss'}" for r in proof_rows
+            )
+            + f" -> {len(proof_hits)}/{len(proof_rows)} HIT. A HIT here means "
+            "the answer came from REUSED KV that was NEVER recomputed -- the "
+            "core EPIC claim (reused KV carries information)."
+        )
+    else:
+        _log(
+            "step4: NOTE -- no reused-KV proof row at this offset "
+            f"(needle_offset={needle_offset} < every non-full eff_link). "
+            "Raise needle_offset to put the target outside the link region."
         )
     _log(
         "step4: HINT -- inspect the engine schedule log for the reuse request's "
@@ -1104,7 +1348,7 @@ def step4_shared_chunk_sparse_vs_dense(model: str, cfg: "SmokeConfig") -> None:
             "link sweep had no entry >= B_len so the decisive (M==all-of-B) "
             "control did not run; add B_len to _LINK_SWEEP.",
         )
-    _, decisive_rate, decisive_div, decisive_hit, _ = decisive
+    _, decisive_rate, decisive_div, decisive_hit, _, _ = decisive
     if not decisive_hit:
         _fail(
             "step4",
@@ -1130,6 +1374,9 @@ def step4_shared_chunk_sparse_vs_dense(model: str, cfg: "SmokeConfig") -> None:
     # Machinery is healthy. The smaller-link runs are an APPROXIMATION regime:
     # report needle hit + match + first divergence; a miss is an algorithmic
     # limit (link cannot restitch B's lost cross-context), not a failure.
+    # NOTE: the decisive gate stays on link=B-full (needle_in_link=True there);
+    # the deep-offset reused-KV PROOF rows are interpretive, NOT a hard gate, so
+    # a reuse-only miss is reported (algorithmic limit) rather than failing.
     _log(
         f"step4: DECISIVE OK (link={decisive[0]} M==all-of-B needle HIT, match "
         f"{decisive_rate:.3f} >= {_MACHINERY_PASS_THRESHOLD}). Smaller-link rows "
@@ -1137,10 +1384,17 @@ def step4_shared_chunk_sparse_vs_dense(model: str, cfg: "SmokeConfig") -> None:
         "there is the 1st-order approximation-quality signal (reported, not a "
         "machinery failure)."
     )
+    if proof_hits:
+        _log(
+            "step4: REUSED-KV PROVEN at this offset -- "
+            + ", ".join(f"link={r[0]}" for r in proof_hits)
+            + " answered the needle while the target sat OUTSIDE the recomputed "
+            "region: the reused KV (never recomputed) carried the answer."
+        )
     _log(
-        "step4: PASS (probe valid: dense answered + discriminative; sparse "
-        "engaged in-band; decisive B-full control hit the needle and matched "
-        "dense; approximation sweep reported)."
+        f"step4: offset {needle_offset} PASS (probe valid: dense answered + "
+        "discriminative; sparse engaged in-band; decisive B-full control hit "
+        "the needle and matched dense; reused-KV proof rows reported)."
     )
 
 
@@ -1178,6 +1432,26 @@ def _parse_steps(arg: str | None) -> list[int]:
         tok = tok.strip()
         if tok:
             out.append(int(tok))
+    return out
+
+
+def _parse_needle_offsets(arg: str | None) -> list[int] | None:
+    """Parse the --needle-offsets CLI value into a list of token offsets, or
+    None to use the default single deep offset. Raises ValueError on a malformed
+    or negative value (caught + reported by main)."""
+    if arg is None:
+        return None
+    out: list[int] = []
+    for tok in str(arg).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        v = int(tok)
+        if v < 0:
+            raise ValueError(f"needle offset must be >= 0, got {v}")
+        out.append(v)
+    if not out:
+        return None
     return out
 
 
@@ -1226,6 +1500,17 @@ def main(argv: list[str] | None = None) -> int:
         help="max_model_len passed to every engine (default 2048).",
     )
     ap.add_argument(
+        "--needle-offsets",
+        default=None,
+        help=(
+            "Comma-separated TARGET-needle token offsets within passage B for "
+            "the step4 depth mini-sweep (e.g. '4,128,240'). Default: a single "
+            "DEEP offset (~0.70*B_len) so the target is OUTSIDE the LegoLink "
+            "recomputed region for non-full links -- a needle HIT there proves "
+            "reused KV carries information. Only step4 reads this."
+        ),
+    )
+    ap.add_argument(
         "--_worker-json",
         dest="worker_json",
         default=None,
@@ -1236,6 +1521,13 @@ def main(argv: list[str] | None = None) -> int:
     # --- hidden worker mode: build ONE engine, print RESULT_JSON, exit --------
     if args.worker_json is not None:
         return _worker_main(args.worker_json)
+
+    # Parse the step4 needle-offset mini-sweep up front so a malformed value
+    # fails before any (slow) engine construction.
+    try:
+        needle_offsets = _parse_needle_offsets(args.needle_offsets)
+    except ValueError as e:
+        _fail("main", f"bad --needle-offsets: {e}")
 
     if not _has_cuda():
         _log(
@@ -1261,7 +1553,10 @@ def main(argv: list[str] | None = None) -> int:
         fn = _STEPS.get(s)
         if fn is None:
             _fail("main", f"unknown step {s}; valid: {sorted(_STEPS)}")
-        fn(args.model, cfg)
+        if s == 4:
+            fn(args.model, cfg, needle_offsets)
+        else:
+            fn(args.model, cfg)
     _log(f"ALL REQUESTED STEPS PASSED: {steps}")
     return 0
 
