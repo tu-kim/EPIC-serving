@@ -660,14 +660,26 @@ def run_mode_subprocess(spec: dict) -> dict:
     live); only stdout is parsed.
     """
     import subprocess
+    import tempfile
 
-    cmd = [
-        sys.executable,
-        os.path.abspath(__file__),
-        "--_worker-json",
-        serialize_spec(spec),
-    ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=None, text=True)
+    # Write the spec to a temp file and pass its PATH (musique contexts are too
+    # large to fit in argv -> "Argument list too long").
+    fd, spec_path = tempfile.mkstemp(prefix="epic_musique_spec_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(serialize_spec(spec))
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--_worker-spec-file",
+            spec_path,
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=None, text=True)
+    finally:
+        try:
+            os.unlink(spec_path)
+        except OSError:
+            pass
     try:
         return parse_result_json(proc.stdout)
     except ValueError as e:
@@ -961,7 +973,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--warmup-discard", action="store_true",
                     help="drop the FIRST sample from the aggregate (cold "
                          "compile/autotune warmup).")
-    ap.add_argument("--_worker-json", dest="worker_json", default=None,
+    # Spec is passed via a FILE, not argv: musique contexts are thousands of
+    # tokens, and serializing them into a command-line argument overruns the OS
+    # argv limit ("Argument list too long").
+    ap.add_argument("--_worker-spec-file", dest="worker_spec_file", default=None,
                     help=argparse.SUPPRESS)
     return ap
 
@@ -984,8 +999,9 @@ def _parse_link_sweep(arg: str | None) -> list[int] | None:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
-    if args.worker_json is not None:
-        return _worker_main(args.worker_json)
+    if args.worker_spec_file is not None:
+        with open(args.worker_spec_file, encoding="utf-8") as f:
+            return _worker_main(f.read())
 
     try:
         args.link_sweep = _parse_link_sweep(args.link_sweep)
