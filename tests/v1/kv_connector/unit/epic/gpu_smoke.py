@@ -45,19 +45,27 @@ Steps (run in order; stop at the first failure):
              (approximation regime; a miss there is an algorithmic limit).
   step5  CROSS-CONTEXT approximation-quality probe. Where step4's needle is a
          discrete, B-self-contained fact (nearly link-INVARIANT, so a weak probe
-         of what LegoLink buys), step5 measures CONTINUOUS output fidelity: a
-         contentful shared passage B is reused NON-PREFIX under a NEW context
-         A/C; the DENSE (full-recompute) continuation C* is generated once, then
-         each sparse link L re-scores the fixed (reuse_prompt + C*) sequence via
-         teacher-forced prompt_logprobs and reports distance(L) = mean NLL of C*
-         under sparse-L (smaller == closer to dense). The link sweep includes
-         the extremes: link=0 (reuse-only, pure stale KV) and link=B_full (full
-         recompute, == dense up to numerics). Verdicts: B_full distance ~= dense
-         self-NLL else MACHINERY FAIL; reuse-only > B_full means recompute does
-         something (else "LINK HAS NO EFFECT" diagnostic); middle links are
-         REPORTED (distance + monotonicity), never hard-thresholded. A
-         monotone-decreasing distance with link is the evidence the EPIC
-         approximation converges to dense.
+         of what LegoLink buys), step5 measures output fidelity at the FIRST
+         DECODE TOKEN: a contentful shared passage B is reused NON-PREFIX under a
+         NEW context A/C; the DENSE (full-recompute) run is generated once and
+         its first greedy token t0 (argmax) is the reference. Each sparse link L
+         then takes a SINGLE greedy decode step with top-K logprobs
+         (SamplingParams(logprobs=K, max_tokens=1)) and reports the RANK and
+         logprob it assigns to t0; distance(L) = rank(t0)-1 (0 == sparse still
+         picks t0 == dense). The decode position is the only scored position and
+         EPIC sparse ALWAYS forwards it (last prompt token in M), so unlike the
+         old prompt_logprobs teacher-forcing (which needs a logit at EVERY prompt
+         position and crashes the M-row sparse forward with an OverflowError),
+         this metric is SPARSE-COMPATIBLE. The link sweep includes the extremes:
+         link=0 (reuse-only, pure stale KV) and link=B_full (full recompute, ==
+         dense up to numerics). Verdicts: B_full rank-distance == 0 (sparse picks
+         t0) else MACHINERY FAIL; reuse-only distance > B_full means recompute
+         does something (else "LINK HAS NO EFFECT" diagnostic); middle links are
+         REPORTED (rank-distance + KL + monotonicity), never hard-thresholded. A
+         monotone-decreasing rank-distance with link is the evidence the EPIC
+         approximation converges to dense. (Single-position variance is a known
+         limitation; the bench harness averages over many prompts -- TODO there,
+         not here.)
 
 Usage:
     # On a CUDA box, after `VLLM_USE_PRECOMPILED=1 uv pip install -e .`.
@@ -346,8 +354,7 @@ def build_worker_spec(
     max_model_len: int = 2048,
     in_process: bool = False,
     read_counters: bool = False,
-    prompt_logprobs: int | None = None,
-    logprob_prefix_lens: list[int] | None = None,
+    first_token_logprobs: int | None = None,
 ) -> dict:
     """Build the JSON-serialisable spec for ONE isolated engine run (pure).
 
@@ -362,19 +369,20 @@ def build_worker_spec(
                         after the run and returns them (sparse engagement check).
     in_process       -- if True the worker sets VLLM_ENABLE_V1_MULTIPROCESSING=0
                         so the scheduler+worker connectors share state in-band.
-    prompt_logprobs  -- if not None, run each prompt as a TEACHER-FORCED scoring
-                        pass (SamplingParams(prompt_logprobs=N, max_tokens=1))
-                        and return, per prompt, the per-position logprob of the
-                        ACTUAL prompt token (the step5 fidelity metric: the
-                        likelihood the engine assigns to a fixed token sequence).
-                        N==0 is enough (vLLM always includes the real prompt
-                        token's logprob at each position regardless of top-N).
-    logprob_prefix_lens -- per prompt, the prompt-token offset BEFORE which the
-                        teacher-forced logprob is not scored (the reuse-prompt
-                        prefix); only positions >= this offset (the appended
-                        dense continuation) are summed into the NLL. Defaults to
-                        0 (score the whole prompt). Length must match ``prompts``
-                        when given.
+    first_token_logprobs -- if not None (== K), run each prompt as a single
+                        greedy DECODE step (SamplingParams(logprobs=K,
+                        max_tokens=1)) and return, per prompt, the FIRST decode
+                        token's top-K logprob distribution (token id -> {logprob,
+                        rank}) plus the sampled (argmax) token id. This is the
+                        step5 fidelity metric and is SPARSE-COMPATIBLE: the
+                        scored position is the single decode position (the next
+                        token after the last prompt token), which EPIC sparse
+                        ALWAYS forwards (last in M). It does NOT require logits at
+                        the reused (non-forwarded) prompt positions, which is why
+                        it replaces the old prompt_logprobs teacher-forcing path
+                        (prompt_logprobs needs a logit at EVERY prompt position
+                        and is structurally incompatible with the M-row sparse
+                        forward -- see step5 module comment).
     """
     return {
         "role": role,
@@ -389,11 +397,12 @@ def build_worker_spec(
         "max_model_len": int(max_model_len),
         "in_process": bool(in_process),
         "read_counters": bool(read_counters),
-        # step5 teacher-forced scoring (None -> plain generation, unchanged).
-        "prompt_logprobs": (None if prompt_logprobs is None
-                            else int(prompt_logprobs)),
-        "logprob_prefix_lens": (None if logprob_prefix_lens is None
-                                else [int(x) for x in logprob_prefix_lens]),
+        # step5 first-decode-token top-K logprobs (None -> plain generation,
+        # unchanged). K == 0 is NOT enough here (unlike prompt_logprobs) because
+        # we need the dense argmax token to appear in the sparse top-K to read
+        # its rank/logprob, so callers pass K >= ~20.
+        "first_token_logprobs": (None if first_token_logprobs is None
+                                 else int(first_token_logprobs)),
     }
 
 
@@ -435,85 +444,185 @@ def _emit_result(result: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# step5 teacher-forced logprob extraction + serialisation (pure, CPU-testable)
+# step5 first-decode-token top-K logprob extraction + metrics (pure, CPU-test).
 #
-# vLLM's RequestOutput.prompt_logprobs is, per prompt position, a
-# dict[int, Logprob] that ALWAYS includes the actual prompt token id at that
-# position (its rank lookup guarantees it, regardless of top-N). So with
-# SamplingParams(prompt_logprobs=0, max_tokens=1) we get, for free, the
-# log P(prompt_token[pos] | prompt[:pos]) the model assigns to a FIXED token
-# sequence -- exactly the teacher-forced score step5 needs. We extract only the
-# ACTUAL-token logprob per position into a flat list[float | None] (None where
-# vLLM has no entry, e.g. position 0), which is trivially JSON-serialisable and
-# round-trip testable on CPU with no torch/vLLM.
+# WHY NOT prompt_logprobs (the structural incompatibility this rewrite fixes):
+#   The previous step5 metric was teacher-forced NLL via
+#   SamplingParams(prompt_logprobs=N). vLLM produces a prompt logprob at EVERY
+#   prompt position -- gpu_model_runner._get_prompt_logprobs_dict sets
+#   num_prompt_tokens = len(request.prompt_token_ids) (the FULL prompt) and
+#   slices hidden_states[offset:offset+num_logits] expecting a logit per prompt
+#   position (gpu_model_runner.py :5453, :5495). But EPIC sparse forward only
+#   forwards M rows (C u link u last) -- hidden_states has M rows, NOT the full
+#   prompt -- and the scheduler advances num_computed_tokens toward N (the full
+#   span) via epic_computed_advance. The runner then computes a NEGATIVE
+#   num_positions for LogprobsTensors.empty_cpu(num_prompt_tokens - 1, ...)
+#   / a row count that exceeds the M-row hidden_states, and torch.empty with a
+#   negative size raises exactly "OverflowError: out of range integral type
+#   conversion attempted" (outputs.py :98). Dense (sparse OFF) forwards ALL
+#   prompt positions, so every prompt-position logit exists and the path works
+#   -- which is why only the sparse score runs crashed. prompt_logprobs is thus
+#   STRUCTURALLY incompatible with the M-row sparse forward.
+#
+# THE SPARSE-COMPATIBLE METRIC (first decode token):
+#   We instead ask for a SINGLE greedy decode step with the top-K logprob
+#   distribution: SamplingParams(temperature=0, max_tokens=1, logprobs=K). The
+#   ONLY scored position is the decode position (the token after the last prompt
+#   token), which EPIC sparse ALWAYS forwards (the last prompt token is in M, and
+#   its hidden state attends over B's reused KV). No reused (non-forwarded)
+#   prompt position is ever scored, so the M-row forward is sufficient.
+#
+#   The dense run's first decode token t0 (greedy argmax) is the reference. Each
+#   sparse link run reports the logprob and RANK it assigns to t0:
+#     * rank == 1  -> sparse still greedily picks t0 (closest to dense).
+#     * rank large -> sparse's distribution moved away (link too small / stale).
+#   distance(L) = (rank(t0 under L) - 1): 0 == dense agreement, larger == worse.
+#   Secondary: KL(dense top-K || sparse top-K) over the shared support with a
+#   floor logprob for tokens missing from one side.
+#
+# All extraction below operates on plain {token_id: {"logprob","rank"}} dicts so
+# it is JSON-serialisable and unit-testable on CPU with no torch / vLLM.
 # ---------------------------------------------------------------------------
-def extract_actual_token_logprobs(
-    prompt_token_ids: list[int], prompt_logprobs
-) -> list[float | None]:
-    """Per prompt position, the logprob the engine assigned to the ACTUAL
-    prompt token at that position (or None if unavailable).
+def extract_first_token_logprobs(sample_logprobs) -> dict[int, dict] | None:
+    """Pull the FIRST decode step's top-K logprob map out of a vLLM
+    ``SampleLogprobs`` into a plain ``{token_id: {"logprob","rank"}}`` dict.
 
-    ``prompt_logprobs`` is a vLLM ``PromptLogprobs`` (list-like of
-    ``dict[int, Logprob]`` per position, with ``None`` for position 0). We index
-    each position's dict by the real token id and pull its ``.logprob``. Pure
-    apart from reading the (already-pythonised) vLLM objects, so the parsing
-    half is unit-testable with plain dicts of floats.
+    ``sample_logprobs`` is ``RequestOutput.outputs[0].logprobs`` -- a list-like
+    (FlatLogprobs or list) of ``dict[int, Logprob]`` per generated position. We
+    take position 0 (max_tokens=1 -> exactly one decode step). Returns None if
+    there is no logprob for the first step (logprobs were not requested). Pure
+    apart from reading the (already-pythonised) vLLM objects; the CPU test feeds
+    plain dicts of floats, so we tolerate a bare-float value too.
     """
-    out: list[float | None] = []
-    n = len(prompt_token_ids)
-    for pos in range(n):
-        lp_at_pos = None
-        if prompt_logprobs is not None and pos < len(prompt_logprobs):
-            entry = prompt_logprobs[pos]
-            if entry:
-                tid = prompt_token_ids[pos]
-                lp = entry.get(tid)
-                if lp is not None:
-                    # vLLM Logprob dataclass -> .logprob; tolerate a bare float
-                    # (the CPU parsing test feeds plain floats).
-                    lp_at_pos = float(getattr(lp, "logprob", lp))
-        out.append(lp_at_pos)
+    if not sample_logprobs:
+        return None
+    try:
+        first = sample_logprobs[0]
+    except (IndexError, KeyError, TypeError):
+        return None
+    if not first:
+        return None
+    out: dict[int, dict] = {}
+    for tid, lp in first.items():
+        logprob = float(getattr(lp, "logprob", lp))
+        rank = getattr(lp, "rank", None)
+        out[int(tid)] = {
+            "logprob": logprob,
+            "rank": (int(rank) if rank is not None else None),
+        }
     return out
 
 
-def teacher_forced_nll(
-    token_logprobs: list[float | None], prefix_len: int
-) -> tuple[float, int]:
-    """Sum of -logprob over the SCORED region [prefix_len, end), and the count
-    of positions actually scored. Positions with a None logprob (no entry) are
-    skipped (they cannot be scored). Returns (sum_nll, n_scored).
+def parse_first_token_map(raw: dict | None) -> dict[int, dict] | None:
+    """Re-key a JSON-decoded first-token map (string token-id keys -> int) back
+    to ``{int: {"logprob","rank"}}``. JSON forces dict keys to strings on the
+    wire; the worker emits ``{str(tid): entry}`` and the parent calls this to
+    restore int keys. None passes through. Pure."""
+    if raw is None:
+        return None
+    return {int(tid): entry for tid, entry in raw.items()}
 
-    The scored region is the appended dense-continuation tokens; the reuse
-    prompt prefix (B + A/C + Q) is excluded so the metric reflects fidelity of
-    the CONTINUATION the engine would produce, not the fixed prompt.
+
+def argmax_token(first_token_logprobs: dict[int, dict] | None) -> int | None:
+    """The token id with the HIGHEST logprob in a first-token top-K map (== the
+    greedy decode choice). None if the map is empty/None. Ties broken by the
+    smaller token id for determinism. (We prefer rank==1 when ranks are present,
+    falling back to the max logprob, so a missing/garbled rank still resolves.)
     """
-    sum_nll = 0.0
-    n = 0
-    for pos in range(max(prefix_len, 0), len(token_logprobs)):
-        lp = token_logprobs[pos]
-        if lp is None:
-            continue
-        sum_nll += -float(lp)
-        n += 1
-    return sum_nll, n
+    if not first_token_logprobs:
+        return None
+    # Prefer an explicit rank==1 entry (vLLM's own argmax).
+    ranked = [
+        tid for tid, e in first_token_logprobs.items()
+        if e.get("rank") == 1
+    ]
+    if len(ranked) == 1:
+        return ranked[0]
+    # Fall back to max logprob (ties -> smaller token id).
+    best_tid: int | None = None
+    best_lp = float("-inf")
+    for tid in sorted(first_token_logprobs):
+        lp = float(first_token_logprobs[tid]["logprob"])
+        if lp > best_lp:
+            best_lp = lp
+            best_tid = tid
+    return best_tid
 
 
-def mean_nll_to_perplexity(sum_nll: float, n_scored: int) -> tuple[float, float]:
-    """(mean NLL, perplexity) over n_scored positions. Perplexity = exp(meanNLL)
-    is reported alongside for readability; the PRIMARY distance is mean NLL
-    (smaller == closer to dense, the metric-direction convention). Returns
-    (inf, inf) when nothing was scored so a degenerate run is obvious rather
-    than silently 0."""
+# Floor logprob assigned to a token that is absent from a top-K map (it fell
+# outside the requested K -> its true logprob is <= the K-th, so a small floor
+# is a conservative stand-in). Used for the t0 fallback and the KL support
+# alignment. -20 ~= logprob of a ~2e-9 probability token, well below any top-K.
+_FIRST_TOKEN_FLOOR_LOGPROB = -20.0
+
+
+def t0_logprob_and_rank(
+    first_token_logprobs: dict[int, dict] | None, t0: int
+) -> tuple[float, int | None]:
+    """The logprob and RANK the (sparse) run assigns to the dense argmax token
+    ``t0``. If t0 is outside this run's top-K map, return the floor logprob and
+    rank None (== "worse than K", the maximal distance signal). Pure.
+    """
+    if not first_token_logprobs:
+        return _FIRST_TOKEN_FLOOR_LOGPROB, None
+    entry = first_token_logprobs.get(int(t0))
+    if entry is None:
+        return _FIRST_TOKEN_FLOOR_LOGPROB, None
+    rank = entry.get("rank")
+    return (
+        float(entry["logprob"]),
+        (int(rank) if rank is not None else None),
+    )
+
+
+def rank_distance(rank: int | None, *, k: int) -> int:
+    """distance(L) from a t0 RANK: (rank - 1), so rank==1 (sparse agrees with
+    dense) -> 0. A None rank (t0 fell outside the run's top-K) maps to the
+    maximal distance ``k`` (one worse than the worst in-K rank). Smaller ==
+    closer to dense. Pure."""
+    if rank is None:
+        return int(k)
+    return max(int(rank) - 1, 0)
+
+
+def first_token_kl(
+    dense_map: dict[int, dict] | None,
+    sparse_map: dict[int, dict] | None,
+    *,
+    floor_logprob: float = _FIRST_TOKEN_FLOOR_LOGPROB,
+) -> float:
+    """KL(dense || sparse) over the first decode token, on the UNION of the two
+    top-K supports. Tokens missing from a side get ``floor_logprob`` (a small
+    stand-in for "outside top-K"). The dense distribution is RENORMALISED over
+    the shared support so the sum is a proper (truncated) probability; sparse
+    logprobs are read at the same support with the floor for absentees.
+
+    KL = sum_t p_dense(t) * (logp_dense(t) - logp_sparse(t)) >= ~0. Smaller ==
+    sparse closer to dense. Returns inf if dense is empty (cannot form p).
+    Pure (math only)."""
     import math
 
-    if n_scored <= 0:
-        return float("inf"), float("inf")
-    mean = sum_nll / n_scored
-    try:
-        ppl = math.exp(mean)
-    except OverflowError:
-        ppl = float("inf")
-    return mean, ppl
+    if not dense_map:
+        return float("inf")
+    support = set(dense_map) | set(sparse_map or {})
+
+    def _lp(m: dict[int, dict] | None, tid: int) -> float:
+        if not m or tid not in m:
+            return floor_logprob
+        return float(m[tid]["logprob"])
+
+    # Renormalise dense over the (truncated) support.
+    dense_lps = {t: _lp(dense_map, t) for t in support}
+    m = max(dense_lps.values())
+    z = sum(math.exp(lp - m) for lp in dense_lps.values())
+    log_z = m + math.log(z)
+    kl = 0.0
+    for t in support:
+        p = math.exp(dense_lps[t] - log_z)  # normalised dense prob
+        if p <= 0.0:
+            continue
+        kl += p * (dense_lps[t] - log_z - _lp(sparse_map, t))
+    return max(kl, 0.0)
 
 
 def run_worker(spec: dict) -> dict:
@@ -528,7 +637,7 @@ def run_worker(spec: dict) -> dict:
     from vllm.inputs import TokensPrompt
 
     role = spec.get("role", "?")
-    plp_n = spec.get("prompt_logprobs")
+    ftl_k = spec.get("first_token_logprobs")
     try:
         if spec.get("in_process"):
             # In-band counters: scheduler + worker connectors share state.
@@ -549,37 +658,39 @@ def run_worker(spec: dict) -> dict:
         for wp in spec.get("warm_prompts", []):
             llm.generate([TokensPrompt(prompt_token_ids=list(wp))], params)
 
-        # --- step5 teacher-forced scoring branch -------------------------------
-        # prompt_logprobs != None -> we are SCORING a fixed token sequence
-        # (reuse_prompt + dense_continuation), not generating. max_tokens=1 keeps
-        # the forward minimal; we only read RequestOutput.prompt_logprobs.
-        if plp_n is not None:
+        # --- step5 first-decode-token scoring branch ---------------------------
+        # first_token_logprobs != None (== K) -> a SINGLE greedy decode step with
+        # the top-K logprob distribution. The ONLY scored position is the decode
+        # position (next token after the last prompt token), which EPIC sparse
+        # ALWAYS forwards (last prompt token in M) -- so this is sparse-compatible
+        # (unlike prompt_logprobs, which needs a logit at every prompt position;
+        # see the extract_first_token_logprobs module comment). We return, per
+        # prompt, the first decode token's top-K map ({tid: {logprob, rank}}) so
+        # the parent can read the dense argmax t0's rank/logprob under sparse and
+        # compute KL across runs.
+        if ftl_k is not None:
             score_params = SamplingParams(
-                temperature=0.0, max_tokens=1, prompt_logprobs=int(plp_n)
+                temperature=0.0, max_tokens=1, logprobs=int(ftl_k)
             )
-            prefix_lens = spec.get("logprob_prefix_lens") or [
-                0 for _ in spec["prompts"]
-            ]
-            token_logprobs: list[list[float | None]] = []
-            nll_sums: list[float] = []
-            nll_counts: list[int] = []
-            for p, pre in zip(spec["prompts"], prefix_lens):
+            first_token_maps: list[dict | None] = []
+            for p in spec["prompts"]:
                 pid = list(p)
                 outs = llm.generate(
                     [TokensPrompt(prompt_token_ids=pid)], score_params
                 )
-                plp = outs[0].prompt_logprobs
-                per_pos = extract_actual_token_logprobs(pid, plp)
-                s, c = teacher_forced_nll(per_pos, int(pre))
-                token_logprobs.append(per_pos)
-                nll_sums.append(s)
-                nll_counts.append(c)
+                sample_lps = outs[0].outputs[0].logprobs
+                first_token_maps.append(
+                    extract_first_token_logprobs(sample_lps)
+                )
+            # JSON: int keys must become strings; the parent re-ints them.
             result: dict = {
                 "ok": True,
                 "role": role,
-                "token_logprobs": token_logprobs,
-                "nll_sums": nll_sums,
-                "nll_counts": nll_counts,
+                "first_token_logprobs": [
+                    (None if m is None
+                     else {str(tid): e for tid, e in m.items()})
+                    for m in first_token_maps
+                ],
             }
             if spec.get("read_counters"):
                 result["counters"] = _read_epic_counters()
@@ -1139,17 +1250,22 @@ _MACHINERY_PASS_THRESHOLD = 0.9
 # B_full is appended at runtime (= chunk_size) so the constant stays B-agnostic.
 _STEP5_LINK_SWEEP = [0, 8, 64]
 
-# Distance (mean NLL of the dense continuation under the sparse model) below
-# which the B-full control is considered "== dense up to numerics". Teacher-
-# forced NLL on the SAME continuation tokens with full recompute should be
-# essentially the dense self-NLL; a small positive epsilon absorbs fp/kernel
-# nondeterminism. This is the step5 MACHINERY gate (mirror of step4 decisive).
-_STEP5_BFULL_NLL_EPS = 0.05
+# Number of top-K logprobs requested per first decode step. Must be large enough
+# that the dense argmax token t0 usually appears in each sparse run's top-K (so
+# its rank is read directly rather than floored). 20 is a good balance.
+_STEP5_TOPK = 20
 
-# Relative gap below which reuse-only (link=0) is judged INDISTINGUISHABLE from
-# full recompute -> "LINK HAS NO EFFECT" diagnostic (NOT a failure: it is a real
-# finding that, for this prompt, the link boundary recompute buys nothing).
-_STEP5_NO_EFFECT_REL = 0.02
+# rank_distance(t0) at/below which the B-full control is considered "== dense up
+# to numerics". With ZERO reuse approximation the sparse first token MUST equal
+# the dense argmax (rank 1 -> distance 0). We allow distance 0 only (rank 1); a
+# tiny tolerance is meaningless for an integer rank, so this is exact. This is
+# the step5 MACHINERY gate (mirror of step4's decisive gate).
+_STEP5_BFULL_MAX_RANK_DISTANCE = 0
+
+# A reuse-only (link=0) rank-distance this close to the B-full control's
+# distance means "LINK HAS NO EFFECT" -- the boundary recompute changed nothing
+# for this prompt (a DIAGNOSTIC, not a failure).
+_STEP5_NO_EFFECT_RANK_GAP = 0
 
 
 def is_monotonic_nonincreasing(values: list[float], *, tol: float = 1e-6) -> bool:
@@ -1648,32 +1764,45 @@ def _step4_one_offset(
 # recompute) continuation. That monotone convergence is the evidence the EPIC
 # approximation works.
 #
-# METRIC (chosen: teacher-forced NLL of the dense continuation under sparse):
-#   1. DENSE run (sparse OFF) generates a continuation C* for the reuse prompt.
-#   2. For each sparse link L, we SCORE the fixed sequence (reuse_prompt + C*)
-#      with SamplingParams(prompt_logprobs=0, max_tokens=1) and sum -logP over
-#      the C* positions: NLL_L = teacher-forced negative log-likelihood the
-#      sparse-L model assigns to the DENSE continuation.
-#   distance(L) = mean NLL_L (smaller == closer to dense). Direction unified:
-#   KL/NLL both "distance to dense", smaller is better.
+# METRIC (first decode token rank/logprob -- sparse-compatible):
+#   1. DENSE run (sparse OFF) generates the reuse prompt; its FIRST greedy decode
+#      token t0 (argmax) is the reference. We also keep dense's first-token top-K
+#      distribution for the KL secondary.
+#   2. For each sparse link L, we take a SINGLE greedy decode step with top-K
+#      logprobs (SamplingParams(temperature=0, max_tokens=1, logprobs=K)) and
+#      read the RANK and logprob the sparse-L model assigns to t0.
+#   distance(L) = rank(t0 under L) - 1 (0 == sparse still greedily picks t0 ==
+#   dense; larger == sparse moved away). Secondary: KL(dense||sparse) over the
+#   first-token top-K (shared support, floor logprob for absentees). Both are
+#   "distance to dense", smaller is better.
 #
-#   Why prompt_logprobs and not first-token top-K KL: vLLM's
-#   RequestOutput.prompt_logprobs cleanly returns, per prompt position, the
-#   ACTUAL token's logprob in the OFFLINE LLM API (it always includes the real
-#   prompt token regardless of top-N), giving a multi-token, low-variance,
-#   teacher-forced fidelity score in ONE forward per (link). A first-token KL
-#   would need top-K sample logprobs aligned across runs and only scores ONE
-#   position (higher variance, link signal weaker). prompt_logprobs is the
-#   clean path in vLLM offline mode, so it is the primary metric.
+#   WHY NOT prompt_logprobs (the bug this rewrite fixes): teacher-forced
+#   prompt_logprobs needs a logit at EVERY prompt position. The V1 runner
+#   (gpu_model_runner._get_prompt_logprobs_dict, :5453/:5495) slices
+#   hidden_states by the FULL prompt length and allocates
+#   LogprobsTensors.empty_cpu(num_prompt_tokens - 1, ...). EPIC sparse only
+#   forwards M rows (C u link u last) and advances num_computed_tokens toward the
+#   full span, so num_prompt_tokens disagrees with the M-row hidden_states and a
+#   negative size reaches torch.empty -> "OverflowError: out of range integral
+#   type conversion attempted" (outputs.py :98). Dense forwards every position so
+#   it works -- that asymmetry is exactly why only the sparse score runs crashed.
+#   The first-decode-token metric only ever scores the decode position, which
+#   sparse ALWAYS forwards (last prompt token in M), so it is compatible.
+#
+#   Link sensitivity: the last prompt token's hidden state attends over B's
+#   reused KV; a smaller link leaves more of B stale (warm context) -> t0's
+#   sparse logprob drops and its rank grows. So rank-distance should DECREASE as
+#   link grows. Single-position variance is a known limitation; averaging over
+#   many prompts is the bench harness's job (TODO there, not here).
 #
 # VERDICTS (mechanical):
-#   * link=B_full distance ~= dense self-NLL (<= dense + eps) -> else MACHINERY
-#     FAIL (same meaning as step4 decisive: a non-zero distance with ZERO reuse
+#   * link=B_full rank-distance == 0 (sparse picks t0) -> else MACHINERY FAIL
+#     (same meaning as step4 decisive: a moved first token with ZERO reuse
 #     approximation is a mechanical bug, not an algorithm limit).
-#   * link=0 (reuse-only) distance > link=B_full distance -> recompute does
-#     something. If reuse-only ~= full -> "LINK HAS NO EFFECT" diagnostic
+#   * link=0 (reuse-only) rank-distance > link=B_full -> recompute does
+#     something. If reuse-only == full -> "LINK HAS NO EFFECT" diagnostic
 #     (reported, NOT a failure).
-#   * middle links: REPORT distance + monotonicity; NO hard threshold.
+#   * middle links: REPORT rank-distance + KL + monotonicity; NO hard threshold.
 # ---------------------------------------------------------------------------
 
 # Passage A: a shared, contentful DISTRACTOR document (appears as the prefix
@@ -1725,12 +1854,11 @@ _STEP5_WARM_TAIL = (
 def step5_cross_context_fidelity(model: str, cfg: "SmokeConfig") -> None:
     """CROSS-CONTEXT approximation-quality probe (see module comment above)."""
     _log(
-        "step5: CROSS-CONTEXT fidelity -- teacher-forced NLL of the DENSE "
-        "continuation under each sparse link "
-        f"{_STEP5_LINK_SWEEP}+[B_full] (smaller NLL == closer to dense)"
+        "step5: CROSS-CONTEXT fidelity -- first-decode-token rank of the DENSE "
+        "argmax t0 under each sparse link "
+        f"{_STEP5_LINK_SWEEP}+[B_full] (rank-distance 0 == closer to dense)"
     )
 
-    cont_tokens = 32  # dense continuation length we score the sparse runs on.
     chunk_size = DEFAULT_CHUNK_SIZE
 
     tok = _parent_tokenizer(model)
@@ -1771,22 +1899,29 @@ def step5_cross_context_fidelity(model: str, cfg: "SmokeConfig") -> None:
     warm_ids = assembled["warm_ids"]
     reuse_ids = assembled["reuse_ids"]
     reuse_len = len(reuse_ids)
+    b_len = assembled["b_len"]
 
     _log(
-        f"step5: chunk_size={chunk_size} B_len={assembled['b_len']} "
+        f"step5: chunk_size={chunk_size} B_len={b_len} "
         f"reuse_B_offset={assembled['reuse_b_offset']} "
         f"reuse_prompt_len={reuse_len} "
         f"B_hash_prefixes={[h[:12] for h in assembled['expected_b_hashes']]}"
     )
 
-    # --- DENSE reference: generate the continuation C* (sparse OFF) ----------
+    # --- DENSE reference: first decode token t0 (sparse OFF). We greedily decode
+    # ONE token with top-K logprobs so we get both t0 (the argmax) AND the dense
+    # first-token distribution for the KL secondary. The decode position is the
+    # next token after the reuse prompt's last token -- the same single position
+    # every sparse link will score (NO teacher-forcing, NO per-prompt-position
+    # logits, so it is sparse-compatible).
     dense_res = run_engine_subprocess(build_worker_spec(
         role="dense",
         model=model,
         kv_config=_epic_kv_config(sparse=False),
         warm_prompts=[warm_ids],
         prompts=[reuse_ids],
-        max_tokens=cont_tokens,
+        first_token_logprobs=_STEP5_TOPK,
+        max_tokens=1,
         enforce_eager=True,
         attention_backend="FLEX_ATTENTION",
         **cfg.engine_kwargs(),
@@ -1794,53 +1929,27 @@ def step5_cross_context_fidelity(model: str, cfg: "SmokeConfig") -> None:
     if not dense_res.get("ok"):
         _fail("step5", f"DENSE reference engine failed: {dense_res.get('error')}\n"
               + dense_res.get("traceback", ""))
-    dense_cont = dense_res["token_ids"][0]
-    dense_text = dense_res["texts"][0]
-    if not dense_cont:
-        _fail("step5", "DENSE produced an empty continuation; cannot score.")
-    _log(f"step5: DENSE continuation ({len(dense_cont)} tok): {dense_text!r}")
-
-    # The fixed scoring sequence: reuse_prompt + dense_continuation. We score the
-    # CONTINUATION region only (prefix_len = reuse_len).
-    scored_seq = list(reuse_ids) + list(dense_cont)
-
-    # --- DENSE self-NLL: score C* under DENSE (sparse OFF) as the 0-distance
-    # reference. With sparse off this is the model's own likelihood of its
-    # greedy continuation; the B-full sparse run must match it up to numerics.
-    dense_score = run_engine_subprocess(build_worker_spec(
-        role="dense",
-        model=model,
-        kv_config=_epic_kv_config(sparse=False),
-        warm_prompts=[warm_ids],
-        prompts=[scored_seq],
-        prompt_logprobs=0,
-        logprob_prefix_lens=[reuse_len],
-        max_tokens=1,
-        enforce_eager=True,
-        attention_backend="FLEX_ATTENTION",
-        **cfg.engine_kwargs(),
-    ))
-    if not dense_score.get("ok"):
-        _fail("step5", f"DENSE self-score engine failed: "
-              f"{dense_score.get('error')}\n" + dense_score.get("traceback", ""))
-    dense_nll, dense_ppl = mean_nll_to_perplexity(
-        dense_score["nll_sums"][0], dense_score["nll_counts"][0]
-    )
+    dense_map = parse_first_token_map(dense_res["first_token_logprobs"][0])
+    t0 = argmax_token(dense_map)
+    if t0 is None:
+        _fail("step5", "DENSE produced no first-token logprobs; cannot score. "
+              "Check the model supports logprobs and K>=1.")
+    dense_t0_lp, dense_t0_rank = t0_logprob_and_rank(dense_map, t0)
     _log(
-        f"step5: DENSE self-NLL (reference 0-distance) = {dense_nll:.4f} "
-        f"(ppl {dense_ppl:.3f}, scored {dense_score['nll_counts'][0]} tok)"
+        f"step5: DENSE first token t0={t0} ({tok.decode([t0])!r}) "
+        f"logprob={dense_t0_lp:.4f} rank={dense_t0_rank} "
+        f"(top-{_STEP5_TOPK} support size {len(dense_map or {})})"
     )
 
-    # --- link sweep: score C* under each sparse link -------------------------
+    # --- link sweep: score t0 under each sparse link -------------------------
     sweep = list(_STEP5_LINK_SWEEP) + [chunk_size]  # append B_full control
-    # rows: (link, reuse_frac, mean_nll, ppl, n_scored, counters)
-    rows: list[tuple[int, float, float, float, int, dict]] = []
-    b_len = assembled["b_len"]
+    # rows: (link, reuse_frac, t0_logprob, rank, rank_distance, kl, counters)
+    rows: list[tuple[int, float, float, int | None, int, float, dict]] = []
     for link in sweep:
         eff_link = min(link, b_len)
         reuse_frac = (b_len - eff_link) / b_len
         _log(
-            f"step5[link={link}]: SUBPROCESS sparse score "
+            f"step5[link={link}]: SUBPROCESS sparse first-token score "
             f"(epic_link_tokens={eff_link}, reuse_frac={reuse_frac:.2f})"
         )
         sparse_res = run_engine_subprocess(build_worker_spec(
@@ -1854,9 +1963,8 @@ def step5_cross_context_fidelity(model: str, cfg: "SmokeConfig") -> None:
                 debug_counters=True,
             ),
             warm_prompts=[warm_ids],
-            prompts=[scored_seq],
-            prompt_logprobs=0,
-            logprob_prefix_lens=[reuse_len],
+            prompts=[reuse_ids],
+            first_token_logprobs=_STEP5_TOPK,
             max_tokens=1,
             enforce_eager=True,
             attention_backend="FLEX_ATTENTION",
@@ -1872,14 +1980,14 @@ def step5_cross_context_fidelity(model: str, cfg: "SmokeConfig") -> None:
                 + sparse_res.get("traceback", ""),
             )
         counters = sparse_res.get("counters", {})
-        mean_nll, ppl = mean_nll_to_perplexity(
-            sparse_res["nll_sums"][0], sparse_res["nll_counts"][0]
-        )
-        rows.append((link, reuse_frac, mean_nll, ppl,
-                     sparse_res["nll_counts"][0], counters))
+        sparse_map = parse_first_token_map(sparse_res["first_token_logprobs"][0])
+        t0_lp, t0_rank = t0_logprob_and_rank(sparse_map, t0)
+        dist = rank_distance(t0_rank, k=_STEP5_TOPK)
+        kl = first_token_kl(dense_map, sparse_map)
+        rows.append((link, reuse_frac, t0_lp, t0_rank, dist, kl, counters))
         _log(
-            f"step5[link={link}]: distance(meanNLL)={mean_nll:.4f} "
-            f"ppl={ppl:.3f} scored={sparse_res['nll_counts'][0]} "
+            f"step5[link={link}]: t0_logprob={t0_lp:.4f} t0_rank={t0_rank} "
+            f"rank_distance={dist} KL(dense||sparse)={kl:.4f} "
             f"counters={counters}"
         )
 
@@ -1898,42 +2006,50 @@ def step5_cross_context_fidelity(model: str, cfg: "SmokeConfig") -> None:
 
     # --- summary table -------------------------------------------------------
     _log("step5: CROSS-CONTEXT FIDELITY SUMMARY")
-    _log(f"step5: DENSE self-NLL reference = {dense_nll:.4f}")
-    _log("    link | reuse_frac | distance(meanNLL) | ppl       | regime")
-    for link, frac, mean_nll, ppl, _n, _c in rows:
+    _log(
+        f"step5: DENSE t0={t0} logprob={dense_t0_lp:.4f} (reference: sparse "
+        "rank-distance should -> 0)"
+    )
+    _log(
+        "    link | reuse_frac | t0_logprob | t0_rank | rank_dist | "
+        "KL(d||s) | regime"
+    )
+    for link, frac, t0_lp, t0_rank, dist, kl, _c in rows:
         if link == 0:
             regime = "reuse-only (max approx)"
         elif link >= b_len:
             regime = "B-FULL (control == dense)"
         else:
             regime = "approx"
+        rank_str = "none" if t0_rank is None else str(t0_rank)
         _log(
-            f"    {link:4d} | {frac:10.2f} | {mean_nll:17.4f} | "
-            f"{ppl:9.3f} | {regime}"
+            f"    {link:4d} | {frac:10.2f} | {t0_lp:10.4f} | {rank_str:>7s} | "
+            f"{dist:9d} | {kl:8.4f} | {regime}"
         )
 
     # --- monotonicity (reported, not gated on the middle links) --------------
+    # Distance is the integer rank-distance; it should be non-increasing in link.
     links = [r[0] for r in rows]
-    dists = [r[2] for r in rows]
+    dists = [float(r[4]) for r in rows]
     mono = monotonicity_report(links, dists)
     _log(
-        "step5: MONOTONICITY (distance vs ASCENDING link/recompute) -- "
-        f"ordered={[round(d, 4) for d in mono['ordered_by_link']]} "
+        "step5: MONOTONICITY (rank-distance vs ASCENDING link/recompute) -- "
+        f"ordered={[int(d) for d in mono['ordered_by_link']]} "
         f"nonincreasing={mono['nonincreasing']} "
         f"violations={mono['n_violations']}"
     )
     if mono["nonincreasing"]:
         _log(
-            "step5: distance DECREASES (or is flat) as recompute grows -> the "
-            "EPIC approximation behaves: more boundary recompute pulls the "
-            "output toward dense."
+            "step5: rank-distance DECREASES (or is flat) as recompute grows -> "
+            "the EPIC approximation behaves: more boundary recompute pulls the "
+            "first token toward dense."
         )
     else:
         _log(
-            "step5: NOTE -- distance is NOT monotone non-increasing "
+            "step5: NOTE -- rank-distance is NOT monotone non-increasing "
             f"({mono['n_violations']} step-up(s)). Reported, not failed: the "
-            "middle links carry no hard threshold (could be fp jitter or a "
-            "non-monotone region of the approximation)."
+            "middle links carry no hard threshold (single-position variance; the "
+            "bench harness averages over many prompts -- TODO there)."
         )
 
     # --- VERDICT 1: B-full machinery gate (decisive) -------------------------
@@ -1941,59 +2057,60 @@ def step5_cross_context_fidelity(model: str, cfg: "SmokeConfig") -> None:
     if bfull is None:
         _fail("step5", "no B-full row in the sweep; cannot run the decisive "
                        "machinery gate.")
-    bfull_nll = bfull[2]
-    if bfull_nll > dense_nll + _STEP5_BFULL_NLL_EPS:
+    bfull_dist = bfull[4]
+    if bfull_dist > _STEP5_BFULL_MAX_RANK_DISTANCE:
         _fail(
             "step5",
             f"MACHINERY FAIL: link=B_full (full recompute, ZERO reuse "
-            f"approximation) distance meanNLL={bfull_nll:.4f} exceeds the DENSE "
-            f"self-NLL {dense_nll:.4f} by more than eps {_STEP5_BFULL_NLL_EPS} "
-            "-- with the whole B chunk recomputed the sparse forward must "
-            "reproduce dense up to numerics. A gap here is a MECHANICAL fault "
-            "(runner positions/seq_lens, flex logical_q, schedule accounting, or "
-            "KV scatter layout), NOT the reuse approximation. Same meaning as "
+            f"approximation) rank-distance={bfull_dist} (t0_rank={bfull[3]}) "
+            f"exceeds {_STEP5_BFULL_MAX_RANK_DISTANCE} -- with the whole B chunk "
+            "recomputed the sparse forward must reproduce dense up to numerics, "
+            "so its greedy first token MUST equal the dense argmax t0 (rank 1). "
+            "A moved first token here is a MECHANICAL fault (runner "
+            "positions/seq_lens, flex logical_q, schedule accounting, or KV "
+            "scatter layout), NOT the reuse approximation. Same meaning as "
             "step4's decisive gate. Inspect 'EPIC check_load' / worker-plan logs.",
         )
     _log(
-        f"step5: DECISIVE OK -- B-full meanNLL {bfull_nll:.4f} ~= dense self-NLL "
-        f"{dense_nll:.4f} (within eps {_STEP5_BFULL_NLL_EPS}): full recompute "
-        "reproduces dense, machinery healthy."
+        f"step5: DECISIVE OK -- B-full rank-distance {bfull_dist} (t0 rank "
+        f"{bfull[3]}): full recompute reproduces the dense first token, "
+        "machinery healthy."
     )
 
     # --- VERDICT 2: does link buy anything? (diagnostic, not a hard fail) -----
     reuse_only = next((r for r in rows if r[0] == 0), None)
     if reuse_only is not None:
-        ro_nll = reuse_only[2]
-        # Relative gap of reuse-only above the B-full control.
-        denom = max(abs(bfull_nll), 1e-6)
-        rel = (ro_nll - bfull_nll) / denom
+        ro_dist = reuse_only[4]
+        gap = ro_dist - bfull_dist
         _log(
-            f"step5: reuse-only(link=0) meanNLL={ro_nll:.4f} vs B-full "
-            f"{bfull_nll:.4f} -> relative gap {rel:+.4f}"
+            f"step5: reuse-only(link=0) rank-distance={ro_dist} "
+            f"(t0_rank={reuse_only[3]}, KL={reuse_only[5]:.4f}) vs B-full "
+            f"{bfull_dist} -> gap {gap:+d}"
         )
-        if ro_nll <= bfull_nll + _STEP5_BFULL_NLL_EPS or rel <= _STEP5_NO_EFFECT_REL:
+        if gap <= _STEP5_NO_EFFECT_RANK_GAP:
             _log(
                 "step5: WARNING -- LINK HAS NO EFFECT: reuse-only is "
-                "indistinguishable from full recompute on this prompt. This is "
-                "NOT a failure; it is an important DIAGNOSTIC -- for this "
-                "context the LegoLink boundary recompute buys ~nothing (B's "
-                "stale reused KV already encodes enough). Try a prompt where "
-                "A/C are more entangled with B, or a stronger cross-context "
-                "dependency, to expose the link's value."
+                "indistinguishable from full recompute on this prompt (same "
+                "first-token rank). This is NOT a failure; it is an important "
+                "DIAGNOSTIC -- for this context the LegoLink boundary recompute "
+                "buys ~nothing (B's stale reused KV already encodes enough). Try "
+                "a prompt where A/C are more entangled with B, or a stronger "
+                "cross-context dependency, to expose the link's value."
             )
         else:
             _log(
-                "step5: LINK IS EFFECTIVE -- reuse-only is measurably farther "
-                "from dense than full recompute; the boundary recompute pulls "
-                "the output toward dense (the EPIC approximation does work)."
+                "step5: LINK IS EFFECTIVE -- reuse-only's first token is "
+                "measurably farther from dense (larger rank-distance) than full "
+                "recompute; the boundary recompute pulls the first token toward "
+                "dense (the EPIC approximation does work)."
             )
     else:
         _log("step5: NOTE -- no reuse-only(link=0) row; add 0 to "
              "_STEP5_LINK_SWEEP to measure the pure-stale endpoint.")
 
     _log(
-        "step5: PASS (B-full machinery gate met == dense up to numerics; "
-        "sparse engaged in-band on every link; distances + monotonicity + "
+        "step5: PASS (B-full machinery gate met == dense first token; sparse "
+        "engaged in-band on every link; rank-distances + KL + monotonicity + "
         "link-effect diagnostic reported)."
     )
 
