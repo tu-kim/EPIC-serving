@@ -36,13 +36,16 @@ import pytest
 
 from tests.v1.kv_connector.unit.epic.gpu_smoke import (
     _FIRST_TOKEN_FLOOR_LOGPROB,
+    _STEP5_FLOOR_MULT,
     _STEP5_LINK_SWEEP,
     _STEP5_TOPK,
     argmax_token,
+    bfull_within_floor,
     build_worker_spec,
     extract_first_token_logprobs,
     first_token_kl,
     is_monotonic_nonincreasing,
+    kl_floor_multiple,
     monotonicity_report,
     parse_first_token_map,
     parse_spec,
@@ -50,6 +53,7 @@ from tests.v1.kv_connector.unit.epic.gpu_smoke import (
     serialize_spec,
     step5_cross_context_fidelity,
     t0_logprob_and_rank,
+    t0_logprob_delta,
 )
 
 
@@ -355,6 +359,176 @@ def test_step5_topk_large_enough_for_rank_lookup():
     # K must be > 1 so the dense argmax t0 usually appears in each sparse run's
     # top-K (read its rank directly rather than flooring to "outside K").
     assert _STEP5_TOPK >= 2
+
+
+# ---------------------------------------------------------------------------
+# NOISE FLOOR: kl_floor_multiple + bfull_within_floor (the interpretation fix)
+#
+# These pin the floor-relative reading that replaces the dead rank verdict: a
+# sparse KL is read as a MULTIPLE of the dense-vs-dense noise floor, and the
+# B-full machinery gate is "within k floors" rather than "rank == 1".
+# ---------------------------------------------------------------------------
+
+
+def test_kl_floor_multiple_basic_ratio():
+    # 0.36 KL against a 0.18 floor == 2x the noise floor.
+    assert kl_floor_multiple(0.36, 0.18) == pytest.approx(2.0)
+    assert kl_floor_multiple(0.18, 0.18) == pytest.approx(1.0)
+    assert kl_floor_multiple(0.09, 0.18) == pytest.approx(0.5)
+
+
+def test_kl_floor_multiple_zero_floor_guards():
+    # Floor == 0 (two dense runs byte-identical): any nonzero KL is infinitely
+    # many floors; 0/0 reads as "at floor" (1x is meaningless, so 0.0 returned).
+    assert kl_floor_multiple(0.0, 0.0) == 0.0
+    assert kl_floor_multiple(0.5, 0.0) == float("inf")
+    assert kl_floor_multiple(0.5, -1.0) == float("inf")  # negative floor guard
+
+
+def test_kl_floor_multiple_nonfinite_kl_is_inf():
+    assert kl_floor_multiple(float("inf"), 0.18) == float("inf")
+    assert kl_floor_multiple(float("nan"), 0.18) == float("inf")
+
+
+def test_bfull_within_floor_pass_when_kl_at_or_below_mult():
+    # B-full KL within 2x the floor -> machinery healthy (full recompute ~= dense
+    # within measurement noise).
+    floor = 0.20
+    assert bfull_within_floor(0.20, floor, mult=2.0) is True   # 1x
+    assert bfull_within_floor(0.40, floor, mult=2.0) is True   # exactly 2x
+    assert bfull_within_floor(0.39, floor, mult=2.0) is True
+
+
+def test_bfull_within_floor_discrepancy_when_kl_exceeds_mult():
+    # The observed failing case: B-full KL == 0.36 against a small floor exceeds
+    # the 2x gate -> REAL MACHINERY DISCREPANCY (not within floor).
+    assert bfull_within_floor(0.36, 0.05, mult=2.0) is False   # 7.2x
+    assert bfull_within_floor(0.41, 0.20, mult=2.0) is False   # 2.05x
+
+
+def test_bfull_within_floor_uses_module_default_mult():
+    # The default mult is _STEP5_FLOOR_MULT; a KL just over that fails.
+    floor = 0.10
+    just_over = floor * _STEP5_FLOOR_MULT + 0.01
+    just_under = floor * _STEP5_FLOOR_MULT - 0.01
+    assert bfull_within_floor(just_under, floor) is True
+    assert bfull_within_floor(just_over, floor) is False
+
+
+def test_bfull_within_floor_nonfinite_is_discrepancy():
+    assert bfull_within_floor(float("inf"), 0.2) is False
+
+
+def test_bfull_within_floor_zero_floor_only_exact_zero_passes():
+    # With a zero floor (identical dense runs) only an exactly-zero B-full KL is
+    # "within floor"; any positive KL is infinitely above it.
+    assert bfull_within_floor(0.0, 0.0) is True
+    assert bfull_within_floor(1e-6, 0.0) is False
+
+
+# ---------------------------------------------------------------------------
+# rank-saturation fallback: when t0_rank==1 at every link the rank metric is
+# dead and KL must drive the verdict. We assert the two metrics are independent
+# so KL can still discriminate while rank is pinned.
+# ---------------------------------------------------------------------------
+
+
+def test_rank_saturated_but_kl_still_discriminates():
+    # Simulate the observed regime: argmax (t0) stable across links (rank 1
+    # everywhere -> rank_distance 0 everywhere) yet the tail distribution moves,
+    # so KL grows as the link shrinks. The KL metric must still separate them.
+    dense = {1: {"logprob": -1.40, "rank": 1},
+             2: {"logprob": -2.00, "rank": 2},
+             3: {"logprob": -3.00, "rank": 3}}
+    # B-full: t0 still rank 1, distribution very close to dense (low KL).
+    bfull = {1: {"logprob": -1.41, "rank": 1},
+             2: {"logprob": -2.02, "rank": 2},
+             3: {"logprob": -3.05, "rank": 3}}
+    # reuse-only: t0 STILL rank 1 (saturated) but the tail diverges sharply
+    # (token 2 and 3 logprobs far from dense -> high KL).
+    reuse = {1: {"logprob": -1.41, "rank": 1},
+             2: {"logprob": -6.00, "rank": 2},
+             3: {"logprob": -6.00, "rank": 3}}
+    # rank metric is dead: distance 0 for both (t0 == token 1 at rank 1).
+    _, r_b = t0_logprob_and_rank(bfull, 1)
+    _, r_r = t0_logprob_and_rank(reuse, 1)
+    assert rank_distance(r_b, k=20) == rank_distance(r_r, k=20) == 0
+    # KL still discriminates: reuse-only is farther from dense than B-full.
+    assert first_token_kl(dense, reuse) > first_token_kl(dense, bfull)
+
+
+# ---------------------------------------------------------------------------
+# t0_logprob_delta: the auxiliary first-token logprob delta column
+# ---------------------------------------------------------------------------
+
+
+def test_t0_logprob_delta_is_absolute_difference():
+    assert t0_logprob_delta(-1.40, -1.45) == pytest.approx(0.05)
+    assert t0_logprob_delta(-1.40, -1.35) == pytest.approx(0.05)  # sign-agnostic
+    assert t0_logprob_delta(-1.40, -1.40) == pytest.approx(0.0)
+
+
+def test_t0_logprob_delta_small_across_observed_values():
+    # Mirrors the observed table (all links ~ -1.36..-1.42 vs dense -1.3961):
+    # the delta is tiny (auxiliary, non-discriminative), corroborating that the
+    # first-token logprob is NOT the discriminating signal.
+    dense_lp = -1.3961
+    for sparse_lp in (-1.3635, -1.4103, -1.4195, -1.3901):
+        assert t0_logprob_delta(dense_lp, sparse_lp) < 0.05
+
+
+# ---------------------------------------------------------------------------
+# floor-relative monotonicity: KL/floor (the live metric) should be the basis of
+# the convergence judgement now that rank is saturated.
+# ---------------------------------------------------------------------------
+
+
+def test_monotonicity_on_kl_floor_multiples():
+    # Good convergence: KL/floor decreases as link (recompute) grows.
+    links = [0, 8, 64, 256]
+    kl_mults = [6.0, 4.0, 2.0, 1.0]
+    rep = monotonicity_report(links, kl_mults)
+    assert rep["ordered_by_link"] == [6.0, 4.0, 2.0, 1.0]
+    assert rep["nonincreasing"] is True
+    assert rep["first_distance"] == 6.0
+    assert rep["last_distance"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# dense-run-TWICE spec build: step5 must build TWO identical dense specs for the
+# floor. We can't run engines on CPU, but the spec the floor relies on must be
+# well-formed and round-trip (the worker-side scoring path is the same as the
+# single dense run, just executed a second time).
+# ---------------------------------------------------------------------------
+
+
+def test_dense_floor_spec_roundtrip_two_identical_specs():
+    # The floor is KL between two runs of the SAME dense spec; build that spec
+    # twice and confirm they serialise identically (so the two subprocesses run
+    # mathematically identical models -> any KL is pure noise).
+    def _dense_spec():
+        return build_worker_spec(
+            role="dense",
+            model="some/model",
+            kv_config={"kv_connector": "EpicConnector", "kv_role": "kv_both"},
+            prompts=[[1, 2, 3, 4, 5]],
+            warm_prompts=[[9, 8, 7]],
+            first_token_logprobs=_STEP5_TOPK,
+            max_tokens=1,
+        )
+
+    s1, s2 = _dense_spec(), _dense_spec()
+    assert s1 == s2
+    assert serialize_spec(s1) == serialize_spec(s2)
+    # Both must score the first decode token (the floor's measured quantity).
+    assert s1["first_token_logprobs"] == _STEP5_TOPK
+    assert s1["max_tokens"] == 1
+
+
+def test_floor_mult_constant_is_sane():
+    # The gate multiple must be > 1 (some headroom over pure-noise) and finite.
+    assert _STEP5_FLOOR_MULT > 1.0
+    assert math.isfinite(_STEP5_FLOOR_MULT)
 
 
 if __name__ == "__main__":
