@@ -1087,6 +1087,21 @@ class EpicConnector(KVConnectorBase_V1):
         # the time the forward runs. Independent of whether there are loads.
         self._install_fusion_mask(forward_context, meta)
 
+        # DIAGNOSTIC: when check-load is requested, make the load path's state
+        # unambiguous at WARNING level -- so "no check_load line" can be told
+        # apart from "loads never ran" / "flag never reached the worker".
+        if getattr(self, "_debug_check_load", False):
+            n_chunks = sum(len(load.chunks) for load in meta.loads)
+            logger.warning(
+                "EPIC start_load_kv: debug_check_load=True loads=%d chunks=%d "
+                "alignment=%s store=%s -- check_load lines should follow if "
+                "chunks>0 (else loads are not happening on the worker)",
+                len(meta.loads),
+                n_chunks,
+                self._alignment is not None,
+                self._store is not None,
+            )
+
         if not meta.loads or self._alignment is None or self._store is None:
             return
 
@@ -1331,10 +1346,11 @@ class EpicConnector(KVConnectorBase_V1):
             )
             return
         k_ok, k_diff, v_ok, v_diff = result
-        # Mismatch is the decisive bug signal -> log at WARNING so it is never
-        # suppressed by the engine log level; clean read-back stays at info.
-        log = logger.info if (k_ok and v_ok) else logger.warning
-        log(
+        # This only runs when epic_debug_check_load is on (an explicit debug
+        # request), so ALWAYS log at WARNING -- otherwise a clean read-back at
+        # info is silently dropped under VLLM_LOGGING_LEVEL=WARNING and the user
+        # cannot tell "scatter is fine" from "the check never ran".
+        logger.warning(
             "EPIC check_load layer=%s n=%d k_allclose=%s k_maxabsdiff=%.3e "
             "v_allclose=%s v_maxabsdiff=%.3e%s",
             layer_name,
