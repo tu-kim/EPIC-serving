@@ -543,6 +543,10 @@ def kv_config_for_mode(mode: Mode, *, chunk_size: int) -> dict | None:
         # In-band engagement counters (assert sparse actually fired) -- requires
         # the in-process engine so scheduler + worker share the class state.
         "epic_debug_counters": True,
+        # Worker reads back scattered dst slots vs the store (per-layer
+        # allclose + max-abs-diff on the first loaded chunk) -- the decisive
+        # signal for whether the pure-load B KV is faithful or garbage.
+        "epic_debug_check_load": True,
     }
     return {
         "kv_connector": "EpicConnector",

@@ -1321,14 +1321,20 @@ class EpicConnector(KVConnectorBase_V1):
         """
         result = check_scatter_fidelity(kv_cache, k, v, slot_ids)
         if result is None:
-            logger.info(
-                "EPIC check_load layer=%s SKIP (unsupported layout %s)",
+            # Unsupported layout is itself a likely root cause (scatter is a
+            # no-op) -> warn, not info, so it survives VLLM_LOGGING_LEVEL=WARNING.
+            logger.warning(
+                "EPIC check_load layer=%s SKIP (unsupported layout %s) -- "
+                "scatter may be a NO-OP for this backend",
                 layer_name,
                 tuple(kv_cache.shape),
             )
             return
         k_ok, k_diff, v_ok, v_diff = result
-        logger.info(
+        # Mismatch is the decisive bug signal -> log at WARNING so it is never
+        # suppressed by the engine log level; clean read-back stays at info.
+        log = logger.info if (k_ok and v_ok) else logger.warning
+        log(
             "EPIC check_load layer=%s n=%d k_allclose=%s k_maxabsdiff=%.3e "
             "v_allclose=%s v_maxabsdiff=%.3e%s",
             layer_name,
