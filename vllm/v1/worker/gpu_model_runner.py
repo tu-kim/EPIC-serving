@@ -2174,6 +2174,24 @@ class GPUModelRunner(
                 self.positions[edit.row_start : edit.row_end] = pos_t
                 req_idx = self.input_batch.req_id_to_index[edit.req_id]
                 self.seq_lens[req_idx] = edit.seq_len
+                # EPIC (bug fix): the CPU ``optimistic_seq_lens_cpu`` was computed
+                # above as ``num_computed_tokens(=external=|A|+|B|) +
+                # num_scheduled_tokens(=|M|)``. Under sparse reuse that is NOT the
+                # sequence length: |M| double-counts the link tokens that already
+                # live inside the externally-counted B chunks, so the value
+                # inflates to ~``external + |M|`` (well above N, and above
+                # max_model_len for long prompts). That inflated value flows into
+                # ``max_seq_len`` and ``_seq_lens_cpu`` /
+                # ``seq_lens_cpu_upper_bound`` on CommonAttentionMetadata, which
+                # size the FlexAttention paged block mask and gate
+                # discard/prefill classification. The GPU ``seq_lens`` was patched
+                # to N just above; mirror that onto the CPU optimistic seq_lens so
+                # every derived sizing/bound is the true N. Without this the dense
+                # (link == chunk_size) path is unaffected (M == every token, so
+                # the loaded B KV is fully overwritten and never read), but a
+                # strict-subset M (link < chunk_size) leaves pure-load B positions
+                # whose attention is sized/bounded by the wrong seq len.
+                self.optimistic_seq_lens_cpu[req_idx] = edit.seq_len
 
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
