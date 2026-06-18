@@ -341,11 +341,11 @@ def test_connector_counters_reset_and_increment():
     )
 
     EpicConnector.reset_debug_counters()
-    assert EpicConnector.debug_counters == {
-        "sparse_match": 0,
-        "sparse_emit": 0,
-        "chunks_loaded": 0,
-    }
+    # All counters zeroed; the key set may grow (load-fidelity diagnostics) so
+    # assert zeroed-ness + the load-bearing keys rather than an exact key set.
+    assert all(v == 0 for v in EpicConnector.debug_counters.values())
+    for k in ("sparse_match", "sparse_emit", "chunks_loaded"):
+        assert k in EpicConnector.debug_counters
     EpicConnector._bump_counter("sparse_match")
     EpicConnector._bump_counter("sparse_match")
     EpicConnector._bump_counter("chunks_loaded", 3)

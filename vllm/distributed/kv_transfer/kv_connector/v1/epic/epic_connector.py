@@ -160,6 +160,21 @@ class EpicConnector(KVConnectorBase_V1):
         "sparse_match": 0,
         "sparse_emit": 0,
         "chunks_loaded": 0,
+        # Load-fidelity diagnostics (gated on epic_debug_counters; surfaced via
+        # the RESULT_JSON counters channel which is reliable regardless of log
+        # level / process). These disambiguate the "no check_load log" mystery:
+        #   loads_emitted     -> chunk-load specs seen by the worker this run
+        #   check_load_calls  -> times the scatter read-back actually ran
+        #                        (0 with loads_emitted>0 => epic_debug_check_load
+        #                         did not reach the worker)
+        #   check_load_mismatch -> read-backs where allclose was False (SCATTER
+        #                          / PIC / layout bug)
+        #   check_load_skip   -> read-backs skipped (unsupported KV layout =>
+        #                        scatter is a NO-OP, a likely root cause)
+        "loads_emitted": 0,
+        "check_load_calls": 0,
+        "check_load_mismatch": 0,
+        "check_load_skip": 0,
     }
 
     # EPIC diagnostics: per-request SELECTION summary so a probe (musique_blend)
@@ -1090,6 +1105,15 @@ class EpicConnector(KVConnectorBase_V1):
         # DIAGNOSTIC: when check-load is requested, make the load path's state
         # unambiguous at WARNING level -- so "no check_load line" can be told
         # apart from "loads never ran" / "flag never reached the worker".
+        # Record the load count on the RELIABLE counters channel (gated on
+        # epic_debug_counters, which is surfaced via RESULT_JSON). This shows up
+        # in the printed counters dict regardless of log level/process, so
+        # loads_emitted>0 with check_load_calls==0 pinpoints whether the
+        # check-load flag reached the worker vs whether loads ran at all.
+        if getattr(self, "_debug_counters", False):
+            self._bump_counter(
+                "loads_emitted", sum(len(load.chunks) for load in meta.loads)
+            )
         if getattr(self, "_debug_check_load", False):
             n_chunks = sum(len(load.chunks) for load in meta.loads)
             logger.warning(
@@ -1334,8 +1358,12 @@ class EpicConnector(KVConnectorBase_V1):
         correct-looking plan but a corrupted forward. Pure read-back + tensor
         math; no effect on the cache contents.
         """
+        if getattr(self, "_debug_counters", False):
+            self._bump_counter("check_load_calls")
         result = check_scatter_fidelity(kv_cache, k, v, slot_ids)
         if result is None:
+            if getattr(self, "_debug_counters", False):
+                self._bump_counter("check_load_skip")
             # Unsupported layout is itself a likely root cause (scatter is a
             # no-op) -> warn, not info, so it survives VLLM_LOGGING_LEVEL=WARNING.
             logger.warning(
@@ -1346,6 +1374,8 @@ class EpicConnector(KVConnectorBase_V1):
             )
             return
         k_ok, k_diff, v_ok, v_diff = result
+        if not (k_ok and v_ok) and getattr(self, "_debug_counters", False):
+            self._bump_counter("check_load_mismatch")
         # This only runs when epic_debug_check_load is on (an explicit debug
         # request), so ALWAYS log at WARNING -- otherwise a clean read-back at
         # info is silently dropped under VLLM_LOGGING_LEVEL=WARNING and the user
