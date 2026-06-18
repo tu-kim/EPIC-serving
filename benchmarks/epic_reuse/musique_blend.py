@@ -125,11 +125,50 @@ aggregate table (mode | answer_hit_rate | mean_prefill_ms | speedup vs full).
 CPU / no-GPU behaviour: prints guidance and exits 0 (so a structure-only import
 check is not penalised). ``--help`` and ``py_compile`` work with no GPU.
 
+REALISTIC RAG REUSE SCENARIOS (``--scenario``; reorder/insert/same)
+-------------------------------------------------------------------
+On top of the per-ctx warm probe above, this script adds a warm->measure flow
+that mirrors a real RAG server and -- crucially -- SPLITS the two reuse
+mechanisms so a failure localises. A FIRST request full-prefills
+``[system][a][b][c]`` (connector STORES sys/a/b/c by content hash); a SECOND
+("measured") request reuses them under ``--scenario``:
+
+  * ``reorder`` -> ``[system][b][a][c][query]``. sys is warmed (a HIT) and
+    b,a,c are all hits CONTIGUOUS from the sys boundary, so they fold into the
+    prefix (``non_prefix==0``, sparse-forward NOT taken). But every ctx MOVED,
+    so the prefix-load applies a NON-ZERO PIC delta re-rotary -> this is the
+    FIRST real-data test of PIC re-rotary + load + scatter ALONE.
+  * ``insert``  -> ``[system][d][a][c][query]``. ``d`` is a held-out (never
+    warmed) ctx of the SAME sample spliced after sys -> its chunk is a non-hit
+    -> contiguity breaks -> a,c become NON-PREFIX hits -> the sparse-forward +
+    LegoLink recompute path engages (``non_prefix>0``, ``sparse_branch==True``).
+  * ``same``    -> ``[system][a][b][c][query]`` (legacy nonce control).
+
+WHAT THIS ANSWERS (the link=255 collapse, split into PIC vs sparse-forward):
+  reorder reuse-only CORRECT  => PIC re-rotary/load/scatter are SOUND (first
+                                 PIC validation on real data passes).
+  reorder fine, insert-epic COLLAPSES => bug is in the SPARSE-FORWARD path, not
+                                 PIC.
+  reorder ALSO COLLAPSES      => bug is in PIC/load itself.
+Per-mode connector counters (loads_emitted, chunks_loaded, sparse_match,
+check_load_*) and per-request selection (prefix_extent, non_prefix offsets,
+sparse_branch) are printed so reorder's "sparse_match=0" and insert's
+"sparse_branch=True" are visible, and the silent INERT case is flagged loudly.
+
 Usage (CUDA box, after ``VLLM_USE_PRECOMPILED=1 uv pip install -e .``):
 
+    # legacy per-ctx probe shape (scenario defaults to 'same'):
     .venv/bin/python benchmarks/epic_reuse/musique_blend.py \
         --model meta-llama/Llama-3.2-1B-Instruct \
-        --num-samples 5 --ctx-per-sample 6 --chunk-size 256 --link 8
+        --num-samples 5 --chunk-size 256 --link 8
+
+    # PIC-only validation (sparse-forward NOT exercised):
+    .venv/bin/python benchmarks/epic_reuse/musique_blend.py \
+        --scenario reorder --num-samples 5 --chunk-size 256 --link 8
+
+    # sparse-forward + LegoLink validation:
+    .venv/bin/python benchmarks/epic_reuse/musique_blend.py \
+        --scenario insert --num-samples 5 --chunk-size 256 --link 8
 """
 
 from __future__ import annotations
@@ -491,6 +530,291 @@ def assemble_musique_prompt(
         real_tokens=total_real,
         pad_tokens=total_pad,
         sys_len=len(sys_seg),
+    )
+
+
+# ---------------------------------------------------------------------------
+# REALISTIC RAG REUSE SCENARIOS (reorder / insert / same)
+# ---------------------------------------------------------------------------
+# These exercise EPIC the way a real RAG server hits it: a FIRST ("warm")
+# request full-prefills ``[system][a][b][c]`` so the connector stores the sys,
+# a, b, c chunks by content-hash, then a SECOND ("measured") request reuses
+# those chunks under one of three layouts. The point is to split the two
+# independent reuse mechanisms so a failure localises to ONE of them:
+#
+#   * ``reorder`` -> ``[system][b][a][c][query]``. b, a, c are the SAME chunks
+#     warmed, but at DIFFERENT positions (b now sits where a was, etc.). The sys
+#     chunk is ALSO warmed (it is identical in warm and measured -- no nonce),
+#     so EpicSelection walks sys, b, a, c as a CONTIGUOUS run of hits from
+#     position 0 -> they ALL fold into the prefix -> ``non_prefix == 0`` ->
+#     the sparse/LegoLink branch is NOT taken (``sparse_match == 0`` expected).
+#     But because every chunk moved, the connector's prefix-load path applies a
+#     NON-ZERO PIC delta re-rotary (stored old_pos != new prompt position). So
+#     reorder is the FIRST real-data test of PIC re-rotary + load + scatter on
+#     their own, with the sparse-forward path deliberately untouched.
+#
+#   * ``insert`` -> ``[system][d][a][c][query]``. ``d`` is a DIFFERENT,
+#     HELD-OUT context of the SAME sample that was NEVER warmed, spliced in
+#     right after sys. Its chunk(s) are a NON-hit, so contiguity breaks at the
+#     first ctx slot -> ``a`` (now offset by |sys|+|d|) and ``c`` are no longer
+#     contiguous with the warmed run -> they become NON-PREFIX hits -> the
+#     sparse-forward + LegoLink recompute path engages (``non_prefix > 0``,
+#     ``sparse_branch == True`` expected). This isolates the sparse path.
+#
+#   * ``same`` -> ``[system][a][b][c][query]``, same order as warm. Kept as the
+#     legacy control. Here sys IS warmed and a, b, c sit at the SAME positions
+#     they were warmed at, so without help the whole run folds into the prefix
+#     AND the PIC delta is zero -> nothing interesting. To keep ``same`` doing
+#     what the pre-scenario script did (force non-prefix hits via a broken
+#     position-0), ``same`` retains the per-sample sys NONCE so sys is a non-hit
+#     and a, b, c become non-prefix hits. reorder/insert do NOT use the nonce:
+#     the reorder/insert layout itself supplies the contiguity break (insert) or
+#     the non-zero PIC delta (reorder), and a warmed sys is REQUIRED for reorder
+#     to fold into the (PIC-rotated) prefix.
+#
+# HOW THIS SEPARATES THE link=255 COLLAPSE BUG (PIC vs sparse-forward):
+#   reorder reuse-only correct  => PIC re-rotary + load + scatter are SOUND on
+#                                  real data (first PIC validation passes).
+#   reorder fine BUT insert-epic broken => the bug lives in the SPARSE-FORWARD /
+#                                  LegoLink recompute path, NOT in PIC.
+#   reorder ALSO broken         => the bug is in PIC / load itself.
+
+# The three realistic reuse scenarios. ``same`` is the legacy nonce control.
+SCENARIOS = ("same", "reorder", "insert")
+
+
+@dataclass
+class ScenarioPrompt:
+    """A warm + measured prompt pair for ONE realistic RAG reuse scenario.
+
+    ``warm_ids`` is the SINGLE first-request prompt ``[system][a][b][c]`` that
+    is full-prefilled so the connector STORES the sys/a/b/c chunks. ``prompt_ids``
+    is the measured second-request prompt for the chosen scenario. The remaining
+    fields are diagnostics the run/test asserts on (chunk offsets/hashes per
+    segment, which segment was held-out, expected selection outcome).
+    """
+
+    scenario: str
+    warm_ids: list[int]              # [sys][a][b][c] -- the warm full prefill
+    prompt_ids: list[int]            # measured prompt for the scenario
+    # Per-segment layout of the MEASURED prompt, in prompt order. Each entry is
+    # (label, offset, length, [chunk_hash...]). ``label`` is "sys"/"a"/"b"/"c"/
+    # "d"/"query". sys + ctx segments are chunk-aligned; query is a trailing
+    # partial chunk (never hashed).
+    seg_labels: list[str]
+    seg_offsets: list[int]
+    seg_lens: list[int]
+    seg_chunk_hashes: list[list[str]]
+    # Hashes the WARM prefill stores (sys + a + b + c chunks). For ``same`` the
+    # warm sys carries the SAME nonce-free sys text, so its hash is recorded but
+    # the measured prompt's sys (nonced) will NOT collide with it.
+    warm_stored_hashes: set
+    sys_len: int
+    chunk_size: int
+    question_len: int
+    held_out_label: str | None       # "d" for insert, else None
+    real_tokens: int
+    pad_tokens: int
+    # Static prediction (pure mirror of EpicSelection) for the MEASURED prompt:
+    # which segments fold into the contiguous prefix vs become non-prefix hits.
+    expect_prefix_extent: int
+    expect_non_prefix_offsets: list[int]
+
+    @property
+    def expect_sparse(self) -> bool:
+        """Whether the sparse-forward / LegoLink branch is expected to engage
+        (i.e. there is at least one non-prefix hit)."""
+        return len(self.expect_non_prefix_offsets) > 0
+
+
+def _mirror_select_offsets(
+    chunks: list[tuple[int, int, str]], store_hashes: set
+) -> tuple[int, list[int]]:
+    """Pure mirror of ``EpicSelection.select``'s prefix/non-prefix walk.
+
+    ``chunks`` = ordered ``[(start, length, hash)]`` for the measured prompt;
+    ``store_hashes`` = hashes present in the store after the warm prefill.
+    Returns ``(prefix_extent, non_prefix_offsets)``. Used to PREDICT (CPU, no
+    torch) whether a scenario will fold into the prefix (reorder/same-via-nonce)
+    or expose non-prefix hits (insert) -- the load-bearing diagnostic.
+    """
+    prefix_extent = 0
+    contiguous = True
+    non_prefix: list[int] = []
+    for start, length, h in chunks:
+        hit = h in store_hashes
+        if contiguous and start == prefix_extent and hit:
+            prefix_extent += length
+        else:
+            contiguous = False
+            if hit:
+                non_prefix.append(start)
+    return prefix_extent, non_prefix
+
+
+def assemble_scenario_prompt(
+    *,
+    scenario: str,
+    ctx_token_lists: list[list[int]],
+    held_out_ctx_ids: list[int] | None,
+    question_ids: list[int],
+    chunk_size: int,
+    filler_ids: list[int],
+    sys_ids: list[int],
+    sys_nonce_ids: list[int] | None = None,
+) -> ScenarioPrompt:
+    """Assemble a warm/measured pair for a realistic RAG reuse ``scenario``.
+
+    ``ctx_token_lists`` are the THREE warmed contexts (a, b, c) -- the function
+    requires exactly three so the reorder/insert layouts are unambiguous.
+    ``held_out_ctx_ids`` is the FOURTH, never-warmed context ``d`` used ONLY by
+    ``insert``. Every segment (sys, a, b, c, d) is padded UP to a ``chunk_size``
+    multiple with cycled real-word filler so it occupies whole hashable chunks
+    and the next segment starts on a chunk boundary -- identical alignment rule
+    to ``assemble_musique_prompt``.
+
+    Warm prompt (ALL scenarios): ``[sys][a][b][c]`` full-prefilled -> stores the
+    sys, a, b, c chunks (the connector saves every whole chunk inside M, and a
+    reuse-less first prefill computes everything). The warm sys is NONCE-FREE.
+
+    Measured prompt by scenario:
+      * ``same``    : ``[sys_nonced][a][b][c][query]``. The measured sys gets a
+                      per-sample NONCE so it is a NON-hit -> contiguity breaks at
+                      position 0 -> a, b, c all become non-prefix hits (legacy
+                      LegoLink-engagement behaviour; PIC delta is ZERO because
+                      a, b, c sit where they were warmed).
+      * ``reorder`` : ``[sys][b][a][c][query]``. sys is NONCE-FREE so it HITS the
+                      warmed sys -> sys, b, a, c form a contiguous prefix hit ->
+                      ``non_prefix == 0`` (no sparse branch), but b/a moved so the
+                      prefix-load PIC delta is NON-ZERO. Validates PIC alone.
+      * ``insert``  : ``[sys][d][a][c][query]``. sys HITS; d is the held-out ctx
+                      (NON-hit) spliced after sys -> breaks contiguity -> a, c
+                      become non-prefix hits -> sparse branch engages.
+
+    a, b, c are BYTE-IDENTICAL between warm and measured (same padded ids), so
+    their content hashes collide regardless of position. Returns a ScenarioPrompt
+    with the measured layout, the warm-stored hash set, and a STATIC prediction
+    of the prefix/non-prefix split (pure mirror of EpicSelection).
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if scenario not in SCENARIOS:
+        raise ValueError(f"unknown scenario {scenario!r}; valid: {SCENARIOS}")
+    if len(ctx_token_lists) != 3:
+        raise ValueError(
+            f"scenario assembly needs exactly 3 warmed ctxs (a,b,c); got "
+            f"{len(ctx_token_lists)}"
+        )
+    if scenario == "insert" and not held_out_ctx_ids:
+        raise ValueError("scenario 'insert' requires a held-out ctx 'd'")
+
+    pool = list(filler_ids) if filler_ids else [0]
+
+    def _fill(n: int) -> list[int]:
+        return [pool[i % len(pool)] for i in range(n)]
+
+    def _pad_to_chunk(ids: list[int]) -> tuple[list[int], int, int]:
+        real = len(ids)
+        rem = real % chunk_size
+        pad = (chunk_size - rem) % chunk_size
+        if real == 0:
+            pad = chunk_size
+        return list(ids) + _fill(pad), real, pad
+
+    def _hashes(padded: list[int]) -> list[str]:
+        n = len(padded) // chunk_size
+        return [
+            epic_chunk_hash(padded[c * chunk_size:(c + 1) * chunk_size])
+            for c in range(n)
+        ]
+
+    # --- pad every segment to a chunk multiple (byte-stable per segment) ---
+    a_pad, a_real, a_p = _pad_to_chunk(ctx_token_lists[0])
+    b_pad, b_real, b_p = _pad_to_chunk(ctx_token_lists[1])
+    c_pad, c_real, c_p = _pad_to_chunk(ctx_token_lists[2])
+    d_pad: list[int] = []
+    d_real = d_p = 0
+    if held_out_ctx_ids:
+        d_pad, d_real, d_p = _pad_to_chunk(held_out_ctx_ids)
+
+    # Warm sys: NONCE-FREE (so reorder's measured sys collides with it).
+    warm_sys_pad, _, warm_sys_p = _pad_to_chunk(list(sys_ids))
+    # Measured sys: nonced ONLY for ``same`` (force a position-0 non-hit). For
+    # reorder/insert the measured sys is nonce-free so it HITS the warmed sys.
+    if scenario == "same":
+        meas_sys_raw = list(sys_nonce_ids or []) + list(sys_ids)
+    else:
+        meas_sys_raw = list(sys_ids)
+    meas_sys_pad, _, meas_sys_p = _pad_to_chunk(meas_sys_raw)
+
+    a_h, b_h, c_h = _hashes(a_pad), _hashes(b_pad), _hashes(c_pad)
+    d_h = _hashes(d_pad) if d_pad else []
+    warm_sys_h = _hashes(warm_sys_pad)
+
+    # --- WARM prompt: [sys][a][b][c] (stores sys,a,b,c chunks) ---
+    warm_ids = list(warm_sys_pad) + a_pad + b_pad + c_pad
+    warm_stored: set = set(warm_sys_h) | set(a_h) | set(b_h) | set(c_h)
+
+    # --- MEASURED prompt assembly per scenario ---
+    # Each entry: (label, padded_ids, chunk_hashes).
+    if scenario == "same":
+        ordered = [("a", a_pad, a_h), ("b", b_pad, b_h), ("c", c_pad, c_h)]
+        held_out_label = None
+    elif scenario == "reorder":
+        ordered = [("b", b_pad, b_h), ("a", a_pad, a_h), ("c", c_pad, c_h)]
+        held_out_label = None
+    else:  # insert
+        ordered = [("d", d_pad, d_h), ("a", a_pad, a_h), ("c", c_pad, c_h)]
+        held_out_label = "d"
+
+    prompt_ids: list[int] = list(meas_sys_pad)
+    seg_labels: list[str] = ["sys"]
+    seg_offsets: list[int] = [0]
+    seg_lens: list[int] = [len(meas_sys_pad)]
+    seg_chunk_hashes: list[list[str]] = [_hashes(meas_sys_pad)]
+    for label, padded, hashes in ordered:
+        seg_labels.append(label)
+        seg_offsets.append(len(prompt_ids))
+        seg_lens.append(len(padded))
+        seg_chunk_hashes.append(hashes)
+        prompt_ids.extend(padded)
+    q_off = len(prompt_ids)
+    prompt_ids.extend(question_ids)
+    seg_labels.append("query")
+    seg_offsets.append(q_off)
+    seg_lens.append(len(question_ids))
+    seg_chunk_hashes.append([])
+
+    # --- static prediction of the prefix/non-prefix split (CPU mirror) ---
+    chunks: list[tuple[int, int, str]] = []
+    for off, ln, hashes in zip(seg_offsets, seg_lens, seg_chunk_hashes):
+        for c, h in enumerate(hashes):
+            chunks.append((off + c * chunk_size, chunk_size, h))
+    expect_prefix, expect_nonpref = _mirror_select_offsets(chunks, warm_stored)
+
+    # padding accounting (content vs filler) over the MEASURED prompt ctxs.
+    seg_reals = {"a": a_real, "b": b_real, "c": c_real, "d": d_real}
+    seg_pads = {"a": a_p, "b": b_p, "c": c_p, "d": d_p}
+    real_tokens = sum(seg_reals[lbl] for lbl in seg_labels if lbl in seg_reals)
+    pad_tokens = sum(seg_pads[lbl] for lbl in seg_labels if lbl in seg_pads)
+
+    return ScenarioPrompt(
+        scenario=scenario,
+        warm_ids=warm_ids,
+        prompt_ids=prompt_ids,
+        seg_labels=seg_labels,
+        seg_offsets=seg_offsets,
+        seg_lens=seg_lens,
+        seg_chunk_hashes=seg_chunk_hashes,
+        warm_stored_hashes=warm_stored,
+        sys_len=len(meas_sys_pad),
+        chunk_size=chunk_size,
+        question_len=len(question_ids),
+        held_out_label=held_out_label,
+        real_tokens=real_tokens,
+        pad_tokens=pad_tokens,
+        expect_prefix_extent=expect_prefix,
+        expect_non_prefix_offsets=expect_nonpref,
     )
 
 
@@ -905,10 +1229,112 @@ def prepare_samples(
     return prepared
 
 
+@dataclass
+class PreparedScenarioSample:
+    """A musique sample assembled for a realistic RAG reuse scenario.
+
+    Unlike ``PreparedSample`` (one warm prefill per ctx, legacy probe), the
+    scenario path warms a SINGLE ``[sys][a][b][c]`` prompt and measures the
+    scenario-specific reordered/inserted layout. ``assembled`` carries the
+    static prefix/non-prefix prediction the run logs and the test asserts on.
+    """
+
+    assembled: ScenarioPrompt
+    answers: list[str]
+    question: str
+
+
+def prepare_scenario_samples(
+    samples: list[MusiqueSample],
+    *,
+    tok,
+    chunk_size: int,
+    scenario: str,
+    system_text: str,
+) -> list[PreparedScenarioSample]:
+    """Tokenize + chunk-align N samples for a realistic RAG reuse ``scenario``.
+
+    For every sample we pick the FIRST three contexts as the warmed a, b, c and
+    (for ``insert``) the FOURTH context as the held-out d. The warm prompt is
+    ``[sys][a][b][c]`` (full-prefilled -> stores sys/a/b/c). The measured prompt
+    is the scenario layout (see ``assemble_scenario_prompt``). ``system_text`` is
+    REQUIRED (a leading RAG instruction is the whole point); it is nonce-free in
+    warm and in reorder/insert (so it HITS), and per-sample nonced ONLY in
+    ``same`` (legacy position-0 break). Samples without enough contexts for the
+    scenario (>=3, or >=4 for insert) are SKIPPED with a log line.
+    """
+    if scenario not in SCENARIOS:
+        raise ValueError(f"unknown scenario {scenario!r}; valid: {SCENARIOS}")
+    if not system_text:
+        raise ValueError("scenario mode requires a non-empty --system-prompt")
+    enc = _encode(tok)
+    sys_ids = enc(system_text)
+    need = 4 if scenario == "insert" else 3
+    prepared: list[PreparedScenarioSample] = []
+    for idx, s in enumerate(samples):
+        if len(s.ctxs) < need:
+            _log(
+                f"skip sample {idx}: scenario {scenario!r} needs >={need} ctxs, "
+                f"has {len(s.ctxs)}"
+            )
+            continue
+        abc = [enc(c) for c in s.ctxs[:3]]
+        held_out = enc(s.ctxs[3]) if scenario == "insert" else None
+        # Nonce only matters for ``same`` (the legacy position-0 break). reorder/
+        # insert keep sys nonce-free so the measured sys HITS the warmed sys.
+        sys_nonce_ids = enc(f"[sample-{idx} sys]\n") if scenario == "same" else None
+        q_text = (
+            f"\n\nQuestion: {s.question}\nAnswer the question using ONLY the "
+            "passages above. Answer:"
+        )
+        q_ids = enc(q_text)
+        assembled = assemble_scenario_prompt(
+            scenario=scenario,
+            ctx_token_lists=abc,
+            held_out_ctx_ids=held_out,
+            question_ids=q_ids,
+            chunk_size=chunk_size,
+            filler_ids=_filler_token_pool(enc),
+            sys_ids=sys_ids,
+            sys_nonce_ids=sys_nonce_ids,
+        )
+        prepared.append(
+            PreparedScenarioSample(
+                assembled=assembled, answers=s.answers, question=s.question
+            )
+        )
+    if not prepared:
+        _fail(
+            f"no samples have enough contexts for scenario {scenario!r} "
+            f"(need >={need}); raise --num-samples or pick a different scenario"
+        )
+    return prepared
+
+
 def _samples_for_spec(prepared: list[PreparedSample]) -> list[dict]:
     return [
         {
             "warm": p.assembled.warm_ctx_ids,
+            "prompt": p.assembled.prompt_ids,
+            "answers": p.answers,
+        }
+        for p in prepared
+    ]
+
+
+def _scenario_samples_for_spec(
+    prepared: list[PreparedScenarioSample],
+) -> list[dict]:
+    """Worker-spec sample rows for the scenario path.
+
+    The warm side is a SINGLE prompt ``[sys][a][b][c]`` (wrapped in a one-element
+    ``warm`` list so the worker's existing per-warm loop seeds it), and the
+    measured prompt is the scenario layout. Same on-the-wire schema as
+    ``_samples_for_spec`` so ``run_musique_worker`` is unchanged.
+    """
+    return [
+        {
+            "warm": [p.assembled.warm_ids],
             "prompt": p.assembled.prompt_ids,
             "answers": p.answers,
         }
@@ -1071,6 +1497,206 @@ def _report_selection(label: str, res: dict) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Scenario-specific reporting (reorder / insert / same)
+# ---------------------------------------------------------------------------
+def _scenario_layout_str(scenario: str) -> str:
+    return {
+        "same": "[sys*][a][b][c][query]  (* per-sample nonce -> sys non-hit)",
+        "reorder": "[sys][b][a][c][query]  (sys HIT; b/a/c moved -> PIC delta!=0)",
+        "insert": "[sys][d][a][c][query]  (d held-out NON-hit -> a,c non-prefix)",
+    }[scenario]
+
+
+def _print_scenario_intent(scenario: str) -> None:
+    """State, per scenario, exactly which reuse mechanism is under test and what
+    the connector counters/selection are EXPECTED to show, so the operator can
+    immediately classify a result (PIC bug vs sparse-forward bug)."""
+    if scenario == "reorder":
+        _log(
+            "INTENT reorder: b,a,c are all PREFIX hits (sys is warmed) so "
+            "EXPECT sparse_match=0, sparse_branch=False, non_prefix=0 -- the "
+            "sparse-forward path is NOT exercised. The contexts MOVED, so the "
+            "prefix-load applies a NON-ZERO PIC delta re-rotary. This is the "
+            "first real-data test of PIC re-rotary + load + scatter ALONE. "
+            "reuse-only correct here => PIC is sound."
+        )
+    elif scenario == "insert":
+        _log(
+            "INTENT insert: d is a held-out (never-warmed) ctx spliced after "
+            "sys, so a,c become NON-PREFIX hits. EXPECT non_prefix>0, "
+            "sparse_branch=True, sparse_match>=1 -- the sparse-forward + "
+            "LegoLink recompute path IS exercised. Breakage here while reorder "
+            "is fine => the bug is in sparse-forward, NOT PIC."
+        )
+    else:  # same
+        _log(
+            "INTENT same: legacy control. sys carries a per-sample nonce -> "
+            "sys is a NON-hit at position 0 -> a,b,c become non-prefix hits at "
+            "their ORIGINAL positions (PIC delta=0). EXPECT non_prefix>0, "
+            "sparse_branch=True. Mixes PIC(zero-delta)+sparse; use reorder/"
+            "insert to separate the two."
+        )
+
+
+def _print_scenario_padding_report(
+    prepared: list[PreparedScenarioSample], chunk_size: int
+) -> None:
+    total_real = sum(p.assembled.real_tokens for p in prepared)
+    total_pad = sum(p.assembled.pad_tokens for p in prepared)
+    total = total_real + total_pad
+    waste = (total_pad / total * 100.0) if total else 0.0
+    _log(
+        f"scenario assembly: {len(prepared)} samples, chunk_size={chunk_size} "
+        f"(block-aligned), ctx content tokens={total_real}, padding tokens="
+        f"{total_pad} ({waste:.1f}% wasted on chunk alignment). "
+        "CacheBlend concatenates contexts WITHOUT padding (arbitrary-span "
+        "reuse); EPIC reuses BLOCK-ALIGNED whole chunks, hence the padding."
+    )
+
+
+def _print_scenario_selection_prediction(
+    prepared: list[PreparedScenarioSample],
+) -> None:
+    """Print the STATIC (CPU mirror) prediction of the prefix/non-prefix split
+    for the measured prompts, so the operator sees what selection SHOULD do
+    before any GPU runs -- and can compare it to the connector's in-band
+    selection diagnostics afterward."""
+    if not prepared:
+        return
+    p0 = prepared[0].assembled
+    n_non = [len(p.assembled.expect_non_prefix_offsets) for p in prepared]
+    n_non_set = sorted(set(n_non))
+    sparse_expected = any(p.assembled.expect_sparse for p in prepared)
+    _log(
+        f"PREDICTED selection (CPU mirror of EpicSelection): scenario="
+        f"{p0.scenario!r} measured layout segs={p0.seg_labels} "
+        f"prefix_extent(sample0)={p0.expect_prefix_extent} "
+        f"non_prefix_offsets(sample0)={p0.expect_non_prefix_offsets} "
+        f"non_prefix_count_over_samples={n_non_set} "
+        f"=> sparse_branch_expected={sparse_expected}"
+    )
+    if p0.scenario == "reorder" and sparse_expected:
+        _log(
+            "  *** UNEXPECTED: reorder predicted to have non-prefix hits. The "
+            "reordered ctxs should stay a contiguous PREFIX (sys is warmed). "
+            "Check ctx chunk alignment. ***"
+        )
+    if p0.scenario == "insert" and not sparse_expected:
+        _log(
+            "  *** UNEXPECTED: insert predicted to have NO non-prefix hits. The "
+            "held-out d should break contiguity so a,c are non-prefix. Check "
+            "that d is genuinely never warmed. ***"
+        )
+
+
+def _check_scenario_engagement(scenario: str, label: str, res: dict) -> None:
+    """Report the connector's in-band counters/selection for a sparse mode and
+    check them against the scenario's EXPECTATION (reorder: sparse must NOT
+    fire; insert/same: sparse must fire). Reports loudly; never crashes a run."""
+    counters = res.get("counters", {})
+    _log(
+        f"  scenario={scenario!r} mode={label!r} counters: "
+        f"loads_emitted={counters.get('loads_emitted', 0)} "
+        f"chunks_loaded={counters.get('chunks_loaded', 0)} "
+        f"sparse_match={counters.get('sparse_match', 0)} "
+        f"sparse_emit={counters.get('sparse_emit', 0)} "
+        f"check_load_calls={counters.get('check_load_calls', 0)} "
+        f"check_load_mismatch={counters.get('check_load_mismatch', 0)} "
+        f"check_load_skip={counters.get('check_load_skip', 0)}"
+    )
+    sel = res.get("selection") or []
+    biggest = max(sel, key=lambda x: int(x.get("N", 0))) if sel else {}
+    nprefix = int(biggest.get("num_non_prefix", 0)) if biggest else 0
+    sbranch = bool(biggest.get("sparse_branch")) if biggest else False
+    if scenario == "reorder":
+        # reorder should LOAD chunks (prefix-load + PIC) but NOT take the sparse
+        # branch. chunks_loaded>=1 proves load+PIC ran; sparse_match==0 proves
+        # the sparse-forward path stayed out (so any reorder breakage is PIC).
+        if counters.get("chunks_loaded", 0) < 1:
+            _log(
+                f"  *** WARNING reorder/{label}: chunks_loaded=0 -> the prefix "
+                "chunks were NOT loaded. PIC/load path never ran; the measured "
+                "prompt may not have hit the warmed sys (check sys byte-identity "
+                "warm vs measured). Numbers SUSPECT. ***"
+            )
+        if counters.get("sparse_match", 0) != 0 or nprefix != 0:
+            _log(
+                f"  *** NOTE reorder/{label}: sparse_match="
+                f"{counters.get('sparse_match', 0)} non_prefix={nprefix} -- "
+                "EXPECTED 0 for reorder (all ctxs should fold into the PIC-"
+                "rotated prefix). If non-zero, the reorder layout is NOT a pure "
+                "prefix-reuse test. ***"
+            )
+        else:
+            _log(
+                f"  reorder/{label}: PURE prefix reuse + PIC (sparse_match=0, "
+                "non_prefix=0) as intended -- isolates PIC re-rotary/load."
+            )
+    else:  # insert / same -> sparse path must engage
+        if not (counters.get("sparse_match", 0) >= 1
+                and counters.get("chunks_loaded", 0) >= 1 and sbranch):
+            _log(
+                f"  *** WARNING {scenario}/{label}: sparse branch did NOT fully "
+                f"engage (sparse_match={counters.get('sparse_match', 0)}, "
+                f"chunks_loaded={counters.get('chunks_loaded', 0)}, "
+                f"sparse_branch={sbranch}, non_prefix={nprefix}). The recompute "
+                "path may be inert; numbers SUSPECT. ***"
+            )
+        else:
+            _log(
+                f"  {scenario}/{label}: sparse-forward engaged "
+                f"(sparse_match={counters.get('sparse_match', 0)}, "
+                f"non_prefix={nprefix}, sparse_branch=True) as intended."
+            )
+    _report_selection(f"{scenario}/{label}", res)
+
+
+def _print_scenario_aggregate_table(
+    scenario: str, aggs: list[ModeAggregate], *, chunk_size: int
+) -> None:
+    _log(
+        f"AGGREGATE scenario={scenario!r} "
+        "(mode | answer_hit_rate | mean_prefill_ms | speedup_vs_full)"
+    )
+    _log("    mode             | hit_rate (n)   | mean_prefill_ms | speedup")
+    for a in aggs:
+        is_full = a.label.endswith("/full")
+        sp = (
+            "  n/a" if is_full
+            else (f"{a.speedup_vs_full:6.2f}x"
+                  if a.speedup_vs_full not in (float("inf"),) else "   inf")
+        )
+        _log(
+            f"    {a.label:16s} | {a.answer_hit_rate:5.2f} ({a.answer_hits}/"
+            f"{a.n}) | {a.mean_prefill_ms:15.1f} | {sp}"
+        )
+
+
+def _print_scenario_verdict(scenario: str) -> None:
+    """Print the decision rule this scenario answers (PIC vs sparse-forward)."""
+    if scenario == "reorder":
+        _log(
+            "VERDICT KEY (reorder): reuse-only hit_rate ~= full => PIC re-"
+            "rotary + load + scatter are SOUND on real data. reuse-only "
+            "DEGRADED here => the bug is in PIC/load (sparse-forward is not "
+            "even exercised in reorder)."
+        )
+    elif scenario == "insert":
+        _log(
+            "VERDICT KEY (insert): epic@k engages the sparse-forward path. If "
+            "reorder was fine but insert-epic collapses => the bug is in the "
+            "SPARSE-FORWARD / LegoLink recompute path, NOT PIC. epic@k hit_rate "
+            "should climb toward full as k grows (more boundary recompute)."
+        )
+    else:
+        _log(
+            "VERDICT KEY (same): control -- mixes zero-delta PIC with sparse-"
+            "forward. Use scenario=reorder (PIC only) and scenario=insert "
+            "(sparse only) to localise any collapse."
+        )
+
+
 def run_all(args) -> int:
     samples_all = load_musique(args.data, download=not args.no_download)
     samples = samples_all[: args.num_samples]
@@ -1091,38 +1717,41 @@ def run_all(args) -> int:
     if not is_real:
         _fail("could not load a real tokenizer; cannot build model prompts")
 
-    # System segment: ON by default (the LegoLink-engagement fix). --no-system
-    # disables it -> legacy all-prefix behaviour where link is INERT (kept as a
-    # control to demonstrate the bug).
-    system_text = None if args.no_system else args.system_prompt
-    prepared = prepare_samples(
-        samples, tok=tok, chunk_size=chunk_size,
-        ctx_per_sample=args.ctx_per_sample,
-        system_text=system_text,
-    )
-    sys_lens = {p.assembled.sys_len for p in prepared}
-    if system_text:
-        _log(
-            f"system segment ON: leading NON-warmed instruction chunk, "
-            f"padded length={sorted(sys_lens)} tokens (chunk_size={chunk_size}). "
-            "This breaks position-0 contiguity so EVERY ctx is a non-prefix hit "
-            "and LegoLink recompute can engage."
-        )
-    else:
-        _log(
-            "system segment OFF (--no-system): ctx0 starts at position 0 -> the "
-            "whole ctx run folds into the contiguous prefix -> LegoLink link is "
-            "INERT (control / legacy behaviour)."
-        )
-    _print_padding_report(prepared, chunk_size)
+    # The leading RAG system/instruction segment is REQUIRED for the scenario
+    # path: it is the byte-identical leading chunk shared by warm and measured,
+    # and (for reorder/insert) the warmed sys HIT is what lets the reordered ctxs
+    # fold into the PIC-rotated prefix / the held-out d break contiguity. An
+    # empty system prompt is rejected so we never silently lose the layout.
+    system_text = args.system_prompt
+    if not system_text:
+        _fail("--system-prompt must be non-empty for the scenario probe")
 
-    # Length sanity vs max_model_len.
-    max_prompt = max(len(p.assembled.prompt_ids) for p in prepared)
+    scenario = args.scenario
+    prepared = prepare_scenario_samples(
+        samples, tok=tok, chunk_size=chunk_size,
+        scenario=scenario, system_text=system_text,
+    )
+    sys_lens = sorted({p.assembled.sys_len for p in prepared})
+    _log(
+        f"scenario={scenario!r}: RAG system prompt fixed at FRONT "
+        f"(padded sys_len={sys_lens} tokens, chunk_size={chunk_size}). "
+        f"warm prompt = [sys][a][b][c] (stores sys,a,b,c); "
+        f"measured prompt = {_scenario_layout_str(scenario)}."
+    )
+    _print_scenario_intent(scenario)
+    _print_scenario_padding_report(prepared, chunk_size)
+    _print_scenario_selection_prediction(prepared)
+
+    # Length sanity vs max_model_len (warm and measured prompts both matter).
+    max_prompt = max(
+        max(len(p.assembled.prompt_ids), len(p.assembled.warm_ids))
+        for p in prepared
+    )
     if max_prompt + args.max_tokens + 8 > args.max_model_len:
         _fail(
             f"longest assembled prompt is {max_prompt} tokens + {args.max_tokens}"
             f" gen > --max-model-len {args.max_model_len}. Raise --max-model-len "
-            "or lower --ctx-per-sample / --chunk-size."
+            "or lower --chunk-size."
         )
 
     # Build the mode list: full, reuse-only, epic@<link or sweep>.
@@ -1135,16 +1764,19 @@ def run_all(args) -> int:
             modes.append(mode_epic(k))
 
     _log(
-        f"modes={[m.label for m in modes]} num_samples={len(prepared)} "
-        f"ctx_per_sample={args.ctx_per_sample} chunk_size={chunk_size} "
+        f"modes={[m.label for m in modes]} scenario={scenario!r} "
+        f"num_samples={len(prepared)} chunk_size={chunk_size} "
         f"max_tokens={args.max_tokens} warmup_discard={args.warmup_discard}"
     )
 
-    sample_specs = _samples_for_spec(prepared)
+    sample_specs = _scenario_samples_for_spec(prepared)
     mode_results: dict[str, dict] = {}
     aggs: list[ModeAggregate] = []
     for mode in modes:
-        _log(f"=== running mode={mode.label} (fresh subprocess engine) ===")
+        _log(
+            f"=== running scenario={scenario!r} mode={mode.label} "
+            f"(fresh subprocess engine) ==="
+        )
         spec = build_musique_worker_spec(
             mode=mode,
             model=args.model,
@@ -1163,17 +1795,23 @@ def run_all(args) -> int:
             )
         mode_results[mode.label] = res
         if mode.sparse:
-            _check_sparse_engagement(mode.label, res)
+            _check_scenario_engagement(scenario, mode.label, res)
         aggs.append(
             aggregate_mode(
-                mode.label, res["per_sample"],
+                f"{scenario}/{mode.label}", res["per_sample"],
                 warmup_discard=args.warmup_discard,
             )
         )
 
-    fill_speedups(aggs)
+    # Speedups within this scenario use this scenario's full as the baseline.
+    full_label = f"{scenario}/full"
+    base = next((a for a in aggs if a.label == full_label), None)
+    base_ms = base.mean_prefill_ms if base else 0.0
+    for a in aggs:
+        a.speedup_vs_full = speedup(base_ms, a.mean_prefill_ms) if base_ms > 0 else 0.0
     _print_sample_table(mode_results)
-    _print_aggregate_table(aggs, chunk_size=chunk_size)
+    _print_scenario_aggregate_table(scenario, aggs, chunk_size=chunk_size)
+    _print_scenario_verdict(scenario)
     _log("DONE")
     return 0
 
@@ -1215,20 +1853,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="epic@k LegoLink leading-recompute tokens per "
                          "non-prefix chunk (default 8).")
     ap.add_argument(
+        "--scenario",
+        choices=SCENARIOS,
+        default="same",
+        help="Realistic RAG reuse scenario for the MEASURED request after a "
+             "warm [sys][a][b][c] full prefill. 'same'=[sys*][a][b][c][query] "
+             "(legacy nonce control, * = per-sample sys nonce); "
+             "'reorder'=[sys][b][a][c][query] (sys HIT, ctxs moved -> non-zero "
+             "PIC delta, NO sparse branch -> isolates PIC re-rotary/load); "
+             "'insert'=[sys][d][a][c][query] (d = held-out non-warmed ctx -> a,c "
+             "non-prefix -> isolates sparse-forward+LegoLink). reorder vs insert "
+             "splits the link=255 collapse into PIC vs sparse-forward bugs.")
+    ap.add_argument(
         "--system-prompt",
         type=str,
-        default="Answer the question using the documents below.\n",
-        help="Leading instruction/system segment prepended (chunk-padded, NOT "
-             "warmed) to EVERY reuse/full prompt. Breaks position-0 contiguity "
-             "so all contexts become non-prefix hits and LegoLink recompute can "
-             "engage. Mirrors CacheBlend's non-reusable system prefix. ON by "
-             "default.")
+        default=(
+            "You are a helpful assistant. Use the documents to answer the "
+            "question.\n"
+        ),
+        help="Leading RAG instruction/system segment fixed at the FRONT of "
+             "both the warm and measured prompts (chunk-padded). It is the "
+             "byte-identical leading chunk shared warm<->measured; in reorder/"
+             "insert it is WARMED (a HIT) so the reordered ctxs fold into the "
+             "PIC-rotated prefix / the held-out d breaks contiguity. In 'same' "
+             "a per-sample nonce makes it a non-hit (legacy behaviour). Must be "
+             "non-empty.")
     ap.add_argument(
         "--no-system",
         action="store_true",
-        help="Disable the leading system segment (control). ctx0 then starts at "
-             "position 0, the whole ctx run folds into the contiguous prefix, "
-             "and LegoLink link is INERT (the pre-fix bug).")
+        help="DEPRECATED in the scenario probe (the scenario layouts REQUIRE a "
+             "leading system segment); accepted but ignored.")
     ap.add_argument("--link-sweep", type=str, default=None,
                     help="comma-separated link values to run epic@k for each "
                          "(overrides --link), e.g. '0,8,64'.")

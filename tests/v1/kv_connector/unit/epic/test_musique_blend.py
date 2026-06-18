@@ -17,10 +17,12 @@ import pytest
 
 from benchmarks.epic_reuse.common import effective_chunk_size, epic_chunk_hash
 from benchmarks.epic_reuse.musique_blend import (
+    SCENARIOS,
     MusiqueSample,
     ModeAggregate,
     aggregate_mode,
     assemble_musique_prompt,
+    assemble_scenario_prompt,
     build_musique_worker_spec,
     fill_speedups,
     kv_config_for_mode,
@@ -666,3 +668,200 @@ def test_effective_chunk_size_rounds_to_block_multiple():
     assert effective_chunk_size(250, 16) == 256
     assert effective_chunk_size(256, 16) == 256
     assert effective_chunk_size(7, 16) == 16
+
+
+# ---------------------------------------------------------------------------
+# realistic RAG reuse scenarios (reorder / insert / same): warm [sys][a][b][c]
+# full prefill then a scenario-specific measured prompt. These verify the
+# prompt structure, byte-identity of warmed ctxs, held-out d, sys-at-front,
+# and the prefix/non-prefix split (PIC-only reorder vs sparse insert).
+# ---------------------------------------------------------------------------
+CS = 8  # chunk size for the scenario tests (each ctx -> whole chunks)
+_SYS = _ids(50, 51, 52)         # leading RAG system text (-> 1 padded chunk)
+_A = _ids(1, 2, 3, 4, 5, 6, 7, 8)
+_B = _ids(11, 12, 13, 14, 15, 16, 17, 18)
+_C = _ids(21, 22, 23, 24, 25, 26, 27, 28)
+_D = _ids(31, 32, 33, 34, 35, 36, 37, 38)
+_Q = _ids(99)
+
+
+def _scn(scenario, *, held_out=None, nonce=None):
+    return assemble_scenario_prompt(
+        scenario=scenario,
+        ctx_token_lists=[list(_A), list(_B), list(_C)],
+        held_out_ctx_ids=held_out,
+        question_ids=list(_Q),
+        chunk_size=CS,
+        filler_ids=[0],
+        sys_ids=list(_SYS),
+        sys_nonce_ids=nonce,
+    )
+
+
+def _slice(prompt_ids, offset, length):
+    return prompt_ids[offset:offset + length]
+
+
+def test_scenarios_constant_lists_three():
+    assert SCENARIOS == ("same", "reorder", "insert")
+
+
+def test_scenario_warm_prompt_is_sys_a_b_c():
+    # The warm prompt is [sys][a][b][c]: the leading sys (nonce-free) followed by
+    # the three padded ctxs in order. It seeds sys,a,b,c into the store.
+    p = _scn("reorder")
+    assert p.warm_ids[:3] == [50, 51, 52]               # sys text at front
+    assert p.warm_ids[CS:2 * CS] == list(_A)            # a
+    assert p.warm_ids[2 * CS:3 * CS] == list(_B)        # b
+    assert p.warm_ids[3 * CS:4 * CS] == list(_C)        # c
+    assert len(p.warm_ids) == 4 * CS                    # sys+a+b+c, no query
+
+
+def test_scenario_system_prompt_first_in_measured_prompt():
+    for scenario in SCENARIOS:
+        held = list(_D) if scenario == "insert" else None
+        nonce = _ids(900) if scenario == "same" else None
+        p = _scn(scenario, held_out=held, nonce=nonce)
+        assert p.seg_labels[0] == "sys"
+        assert p.seg_offsets[0] == 0
+        # nonce-free scenarios start with the literal sys text; 'same' starts
+        # with its nonce token (still a sys segment at the front).
+        if scenario == "same":
+            assert p.prompt_ids[0] == 900
+        else:
+            assert p.prompt_ids[:3] == [50, 51, 52]
+
+
+def test_scenario_reorder_layout_is_sys_b_a_c_query():
+    p = _scn("reorder")
+    assert p.seg_labels == ["sys", "b", "a", "c", "query"]
+    # b sits where a was warmed -> different position -> non-zero PIC delta.
+    assert _slice(p.prompt_ids, p.seg_offsets[1], CS) == list(_B)  # b first now
+    assert _slice(p.prompt_ids, p.seg_offsets[2], CS) == list(_A)  # a second
+    assert _slice(p.prompt_ids, p.seg_offsets[3], CS) == list(_C)  # c third
+    assert p.held_out_label is None
+
+
+def test_scenario_reorder_is_pure_prefix_no_sparse():
+    # sys is warmed (nonce-free, HIT) and b,a,c are all hits contiguous from the
+    # sys boundary -> EVERYTHING folds into the prefix -> ZERO non-prefix hits ->
+    # the sparse branch is NOT expected. This is the PIC-only test.
+    p = _scn("reorder")
+    assert p.expect_non_prefix_offsets == []
+    assert p.expect_sparse is False
+    # the whole measured prompt (minus the trailing query) is the prefix extent.
+    assert p.expect_prefix_extent == p.sys_len + 3 * CS
+
+
+def test_scenario_reorder_ctxs_byte_identical_to_warm():
+    # a,b,c are byte-identical between warm and measured (only their POSITIONS
+    # change) -> their content hashes collide -> the warmed chunks are reused.
+    p = _scn("reorder")
+    warm = p.warm_ids
+    a_warm = warm[CS:2 * CS]
+    b_warm = warm[2 * CS:3 * CS]
+    c_warm = warm[3 * CS:4 * CS]
+    assert _slice(p.prompt_ids, p.seg_offsets[1], CS) == b_warm
+    assert _slice(p.prompt_ids, p.seg_offsets[2], CS) == a_warm
+    assert _slice(p.prompt_ids, p.seg_offsets[3], CS) == c_warm
+
+
+def test_scenario_insert_layout_is_sys_d_a_c_query():
+    p = _scn("insert", held_out=list(_D))
+    assert p.seg_labels == ["sys", "d", "a", "c", "query"]
+    assert p.held_out_label == "d"
+    assert _slice(p.prompt_ids, p.seg_offsets[1], CS) == list(_D)  # d spliced in
+    assert _slice(p.prompt_ids, p.seg_offsets[2], CS) == list(_A)
+    assert _slice(p.prompt_ids, p.seg_offsets[3], CS) == list(_C)
+
+
+def test_scenario_insert_d_is_held_out_never_warmed():
+    # d's chunk hash must NOT be in the warm-stored set (it is held out), while
+    # a and c hashes ARE stored.
+    p = _scn("insert", held_out=list(_D))
+    d_hash = epic_chunk_hash(_slice(p.prompt_ids, p.seg_offsets[1], CS))
+    a_hash = epic_chunk_hash(_slice(p.prompt_ids, p.seg_offsets[2], CS))
+    c_hash = epic_chunk_hash(_slice(p.prompt_ids, p.seg_offsets[3], CS))
+    assert d_hash not in p.warm_stored_hashes
+    assert a_hash in p.warm_stored_hashes
+    assert c_hash in p.warm_stored_hashes
+    # d is also not in the warm prompt at all.
+    assert list(_D) not in [p.warm_ids[i:i + CS] for i in range(0, len(p.warm_ids), CS)]
+
+
+def test_scenario_insert_breaks_contiguity_a_c_non_prefix():
+    # sys HITS (warmed, nonce-free) -> prefix_extent == sys_len. d at the next
+    # slot is a NON-hit -> contiguity breaks -> a and c (both warmed hits) become
+    # NON-PREFIX hits -> the sparse-forward path is expected to engage.
+    p = _scn("insert", held_out=list(_D))
+    assert p.expect_prefix_extent == p.sys_len  # only sys folds in
+    # a and c offsets are the non-prefix hits (d is a non-hit so not listed).
+    assert p.expect_non_prefix_offsets == [p.seg_offsets[2], p.seg_offsets[3]]
+    assert p.expect_sparse is True
+
+
+def test_scenario_same_nonce_makes_sys_non_hit_all_ctx_non_prefix():
+    # 'same' keeps the per-sample nonce -> the measured sys chunk hash differs
+    # from the warmed sys -> sys is a NON-hit at position 0 -> a,b,c (all warmed)
+    # become non-prefix hits at their ORIGINAL positions (PIC delta zero).
+    p = _scn("same", nonce=_ids(900))
+    assert p.seg_labels == ["sys", "a", "b", "c", "query"]
+    # the nonced sys chunk is NOT in the warm-stored set.
+    sys_hash = epic_chunk_hash(p.prompt_ids[0:CS])
+    assert sys_hash not in p.warm_stored_hashes
+    assert p.expect_prefix_extent == 0
+    assert p.expect_non_prefix_offsets == [
+        p.seg_offsets[1], p.seg_offsets[2], p.seg_offsets[3]
+    ]
+    assert p.expect_sparse is True
+
+
+def test_scenario_reorder_sys_is_warm_hit():
+    # In reorder the measured sys is nonce-free, so its chunk hash IS in the
+    # warm-stored set -> sys is a prefix HIT (the precondition for b,a,c folding
+    # into the PIC-rotated prefix).
+    p = _scn("reorder")
+    sys_hash = epic_chunk_hash(p.prompt_ids[0:CS])
+    assert sys_hash in p.warm_stored_hashes
+
+
+def test_scenario_insert_requires_held_out_ctx():
+    with pytest.raises(ValueError):
+        assemble_scenario_prompt(
+            scenario="insert",
+            ctx_token_lists=[list(_A), list(_B), list(_C)],
+            held_out_ctx_ids=None,
+            question_ids=list(_Q),
+            chunk_size=CS,
+            filler_ids=[0],
+            sys_ids=list(_SYS),
+        )
+
+
+def test_scenario_needs_exactly_three_ctxs():
+    with pytest.raises(ValueError):
+        assemble_scenario_prompt(
+            scenario="reorder",
+            ctx_token_lists=[list(_A), list(_B)],  # only 2
+            held_out_ctx_ids=None,
+            question_ids=list(_Q),
+            chunk_size=CS,
+            filler_ids=[0],
+            sys_ids=list(_SYS),
+        )
+
+
+def test_scenario_unknown_raises():
+    with pytest.raises(ValueError):
+        _scn("shuffle")
+
+
+def test_scenario_measured_ends_with_query():
+    for scenario in SCENARIOS:
+        held = list(_D) if scenario == "insert" else None
+        nonce = _ids(900) if scenario == "same" else None
+        p = _scn(scenario, held_out=held, nonce=nonce)
+        assert p.seg_labels[-1] == "query"
+        assert p.prompt_ids[-1] == _Q[-1]
+        # query is a trailing partial chunk (not hashed).
+        assert p.seg_chunk_hashes[-1] == []
