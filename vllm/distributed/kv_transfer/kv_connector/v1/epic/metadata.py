@@ -33,6 +33,14 @@ class ChunkLoadSpec:
     # Absolute position the chunk will occupy in the new request.
     new_pos_start: int
     length: int
+    # Tokens to skip at the HEAD of the stored chunk before loading (native-
+    # computed-region trim): the worker reads stored K/V/old_positions from
+    # [src_offset, src_offset + length). 0 == load the chunk from its start.
+    # Used when the leading part of a matched chunk is already covered by the
+    # EXACT native prefix cache (num_computed_tokens) -- loading approximate
+    # store KV over it would both downgrade this request and write into paged
+    # blocks that other requests share.
+    src_offset: int = 0
 
 
 @dataclass
@@ -50,6 +58,10 @@ class NonPrefixHit:
     prompt_offset: int
     old_pos_start: int
     length: int
+    # Head trim into the stored chunk (see ChunkLoadSpec.src_offset): when the
+    # leading part of this hit falls below the native-computed extent, the hit
+    # is clamped and this records how many stored tokens to skip at load time.
+    src_offset: int = 0
 
 
 @dataclass

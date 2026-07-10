@@ -744,6 +744,29 @@ class Scheduler(SchedulerInterface):
                     # non-bool; require the exact True the EPIC hook contracts.
                     epic_sparse = True
 
+                # EPIC (defense-in-depth): a sparse plan is only valid for a
+                # ONE-STEP prefill of the full remaining prompt. If the token
+                # budget / long-prefill threshold truncated num_new_tokens, the
+                # allocated blocks would not cover [0, N) while the sparse
+                # override still stamps full-M positions -> out-of-range slots.
+                # The connector's budget guard (_sparse_fits_budget) prevents
+                # this a priori; if it is ever reached anyway, defer the request
+                # instead of scheduling a corrupted step. Inert for non-sparse.
+                if epic_sparse and num_new_tokens < (
+                    request.num_tokens - num_computed_tokens
+                ):
+                    logger.warning(
+                        "EPIC sparse request %s truncated by the scheduler "
+                        "(num_new_tokens=%d < remaining=%d); deferring instead "
+                        "of chunking a sparse prefill.",
+                        request_id,
+                        num_new_tokens,
+                        request.num_tokens - num_computed_tokens,
+                    )
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 # EPIC (Phase 2b, S7): single-batch gate for sparse requests.
                 # A sparse request must be the ONLY request in its step (shared
                 # fusion-mask tensor + |M| forward layout are not validated for
@@ -1092,6 +1115,23 @@ class Scheduler(SchedulerInterface):
             # EPIC: advance override is inert (dict empty) on the default path.
             advance = epic_advance.get(req_id, num_scheduled_token)
             request.num_computed_tokens += advance
+            # EPIC (spec §4 length invariant): a sparse prefill writes
+            # NON-CONTIGUOUS slot ranges (M-forward rows + connector chunk
+            # loads), so "computed tokens" must land EXACTLY on the full prompt
+            # length N (max written position + 1) in this single step -- not on
+            # a running row count. If it doesn't, decode would start at the
+            # wrong slot and silently corrupt KV; fail loudly instead.
+            if req_id in epic_advance and (
+                request.num_computed_tokens != request.num_prompt_tokens
+            ):
+                raise ValueError(
+                    "EPIC sparse length invariant violated: req "
+                    f"{req_id} num_computed_tokens="
+                    f"{request.num_computed_tokens} != prompt length "
+                    f"{request.num_prompt_tokens} after sparse prefill "
+                    f"(advance={advance}). Decode would start at the wrong "
+                    "slot; refusing to continue."
+                )
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )

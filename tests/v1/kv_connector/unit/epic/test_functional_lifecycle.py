@@ -164,6 +164,9 @@ def _base_connector(*, sparse: bool, link: int) -> EpicConnector:
     c._loads_pending = {}
     c._selections = {}
     c._sparse_reqs = {}
+    c._native_computed = {}
+    c._max_sparse_rows = 0  # 0 == no budget limit (unit tests)
+    c._long_prefill_threshold = 0
     c._sparse_forward = sparse
     c._link_tokens = link
     c._selection = EpicSelection()

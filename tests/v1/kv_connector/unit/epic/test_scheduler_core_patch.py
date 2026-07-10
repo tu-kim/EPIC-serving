@@ -141,6 +141,41 @@ def test_update_after_schedule_uses_epic_advance():
     assert req.is_prefill_chunk is False
 
 
+def test_update_after_schedule_length_invariant_raises_on_mismatch():
+    """Spec §4 / acceptance §8-4: after a sparse prefill step, num_computed
+    MUST equal the full prompt length N exactly. A corrupted advance (any
+    accounting drift: double-count, missed external, wrong N) must raise
+    loudly instead of letting decode start at the wrong slot."""
+    sched = create_scheduler()
+    reqs = create_requests(num_requests=1, num_tokens=192)
+    req = reqs[0]
+    sched.requests[req.request_id] = req
+    req.num_computed_tokens = 128
+
+    so = _empty_output({req.request_id: 72})
+    # Corrupted advance: 128 + 63 = 191 != 192.
+    so.epic_computed_advance[req.request_id] = 63
+
+    with pytest.raises(ValueError, match="length invariant"):
+        sched._update_after_schedule(so)
+
+
+def test_update_after_schedule_length_invariant_scoped_to_epic_reqs():
+    """The invariant must NOT fire for vanilla requests: chunked prefill
+    legitimately leaves num_computed < N mid-prefill, and only requests with
+    an epic_computed_advance entry are subject to the exact-landing check."""
+    sched = create_scheduler()
+    reqs = create_requests(num_requests=1, num_tokens=192)
+    req = reqs[0]
+    sched.requests[req.request_id] = req
+    req.num_computed_tokens = 0
+
+    # Vanilla chunked prefill step: 100 of 192 tokens, no epic entry.
+    so = _empty_output({req.request_id: 100})
+    sched._update_after_schedule(so)  # must not raise.
+    assert req.num_computed_tokens == 100
+
+
 def test_update_after_schedule_default_advance_unchanged():
     sched = create_scheduler()
     reqs = create_requests(num_requests=1, num_tokens=192)

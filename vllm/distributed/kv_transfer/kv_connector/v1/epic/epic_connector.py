@@ -285,6 +285,24 @@ class EpicConnector(KVConnectorBase_V1):
         # that are always recomputed (the boundary stitch). DESIGN §4.1.
         self._link_tokens: int = int(extra.get("epic_link_tokens", 8))
 
+        # --- Sparse scheduling-budget guard ---------------------------------
+        # The sparse override rewrites num_scheduled_tokens AFTER the scheduler
+        # ran its token-budget / long-prefill truncation, and the sparse plan is
+        # only correct for a ONE-STEP prefill of the full remaining prompt. So
+        # the connector must decline the sparse branch whenever the scheduler
+        # would truncate: (a) the pre-override row count N-external must fit the
+        # per-step token budget, and (b) the post-override |M| must too (M can
+        # exceed N-external by the link tokens overlapping reused B). Mirrors
+        # Scheduler.max_num_scheduled_tokens; 0 disables the guard (tests).
+        sched = vllm_config.scheduler_config
+        self._max_sparse_rows: int = int(
+            getattr(sched, "max_num_scheduled_tokens", None)
+            or sched.max_num_batched_tokens
+        )
+        self._long_prefill_threshold: int = int(
+            getattr(sched, "long_prefill_token_threshold", 0) or 0
+        )
+
         # --- DIAGNOSTIC: worker load fidelity self-check (default OFF) ------
         # When ``epic_debug_check_load`` is on, the worker re-reads the dst KV
         # slots IMMEDIATELY after scatter and compares them to the source
@@ -330,6 +348,13 @@ class EpicConnector(KVConnectorBase_V1):
         # (is_sparse_request / get_sparse_computed_advance) and cleared per step
         # in build_connector_meta. Empty when sparse forward is off.
         self._sparse_reqs: dict[str, tuple[int, int]] = {}
+        # Scheduler-side: req_id -> native num_computed_tokens at match time.
+        # Positions [0, nc) hold EXACT KV from the native prefix cache (whose
+        # blocks may be SHARED with other live requests), so build_connector_meta
+        # trims every chunk load below nc: loading position-independent
+        # (approximate) store KV there would downgrade this request AND poison
+        # the shared blocks for everyone else. Cleared per step.
+        self._native_computed: dict[str, int] = {}
 
         # Phase 2a fusion-mask: enable installing the LegoLink FlexAttention
         # mask_mod. OFF by default so Phase 1 behavior (backend default causal)
@@ -553,6 +578,50 @@ class EpicConnector(KVConnectorBase_V1):
         )
         return self._index
 
+    @staticmethod
+    def _effective_selection(
+        sel: "ReuseSelection", num_computed_tokens: int
+    ) -> "ReuseSelection":
+        """Fold the NATIVE prefix-cache extent into the selection (sparse mode).
+
+        Positions [0, num_computed_tokens) already hold EXACT KV in the native
+        prefix cache -- better than anything the chunk store can offer. So for
+        M-derivation / external accounting the effective reused prefix A is
+        ``max(store prefix extent, native extent)`` (the user-approved
+        "cached_end == dynamic prefix extent" framing): this keeps natively
+        computed positions out of M (no pointless recompute, no writes into
+        shared native blocks) and lets the sparse path engage even when A is
+        cached ONLY natively (store-evicted). Non-prefix hits overlapping the
+        native extent are clamped to their part above it, carrying the head
+        trim in ``src_offset`` so the worker loads only the uncovered tail.
+        Pure function; safe under the multiple-calls-per-request contract.
+        """
+        nc = max(0, int(num_computed_tokens))
+        eff_prefix = max(int(sel.prefix_extent), nc)
+        if eff_prefix == sel.prefix_extent:
+            return sel
+        hits: list[NonPrefixHit] = []
+        for h in sel.non_prefix_hits:
+            lo = int(h.prompt_offset)
+            hi = lo + max(0, int(h.length))
+            if hi <= eff_prefix:
+                continue  # fully covered by exact native KV -> nothing to load.
+            new_lo = max(lo, eff_prefix)
+            hits.append(
+                NonPrefixHit(
+                    chunk_hash=h.chunk_hash,
+                    prompt_offset=new_lo,
+                    old_pos_start=h.old_pos_start,
+                    length=hi - new_lo,
+                    src_offset=int(h.src_offset) + (new_lo - lo),
+                )
+            )
+        return ReuseSelection(
+            prefix_chunks=list(sel.prefix_chunks),
+            prefix_extent=eff_prefix,
+            non_prefix_hits=hits,
+        )
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -572,6 +641,12 @@ class EpicConnector(KVConnectorBase_V1):
         sel = self._selection.select(
             request, num_computed_tokens, self._membership(), chunks
         )
+
+        # Sparse mode: fold the native prefix extent in (see helper docstring)
+        # BEFORE anything downstream (hit records, M-derivation stash, external
+        # accounting) so every consumer sees one consistent selection.
+        if self._sparse_forward:
+            sel = self._effective_selection(sel, num_computed_tokens)
 
         self._non_prefix[request.request_id] = sel.non_prefix_hits
         # Stash the full selection for sparse-M derivation in build_connector_meta
@@ -624,11 +699,14 @@ class EpicConnector(KVConnectorBase_V1):
             # store-length overestimate so external never exceeds N (assert :624).
             external = min(external, n)
             num_new = max(0, external - num_computed_tokens)
-            if 0 < external < n and num_new > 0:
+            if 0 < external < n and num_new > 0 and self._sparse_fits_budget(
+                request, sel, n, external
+            ):
                 # Mark this request sparse for the scheduler hooks; remember N
                 # and external so the advance (N-external) can be derived later.
                 self._matched_prefix[request.request_id] = sel.prefix_chunks
                 self._sparse_reqs[request.request_id] = (n, external)
+                self._native_computed[request.request_id] = num_computed_tokens
                 # EPIC fix (root cause): the non-prefix B chunks counted into
                 # ``external`` are treated as computed by the scheduler, so they
                 # are NEVER forwarded. Their KV therefore MUST be loaded into the
@@ -660,8 +738,12 @@ class EpicConnector(KVConnectorBase_V1):
                 # Phase 1 loads (prefix chunks) still happen synchronously in
                 # start_load_kv; non-prefix B loading now happens there too.
                 return num_new, False
-            # external == n (fully cached) or no genuinely-new tokens: fall
-            # through to the prefix-only path (dense), which handles num_new==0.
+            # external == n (fully cached), no genuinely-new tokens, or the
+            # one-step sparse prefill does not fit the scheduler token budget:
+            # fall through to the prefix-only path (dense), which handles
+            # num_new==0. _emit_sparse will NOT fire for this request because
+            # no _sparse_reqs entry was registered (match time is the single
+            # source of truth for "is sparse").
 
         # Report only the part of the prefix extent beyond what vLLM computed.
         # Align to block_size (chunk_size already is a block multiple, so the
@@ -672,8 +754,55 @@ class EpicConnector(KVConnectorBase_V1):
             return 0, False
 
         self._matched_prefix[request.request_id] = sel.prefix_chunks
+        self._native_computed[request.request_id] = num_computed_tokens
         # Phase 1 loads synchronously inside start_load_kv -> async = False.
         return num_new, False
+
+    def _sparse_fits_budget(
+        self,
+        request: "Request",
+        sel: "ReuseSelection",
+        n: int,
+        external: int,
+    ) -> bool:
+        """Whether a ONE-STEP sparse prefill of this request fits the scheduler.
+
+        The sparse plan is only valid when the scheduler schedules the FULL
+        remaining prompt (N - external rows pre-override) in a single step and
+        the runner then forwards |M| rows post-override. If either exceeds the
+        per-step token budget (or the long-prefill threshold would truncate),
+        the scheduler would chunk the prefill, the allocated blocks would not
+        cover [0, N), and the stamped full-M positions would index out of
+        range -- so decline sparse here and fall back to prefix-only reuse.
+        """
+        budget = int(getattr(self, "_max_sparse_rows", 0) or 0)
+        threshold = int(getattr(self, "_long_prefill_threshold", 0) or 0)
+        if budget <= 0 and threshold <= 0:
+            return True  # no limits configured (unit-test connectors).
+
+        rows_pre = n - external  # rows the scheduler budgets BEFORE override.
+        plan = self._recompute.plan_recompute(
+            request=request, selection=sel, block_size=self._block_size
+        )
+        rows_post = len(plan.recompute_offsets)  # |M|, forwarded after override.
+        fits = (
+            budget <= 0 or (rows_pre <= budget and rows_post <= budget)
+        ) and (threshold <= 0 or rows_pre <= threshold)
+        if not fits:
+            logger.warning(
+                "EPIC sparse declined req=%s: one-step prefill does not fit "
+                "the scheduler budget (N=%d external=%d rows_pre=%d |M|=%d "
+                "budget=%d long_prefill_threshold=%d); falling back to "
+                "prefix-only reuse.",
+                request.request_id,
+                n,
+                external,
+                rows_pre,
+                rows_post,
+                budget,
+                threshold,
+            )
+        return fits
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -711,19 +840,29 @@ class EpicConnector(KVConnectorBase_V1):
             # ---- loads ----
             if req_id in self._loads_pending:
                 prefix_chunks = self._matched_prefix.get(req_id, [])
+                # Native-computed trim: positions [0, nc) hold EXACT KV in the
+                # native prefix cache (possibly in blocks SHARED with other
+                # requests). Never scatter approximate store KV there -- skip
+                # chunks fully below nc and head-trim chunks straddling it.
+                nc = self._native_computed.get(req_id, 0)
                 load = EpicReqLoad(req_id=req_id)
                 for chunk_hash, start_token in prefix_chunks:
-                    length = self._chunk_size
+                    if start_token + self._chunk_size <= nc:
+                        continue  # fully covered by exact native KV.
+                    src_off = max(0, nc - start_token)
+                    load_start = start_token + src_off
+                    length = self._chunk_size - src_off
                     dst_slots = _slot_ids_from_blocks(
-                        block_ids, self._block_size, start_token, length
+                        block_ids, self._block_size, load_start, length
                     )
                     load.chunks.append(
                         ChunkLoadSpec(
                             chunk_hash=chunk_hash,
                             dst_slot_ids=dst_slots,
                             old_pos_start=-1,  # resolved on worker from store
-                            new_pos_start=start_token,
+                            new_pos_start=load_start,
                             length=length,
+                            src_offset=src_off,
                         )
                     )
                 # EPIC fix (root cause): in sparse mode the non-prefix B chunks
@@ -754,6 +893,10 @@ class EpicConnector(KVConnectorBase_V1):
                                 old_pos_start=-1,  # resolved on worker from store
                                 new_pos_start=int(h.prompt_offset),
                                 length=length,
+                                # Head trim carried from _effective_selection
+                                # (hit clamped to its part above the native
+                                # extent): skip that many stored tokens.
+                                src_offset=int(getattr(h, "src_offset", 0)),
                             )
                         )
                     # Always keep the raw hit record (observability / non-sparse).
@@ -849,6 +992,7 @@ class EpicConnector(KVConnectorBase_V1):
         self._non_prefix.clear()
         self._selections.clear()
         self._sparse_reqs.clear()
+        self._native_computed.clear()
         return meta
 
     def _emit_sparse(
@@ -868,22 +1012,36 @@ class EpicConnector(KVConnectorBase_V1):
         if n == 0:
             return None
 
-        # Use the selection recorded at match time if available; otherwise fall
-        # back to a fresh side-effect-free selection so M can still be derived.
+        # EPIC fix (consistency, root cause): match time is the SINGLE source of
+        # truth for "is sparse". Emit only for requests that
+        # get_num_new_matched_tokens actually REGISTERED sparse this step
+        # (_sparse_reqs). Deriving M here from a fresh/stashed selection for an
+        # unregistered request used to emit a plan whose external was never
+        # counted by the scheduler -> computed_advance defaulted to N-0 -> the
+        # post-schedule length invariant (num_computed != N) raised and killed
+        # the engine. Cases that fall out naturally now: sparse branch declined
+        # (external==N, num_new<=0, budget guard), pure-new prompts, and
+        # requests whose match ran in an earlier (deferred) step.
+        rec = self._sparse_reqs.get(req_id)
+        if rec is None:
+            return None
+
+        # The selection recorded at match time. Registration always stashes it
+        # (same code path); a missing entry means scheduler-side state was
+        # corrupted -- refuse to emit rather than derive M from a fresh select
+        # that may disagree with the counted external.
         sel = self._selections.get(req_id)
         if sel is None:
-            chunks = self._split_prompt_into_chunks(token_ids)
-            # Scheduler-side: query the mirror index, never the worker store.
-            sel = self._selection.select(None, 0, self._membership(), chunks)  # type: ignore[arg-type]
+            logger.error(
+                "EPIC sparse emit skipped req=%s: registered sparse but no "
+                "stashed selection (connector state bug); forwarding dense.",
+                req_id,
+            )
+            return None
 
-        # EPIC fix (consistency): only emit a sparse plan when there is at least
-        # one non-prefix B hit. This matches the scheduler-side condition that
-        # registered the request as sparse (get_num_new_matched_tokens takes the
-        # sparse branch only when ``sel.non_prefix_hits`` is non-empty). Without
-        # this guard a pure-new prompt (no reuse) would emit M == every token and
-        # degenerate into a full-sequence "sparse" forward that the scheduler
-        # never marked sparse -> the two conditions diverge and M=all fires a
-        # needless single-batch gate. No non-prefix hits -> dense (None).
+        # Defensive: registration requires non-prefix hits, so this cannot
+        # trigger unless the stash was mutated. Dense (None) keeps the
+        # scheduler/runner consistent either way.
         if not sel.non_prefix_hits:
             logger.info(
                 "EPIC sparse skip req=%s: no non-prefix hits -> dense forward",
@@ -905,13 +1063,10 @@ class EpicConnector(KVConnectorBase_V1):
         seq_len = plan.seq_len or n
         # computed_advance = N - external. ``external`` is what the scheduler
         # already counted via num_external_computed_tokens (= |A|+|B|), recorded
-        # in _sparse_reqs by get_num_new_matched_tokens. If this request did not
-        # go through the sparse match path (e.g. _emit_sparse fired but external
-        # was never recorded), fall back to seq_len so num_computed still lands
-        # at N when external==0. Advancing by this (not len(M)) avoids double-
-        # counting the link/last M tokens that overlap reused B positions.
-        rec = getattr(self, "_sparse_reqs", {}).get(req_id)
-        external = rec[1] if rec is not None else 0
+        # in _sparse_reqs by get_num_new_matched_tokens (guaranteed present by
+        # the registration guard above). Advancing by this (not len(M)) avoids
+        # double-counting the link/last M tokens that overlap reused B positions.
+        external = rec[1]
         computed_advance = max(0, seq_len - external)
 
         logger.info(
@@ -1249,7 +1404,10 @@ class EpicConnector(KVConnectorBase_V1):
         return list(layers.keys())
 
     def _load_chunk(self, stored: StoredChunk, spec: ChunkLoadSpec) -> None:
-        length = min(stored.length, spec.length)
+        # Head trim (native-computed-region protection): skip the first
+        # ``src_offset`` stored tokens; they are covered by exact native KV.
+        src_off = max(0, int(getattr(spec, "src_offset", 0)))
+        length = min(max(0, stored.length - src_off), spec.length)
         if length == 0:
             return
         if getattr(self, "_debug_counters", False):
@@ -1259,19 +1417,22 @@ class EpicConnector(KVConnectorBase_V1):
         # keeps the check inert (off) on those partially-built instances.
         debug_check = getattr(self, "_debug_check_load", False)
         check_done = getattr(self, "_check_load_done", True)
-        # Destination slots and positions.
+        # Destination slots and positions. new_pos_start already points at the
+        # FIRST loaded (post-trim) token, so only the source side is offset.
         new_positions = torch.arange(
             spec.new_pos_start, spec.new_pos_start + length, dtype=torch.int64
         )
-        old_positions = stored.old_positions[:length].to(torch.int64)
+        old_positions = stored.old_positions[src_off : src_off + length].to(
+            torch.int64
+        )
 
         for layer_name in self._layer_names:
             kv_cache = self._kv_caches.get(layer_name)
             if kv_cache is None or layer_name not in stored.k_per_layer:
                 continue
             device = kv_cache.device
-            k_cpu = stored.k_per_layer[layer_name][:length]
-            v_cpu = stored.v_per_layer[layer_name][:length]
+            k_cpu = stored.k_per_layer[layer_name][src_off : src_off + length]
+            v_cpu = stored.v_per_layer[layer_name][src_off : src_off + length]
             k = k_cpu.to(device, non_blocking=True)
             v = v_cpu.to(device, non_blocking=True)
 

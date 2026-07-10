@@ -100,6 +100,9 @@ def _make_connector(*, sparse: bool, link: int = 8, store=None):
     c._loads_pending = {}
     c._selections = {}
     c._sparse_reqs = {}
+    c._native_computed = {}
+    c._max_sparse_rows = 0  # 0 == no budget limit (unit tests)
+    c._long_prefill_threshold = 0
     c._sparse_forward = sparse
     c._link_tokens = link
     c._selection = EpicSelection()
@@ -188,6 +191,12 @@ def test_flag_on_non_prefix_reuse_emits_sparse_subset():
 
     tokens = chunk0 + chunk1 + chunk2  # N = 192
     n = len(tokens)
+    # Real flow: the scheduler asks for matches FIRST; only a request the match
+    # step actually REGISTERED sparse may emit a plan (consistency guard --
+    # _emit_sparse refuses requests without a _sparse_reqs record).
+    ext, _ = c.get_num_new_matched_tokens(_Req("r0", tokens), 0)
+    assert ext == CHUNK  # external == |B| (chunk1)
+    assert "r0" in c._sparse_reqs
     sout = _SchedOut(
         scheduled_new_reqs=[_NewReq("r0", tokens, _block_ids_for(n))],
         num_scheduled_tokens={"r0": n},
@@ -593,3 +602,232 @@ def test_accounting_external_le_n_and_num_new_positive():
             assert all(0 <= p < n for p in positions)
             # advance converges num_computed (= external) onto N.
             assert external + advance == n, (layout, link, external, advance, n)
+
+
+# --------------------------------------------------------------------------
+# Infix-scenario fixes: emit/registration consistency, budget guard, and the
+# native-computed-region protection (effective prefix + load trimming).
+# --------------------------------------------------------------------------
+
+
+def test_emit_sparse_requires_match_registration():
+    """_emit_sparse must emit ONLY for requests the match step registered
+    sparse (_sparse_reqs). A stashed selection alone (e.g. a declined sparse
+    branch) must NOT produce a plan -- emitting one stamps computed_advance
+    against an external the scheduler never counted, which trips the
+    post-schedule length invariant and kills the engine."""
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    c = _make_connector(sparse=True, link=8, store=store)
+
+    chunk_b = list(range(1000, 1000 + CHUNK))
+    _store_chunk(store, chunk_b)
+    tokens = list(range(0, CHUNK)) + chunk_b + list(range(2000, 2000 + CHUNK))
+
+    # Simulate "match ran but the sparse branch was declined": selection is
+    # stashed, but no _sparse_reqs registration.
+    ext, _ = c.get_num_new_matched_tokens(_Req("r0", tokens), 0)
+    assert "r0" in c._sparse_reqs
+    del c._sparse_reqs["r0"]  # decline happened (budget / external==N / etc.)
+    assert "r0" in c._selections  # stash still present
+
+    sout = _SchedOut(
+        scheduled_new_reqs=[_NewReq("r0", tokens, _block_ids_for(len(tokens)))],
+        num_scheduled_tokens={"r0": len(tokens) - ext},
+    )
+    meta = c.build_connector_meta(sout)
+    assert meta.sparse == []  # no registration -> no emission, dense step.
+
+
+def test_budget_guard_declines_sparse_when_prefill_would_be_chunked():
+    """When the one-step sparse prefill cannot fit the scheduler token budget
+    (N - external > budget or |M| > budget), the connector must decline the
+    sparse branch entirely: no external report from the hits, no _sparse_reqs
+    registration, no sparse emission -- a plain dense prefill."""
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    c = _make_connector(sparse=True, link=8, store=store)
+    c._max_sparse_rows = 32  # << N - external (=128) -> must decline.
+
+    chunk_b = list(range(1000, 1000 + CHUNK))
+    _store_chunk(store, chunk_b)
+    tokens = list(range(0, CHUNK)) + chunk_b + list(range(2000, 2000 + CHUNK))
+    n = len(tokens)
+
+    ext, _ = c.get_num_new_matched_tokens(_Req("r0", tokens), 0)
+    assert ext == 0  # no prefix hit; sparse declined -> nothing external.
+    assert "r0" not in c._sparse_reqs
+
+    sout = _SchedOut(
+        scheduled_new_reqs=[_NewReq("r0", tokens, _block_ids_for(n))],
+        num_scheduled_tokens={"r0": n},
+    )
+    meta = c.build_connector_meta(sout)
+    assert meta.sparse == []
+    assert meta.loads == []  # nothing counted external -> nothing to load.
+
+
+def test_budget_guard_respects_long_prefill_threshold():
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    c = _make_connector(sparse=True, link=8, store=store)
+    c._long_prefill_threshold = 32  # < N - external -> scheduler would chunk.
+
+    chunk_b = list(range(1000, 1000 + CHUNK))
+    _store_chunk(store, chunk_b)
+    tokens = list(range(0, CHUNK)) + chunk_b + list(range(2000, 2000 + CHUNK))
+
+    ext, _ = c.get_num_new_matched_tokens(_Req("r0", tokens), 0)
+    assert ext == 0
+    assert "r0" not in c._sparse_reqs
+
+
+def test_budget_guard_allows_fitting_sparse():
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    c = _make_connector(sparse=True, link=8, store=store)
+    c._max_sparse_rows = 4096  # plenty -> sparse engages normally.
+
+    chunk_b = list(range(1000, 1000 + CHUNK))
+    _store_chunk(store, chunk_b)
+    tokens = list(range(0, CHUNK)) + chunk_b + list(range(2000, 2000 + CHUNK))
+
+    ext, _ = c.get_num_new_matched_tokens(_Req("r0", tokens), 0)
+    assert ext == CHUNK
+    assert "r0" in c._sparse_reqs
+
+
+def test_native_prefix_extends_effective_prefix_and_keeps_native_out_of_m():
+    """User scenario: A is cached ONLY in the native prefix cache (chunk store
+    may or may not hold it). With num_computed_tokens = |A| the effective
+    prefix must cover A, so (a) the sparse branch engages off the native
+    extent, (b) A's positions never enter M, and (c) accounting still lands
+    num_computed on N."""
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    c = _make_connector(sparse=True, link=8, store=store)
+
+    # Prompt: A (1 chunk, NOT in the store -- native only) + X (new) +
+    # B (file chunk, in store) + tail (new).
+    a = list(range(0, CHUNK))
+    x = list(range(5000, 5000 + CHUNK))
+    b = list(range(1000, 1000 + CHUNK))
+    tail = list(range(2000, 2000 + CHUNK))
+    _store_chunk(store, b)
+    tokens = a + x + b + tail
+    n = len(tokens)
+    nc = CHUNK  # native prefix cache covers exactly A.
+
+    num_new, _ = c.get_num_new_matched_tokens(_Req("r0", tokens), nc)
+    # effective prefix = nc, external = nc + |B|, num_new = external - nc = |B|.
+    assert "r0" in c._sparse_reqs
+    assert c._sparse_reqs["r0"] == (n, nc + CHUNK)
+    assert num_new == CHUNK
+
+    sout = _SchedOut(
+        scheduled_new_reqs=[_NewReq("r0", tokens, _block_ids_for(n))],
+        num_scheduled_tokens={"r0": n - (nc + CHUNK)},
+    )
+    meta = c.build_connector_meta(sout)
+    assert len(meta.sparse) == 1
+    m = set(meta.sparse[0].sparse_positions)
+    # A (native) never in M; X fully in M; B only its link head; tail fully.
+    assert m.isdisjoint(range(0, CHUNK))
+    assert set(range(CHUNK, 2 * CHUNK)) <= m
+    assert set(range(2 * CHUNK, 2 * CHUNK + 8)) <= m
+    assert (2 * CHUNK + 8) not in m
+    assert set(range(3 * CHUNK, n)) <= m
+    # advance converges onto N.
+    assert meta.sparse[0].computed_advance == n - (nc + CHUNK)
+
+
+def test_native_computed_trims_prefix_chunk_loads():
+    """Chunk loads must never scatter into positions below the native computed
+    extent: those blocks hold EXACT KV and may be SHARED with other requests
+    (poisoning risk). A prefix chunk fully below nc is skipped; one straddling
+    nc is head-trimmed with src_offset."""
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    c = _make_connector(sparse=True, link=8, store=store)
+
+    # Store TWO contiguous prefix chunks + one non-prefix file chunk.
+    p0 = list(range(0, CHUNK))
+    p1 = list(range(64, 64 + CHUNK))
+    b = list(range(1000, 1000 + CHUNK))
+    for t in (p0, p1, b):
+        _store_chunk(store, t)
+    x = list(range(5000, 5000 + CHUNK))  # new segment between prefix and B
+    tokens = p0 + p1 + x + b + list(range(2000, 2000 + CHUNK))
+    n = len(tokens)
+
+    # Native cache covers p0 entirely plus HALF of p1 (block-aligned 96).
+    nc = CHUNK + CHUNK // 2
+    num_new, _ = c.get_num_new_matched_tokens(_Req("r0", tokens), nc)
+    # store prefix extent (128) > nc (96) -> effective prefix stays 128.
+    assert c._sparse_reqs["r0"] == (n, 2 * CHUNK + CHUNK)
+
+    sout = _SchedOut(
+        scheduled_new_reqs=[_NewReq("r0", tokens, _block_ids_for(n))],
+        num_scheduled_tokens={"r0": n - (2 * CHUNK + CHUNK)},
+    )
+    meta = c.build_connector_meta(sout)
+    assert len(meta.loads) == 1
+    specs = {s.new_pos_start: s for s in meta.loads[0].chunks}
+    # p0 fully below nc=96 -> NO load emitted for position 0.
+    assert 0 not in specs
+    # p1 straddles nc: trimmed to [96, 128), src_offset = 96-64 = 32.
+    assert 96 in specs
+    assert specs[96].src_offset == CHUNK // 2
+    assert specs[96].length == CHUNK // 2
+    assert len(specs[96].dst_slot_ids) == CHUNK // 2
+    # B (non-prefix) is fully above nc -> untrimmed.
+    assert 3 * CHUNK in specs
+    assert specs[3 * CHUNK].src_offset == 0
+    assert specs[3 * CHUNK].length == CHUNK
+
+
+def test_load_chunk_applies_src_offset():
+    """Worker side: _load_chunk must read stored K/V/old_positions from
+    src_offset onward, so a head-trimmed spec lands the chunk TAIL at the
+    trimmed destination slots."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.epic_connector import (
+        check_scatter_fidelity,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.metadata import (
+        ChunkLoadSpec,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.reuse_strategy import (
+        IdentityAlignment,
+    )
+
+    heads, hd = 1, 4
+    kv_cache = torch.zeros(2, 8, BLOCK, heads, hd)
+
+    length, src_off = 32, 8
+    stored = StoredChunk(
+        chunk_hash="h",
+        length=length,
+        old_positions=torch.arange(length, dtype=torch.int64),
+    )
+    k_src = torch.randn(length, heads, hd)
+    v_src = torch.randn(length, heads, hd)
+    stored.k_per_layer["l0"] = k_src
+    stored.v_per_layer["l0"] = v_src
+
+    w = object.__new__(EpicConnector)
+    w._layer_names = ["l0"]
+    w._kv_caches = {"l0": kv_cache}
+    w._alignment = IdentityAlignment()  # isolate the src trim from PIC math.
+    w._store = None
+
+    dst_slots = list(range(40, 40 + (length - src_off)))
+    spec = ChunkLoadSpec(
+        chunk_hash="h",
+        dst_slot_ids=dst_slots,
+        old_pos_start=-1,
+        new_pos_start=src_off,
+        length=length - src_off,
+        src_offset=src_off,
+    )
+    w._load_chunk(stored, spec)
+
+    res = check_scatter_fidelity(
+        kv_cache, k_src[src_off:], v_src[src_off:], dst_slots
+    )
+    assert res is not None
+    k_ok, _, v_ok, _ = res
+    assert k_ok and v_ok
