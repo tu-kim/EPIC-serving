@@ -118,6 +118,24 @@ class EpicReqSparse:
 
 
 @dataclass
+class EpicReqPrefetch:
+    """A prefetch directive: stage these cached chunks on the worker's GPU.
+
+    Produced by the scheduler-side connector from external hints (the previous
+    turn's parsed tool calls, routed by the frontend/dynamo scheduler) and
+    consumed by the worker in ``start_load_kv`` BEFORE any loads: matching
+    chunks are copied CPU -> GPU on a side stream so a subsequent request's
+    ``_load_chunk`` finds them staged (H2D already paid). Pure strings/ints ->
+    pickle-safe across the scheduler->worker boundary.
+    """
+
+    chunk_hashes: list[str] = field(default_factory=list)
+    # Target worker/replica id as assigned by the frontend scheduler (the
+    # connector's ``epic_worker_id`` extra-config). -1 == every worker stages.
+    dst_worker: int = -1
+
+
+@dataclass
 class FusionMaskPlan:
     """Per-step LegoLink fusion-mask data for the FlexAttention backend.
 
@@ -157,6 +175,9 @@ class EpicConnectorMetadata(KVConnectorMetadata):
     # Per-request sparse-forward descriptors (Phase 2b, S0 plumbing). Empty when
     # epic_sparse_forward is off -> Phase 1/2a behavior unchanged.
     sparse: list[EpicReqSparse] = field(default_factory=list)
+    # Prefetch directives drained from the scheduler-side queue this step.
+    # Empty unless the frontend enqueued prefetches -> behavior unchanged.
+    prefetches: list[EpicReqPrefetch] = field(default_factory=list)
 
     def add_load(self, load: EpicReqLoad) -> None:
         self.loads.append(load)
@@ -166,3 +187,6 @@ class EpicConnectorMetadata(KVConnectorMetadata):
 
     def add_sparse(self, sparse: EpicReqSparse) -> None:
         self.sparse.append(sparse)
+
+    def add_prefetch(self, prefetch: EpicReqPrefetch) -> None:
+        self.prefetches.append(prefetch)

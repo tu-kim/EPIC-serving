@@ -21,6 +21,7 @@ NOT done in Phase 1 (see epic/PHASE2.md): selective recompute (recomp_ratio /
 imp_indices), partial-mask fusion attention, sparse (non-prefix) forward.
 """
 
+import threading
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -41,12 +42,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.epic.metadata import (
     ChunkLoadSpec,
     EpicConnectorMetadata,
     EpicReqLoad,
+    EpicReqPrefetch,
     EpicReqSave,
     EpicReqSparse,
     FusionMaskPlan,
     NonPrefixHit,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.pic import PICRotator
+from vllm.distributed.kv_transfer.kv_connector.v1.epic.prefetch import (
+    EpicGpuStagingStore,
+    StagedChunk,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.reuse_strategy import (
     AlignmentStrategy,
     EpicSelection,
@@ -175,6 +181,14 @@ class EpicConnector(KVConnectorBase_V1):
         "check_load_calls": 0,
         "check_load_mismatch": 0,
         "check_load_skip": 0,
+        # Prefetch (feature/prefetch) engagement:
+        #   prefetch_staged -> chunks copied CPU->GPU by a prefetch directive
+        #   prefetch_hit    -> _load_chunk served K/V from the GPU staging store
+        #   prefetch_miss   -> staging enabled but the chunk was not staged
+        #                      (fell back to the CPU fileKV store)
+        "prefetch_staged": 0,
+        "prefetch_hit": 0,
+        "prefetch_miss": 0,
     }
 
     # EPIC diagnostics: per-request SELECTION summary so a probe (musique_blend)
@@ -303,6 +317,23 @@ class EpicConnector(KVConnectorBase_V1):
             getattr(sched, "long_prefill_token_threshold", 0) or 0
         )
 
+        # --- fileKV prefetch (feature/prefetch) -----------------------------
+        # epic_prefetch_gpu_bytes > 0 enables the worker-side GPU staging store
+        # (H2D latency hiding); 0 (default) keeps prefetch fully inert.
+        # epic_worker_id is this worker/replica's identity as the frontend
+        # (dynamo) scheduler knows it; prefetch directives carry a dst_worker
+        # and only the matching worker stages (-1 directives match everyone).
+        self._prefetch_gpu_bytes: int = int(
+            extra.get("epic_prefetch_gpu_bytes", 0)
+        )
+        self._worker_id: int = int(extra.get("epic_worker_id", -1))
+        # Scheduler-side prefetch directive queue, fed by enqueue_prefetch()
+        # (possibly from a frontend thread) and drained into the connector
+        # metadata each build_connector_meta. Lock-guarded: the enqueue may
+        # come from outside the engine-core loop.
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_queue: list[EpicReqPrefetch] = []
+
         # --- DIAGNOSTIC: worker load fidelity self-check (default OFF) ------
         # When ``epic_debug_check_load`` is on, the worker re-reads the dst KV
         # slots IMMEDIATELY after scatter and compares them to the source
@@ -373,6 +404,12 @@ class EpicConnector(KVConnectorBase_V1):
         self._alignment: AlignmentStrategy | None = None
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._layer_names: list[str] = []
+        # Worker-side GPU staging store for prefetched fileKV chunks. None when
+        # prefetch is disabled (epic_prefetch_gpu_bytes == 0) -> load path
+        # byte-for-byte unchanged.
+        self._staging: EpicGpuStagingStore | None = None
+        if role == KVConnectorRole.WORKER and self._prefetch_gpu_bytes > 0:
+            self._staging = EpicGpuStagingStore(self._prefetch_gpu_bytes)
         # Worker-side fusion-mask builder (owns fixed-size mask tensors + the
         # single stable mask_mod object). Built lazily on first install.
         self._mask_builder: LegoLinkMaskBuilder | None = None
@@ -819,10 +856,82 @@ class EpicConnector(KVConnectorBase_V1):
         ):
             self._loads_pending[request.request_id] = request
 
+    # ===================== prefetch API (scheduler side) =====================
+
+    def enqueue_prefetch(
+        self,
+        chunk_hashes: list[str] | None = None,
+        token_ids: list[int] | None = None,
+        dst_worker: int = -1,
+    ) -> list[str]:
+        """Queue fileKV chunks for GPU staging on a designated worker.
+
+        Entry point for the agentic prefetch loop: the frontend parses the
+        previous turn's tool calls (see ``prefetch_parser.FileKVPrefetcher``),
+        learns which files the next turn will read and WHICH worker/replica
+        will serve it (dynamo scheduler's placement decision), and calls this
+        on that engine's SCHEDULER-role connector. The directive rides the
+        next step's connector metadata to the workers, which copy the chunks
+        CPU -> GPU on a side stream -- so by the time the next turn's prefill
+        issues its loads, the H2D latency is already hidden.
+
+        Args:
+            chunk_hashes: content hashes to stage (already grid-aligned).
+            token_ids: alternatively, raw token ids of the (grid-aligned)
+                rendered file text; full chunks are hashed with the
+                connector's own chunk grid.
+            dst_worker: the frontend-assigned worker/replica id that should
+                stage (matched against ``epic_worker_id``); -1 = every worker.
+
+        Returns the hashes actually queued. Unknown hashes (not in the store
+        index -- e.g. the warm request has not run yet) are dropped with a log:
+        a prefetch can only stage what the fileKV store already holds.
+        Thread-safe; callable from outside the engine-core loop.
+        """
+        hashes: list[str] = list(chunk_hashes or [])
+        if token_ids:
+            hashes.extend(
+                h
+                for _, _, h in self._split_prompt_into_chunks(list(token_ids))
+            )
+        unique = list(dict.fromkeys(hashes))
+        index = self._membership()
+        known = [h for h in unique if index.contains(h)]
+        if len(known) < len(unique):
+            logger.info(
+                "EPIC prefetch: dropped %d/%d unknown chunk hashes (not in the "
+                "fileKV store index; warm them first).",
+                len(unique) - len(known),
+                len(unique),
+            )
+        if not known:
+            return []
+        with self._prefetch_lock:
+            self._prefetch_queue.append(
+                EpicReqPrefetch(chunk_hashes=known, dst_worker=int(dst_worker))
+            )
+        logger.info(
+            "EPIC prefetch: queued %d chunks for worker %d.",
+            len(known),
+            int(dst_worker),
+        )
+        return known
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         meta = EpicConnectorMetadata()
+
+        # ---- prefetch directives (feature/prefetch) ----
+        # Drain the externally-fed queue into this step's metadata so the
+        # workers see the directives exactly once. Inert when nothing was
+        # enqueued (and on unit-test connectors without the queue attribute).
+        if getattr(self, "_prefetch_queue", None):
+            with self._prefetch_lock:
+                pending = self._prefetch_queue
+                self._prefetch_queue = []
+            for directive in pending:
+                meta.add_prefetch(directive)
 
         for new_req in scheduler_output.scheduled_new_reqs:
             req_id = new_req.req_id
@@ -1257,6 +1366,13 @@ class EpicConnector(KVConnectorBase_V1):
         # the time the forward runs. Independent of whether there are loads.
         self._install_fusion_mask(forward_context, meta)
 
+        # Prefetch staging (feature/prefetch): issue async CPU->GPU copies for
+        # directive-matched chunks on the side stream. Runs BEFORE the loads so
+        # a same-step load can already consume the staged copy; typically the
+        # directive arrives steps earlier (during the previous turn's decode)
+        # and the copies fully overlap that compute.
+        self._consume_prefetches(meta)
+
         # DIAGNOSTIC: when check-load is requested, make the load path's state
         # unambiguous at WARNING level -- so "no check_load line" can be told
         # apart from "loads never ran" / "flag never reached the worker".
@@ -1284,9 +1400,16 @@ class EpicConnector(KVConnectorBase_V1):
         if not meta.loads or self._alignment is None or self._store is None:
             return
 
+        staging = getattr(self, "_staging", None)
         for load in meta.loads:
             for spec in load.chunks:
                 stored = self._store.get(spec.chunk_hash)
+                if stored is None and staging is not None:
+                    # CPU store evicted it but a prefetched GPU copy survives:
+                    # StagedChunk is duck-compatible with StoredChunk for the
+                    # fields _load_chunk reads (length / old_positions /
+                    # k_per_layer / v_per_layer), so serve from staging.
+                    stored = self._staging.get(spec.chunk_hash)
                 if stored is None:
                     # MIRROR DRIFT (non-fatal, loud): the scheduler's index said
                     # this chunk was cached and emitted a load for it, but the
@@ -1323,6 +1446,56 @@ class EpicConnector(KVConnectorBase_V1):
                     )
                     continue
                 self._load_chunk(stored, spec)
+
+    def _consume_prefetches(self, meta: EpicConnectorMetadata) -> None:
+        """Stage directive-matched chunks onto the GPU (feature/prefetch).
+
+        Worker side, called once per step from ``start_load_kv``. For every
+        prefetch directive addressed to this worker (``dst_worker`` matching
+        our ``epic_worker_id``, or -1 for broadcast), copy the chunk's K/V
+        from the CPU fileKV store into the GPU staging store on the dedicated
+        side stream. Non-blocking w.r.t. this step's forward; inert when
+        staging is disabled or no directives arrived.
+        """
+        staging = getattr(self, "_staging", None)
+        prefetches = getattr(meta, "prefetches", None)
+        if staging is None or not prefetches or self._store is None:
+            return
+        device: torch.device | None = None
+        for kv in self._kv_caches.values():
+            device = kv.device
+            break
+        if device is None:
+            return  # KV caches not registered yet; directive dropped (hint).
+
+        my_id = int(getattr(self, "_worker_id", -1))
+        staged = skipped = missing = 0
+        for directive in prefetches:
+            dst = int(directive.dst_worker)
+            if dst != -1 and my_id != -1 and dst != my_id:
+                skipped += len(directive.chunk_hashes)
+                continue  # addressed to a different worker/replica.
+            for h in directive.chunk_hashes:
+                if staging.contains(h):
+                    continue
+                stored = self._store.get(h)
+                if stored is None:
+                    missing += 1  # store evicted between enqueue and now.
+                    continue
+                staging.stage(stored, device)
+                staged += 1
+        if staged or missing or skipped:
+            logger.info(
+                "EPIC prefetch: staged=%d store_missing=%d other_worker=%d "
+                "staging_bytes=%d/%d",
+                staged,
+                missing,
+                skipped,
+                staging.current_bytes,
+                staging.capacity_bytes,
+            )
+        if staged and getattr(self, "_debug_counters", False):
+            self._bump_counter("prefetch_staged", staged)
 
     def _install_fusion_mask(
         self,
@@ -1403,7 +1576,9 @@ class EpicConnector(KVConnectorBase_V1):
         """
         return list(layers.keys())
 
-    def _load_chunk(self, stored: StoredChunk, spec: ChunkLoadSpec) -> None:
+    def _load_chunk(
+        self, stored: "StoredChunk | StagedChunk", spec: ChunkLoadSpec
+    ) -> None:
         # Head trim (native-computed-region protection): skip the first
         # ``src_offset`` stored tokens; they are covered by exact native KV.
         src_off = max(0, int(getattr(spec, "src_offset", 0)))
@@ -1426,15 +1601,38 @@ class EpicConnector(KVConnectorBase_V1):
             torch.int64
         )
 
+        # Prefetch fast path (feature/prefetch): if the chunk was staged on the
+        # GPU ahead of time, serve K/V from the staging store -- the H2D copy
+        # was already paid on the side stream (get() orders the current stream
+        # on the copy event). Miss -> CPU fileKV store copy, exactly as before.
+        staged: StagedChunk | None = None
+        staging = getattr(self, "_staging", None)
+        if staging is not None:
+            staged = staging.get(spec.chunk_hash)
+            if getattr(self, "_debug_counters", False):
+                self._bump_counter(
+                    "prefetch_hit" if staged is not None else "prefetch_miss"
+                )
+
         for layer_name in self._layer_names:
             kv_cache = self._kv_caches.get(layer_name)
             if kv_cache is None or layer_name not in stored.k_per_layer:
                 continue
             device = kv_cache.device
-            k_cpu = stored.k_per_layer[layer_name][src_off : src_off + length]
-            v_cpu = stored.v_per_layer[layer_name][src_off : src_off + length]
-            k = k_cpu.to(device, non_blocking=True)
-            v = v_cpu.to(device, non_blocking=True)
+            if staged is not None and layer_name in staged.k_per_layer:
+                # Already on-device; slicing is a view, and the PIC rotation
+                # below is out-of-place, so the staged copy stays pristine.
+                k = staged.k_per_layer[layer_name][src_off : src_off + length]
+                v = staged.v_per_layer[layer_name][src_off : src_off + length]
+            else:
+                k_cpu = stored.k_per_layer[layer_name][
+                    src_off : src_off + length
+                ]
+                v_cpu = stored.v_per_layer[layer_name][
+                    src_off : src_off + length
+                ]
+                k = k_cpu.to(device, non_blocking=True)
+                v = v_cpu.to(device, non_blocking=True)
 
             # AlignmentStrategy: EPIC = PIC delta re-rotary (no fake_q hack;
             # see pic.py). CacheBlend would plug IdentityAlignment here.

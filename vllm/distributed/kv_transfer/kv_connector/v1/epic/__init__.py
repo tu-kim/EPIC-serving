@@ -23,12 +23,22 @@ from vllm.distributed.kv_transfer.kv_connector.v1.epic.metadata import (
     ChunkLoadSpec,
     EpicConnectorMetadata,
     EpicReqLoad,
+    EpicReqPrefetch,
     EpicReqSave,
     EpicReqSparse,
     FusionMaskPlan,
     NonPrefixHit,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.pic import PICRotator
+from vllm.distributed.kv_transfer.kv_connector.v1.epic.prefetch import (
+    EpicGpuStagingStore,
+    StagedChunk,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.epic.prefetch_parser import (
+    FileKVPrefetcher,
+    ToolCallRead,
+    parse_tool_call_reads,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.reuse_strategy import (
     AlignmentStrategy,
     EpicSelection,
@@ -48,10 +58,17 @@ __all__ = [
     "EpicConnectorMetadata",
     "ChunkLoadSpec",
     "EpicReqLoad",
+    "EpicReqPrefetch",
     "EpicReqSave",
     "EpicReqSparse",
     "FusionMaskPlan",
     "NonPrefixHit",
+    # prefetch (feature/prefetch)
+    "EpicGpuStagingStore",
+    "StagedChunk",
+    "FileKVPrefetcher",
+    "ToolCallRead",
+    "parse_tool_call_reads",
     "FusionMaskTensors",
     "build_legolink_mask_mod",
     "EpicChunkStore",
