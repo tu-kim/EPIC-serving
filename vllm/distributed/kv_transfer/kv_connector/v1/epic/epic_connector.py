@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.chunk_store import (
+    ChainHasher,
     EpicChunkStore,
     EpicSchedulerIndex,
     StoredChunk,
@@ -339,7 +340,9 @@ class EpicConnector(KVConnectorBase_V1):
         # CacheBlend would swap alignment->Identity and recompute->dynamic.
         # Phase 1 routes selection through EpicSelection and alignment through
         # PicAlignment but is otherwise behaviorally identical to before.
-        self._selection: SelectionStrategy = EpicSelection()
+        self._selection: SelectionStrategy = EpicSelection(
+            strict_prefix_chain=self._sparse_forward
+        )
         # phase1_dense is the inverse of sparse_forward: when sparse is OFF the
         # policy short-circuits to an empty (dense) plan == Phase 1/2a.
         self._recompute: RecomputePolicy = LegoLinkRecompute(
@@ -555,18 +558,38 @@ class EpicConnector(KVConnectorBase_V1):
 
     def _split_prompt_into_chunks(
         self, token_ids: list[int]
-    ) -> list[tuple[int, int, str]]:
-        """Return [(start_token, length, chunk_hash), ...] for full chunks only.
+    ) -> list[tuple[int, int, str, str, str]]:
+        """Return [(start, length, chunk_hash, chain_before, chain_after), ...]
+        for full chunks only.
 
         Only emits whole ``chunk_size`` chunks (a trailing partial chunk is left
         to normal prefill); this keeps hashes position-independent and aligned.
+        ``chain_before``/``chain_after`` are the running context digests of
+        tokens [0, start) / [0, start+length) in THIS prompt (ChainHasher):
+        saves persist them as the chunk's save-time context, and selection
+        compares them against stored chains to decide whether a hit may fold
+        into the EXACT prefix (context-sound) or must stay a non-prefix hit
+        (EPIC link-stitched approximation).
         """
-        out: list[tuple[int, int, str]] = []
+        out: list[tuple[int, int, str, str, str]] = []
         n = len(token_ids)
         start = 0
+        hasher = ChainHasher()
+        chain_before = hasher.digest()
         while start + self._chunk_size <= n:
             chunk = token_ids[start : start + self._chunk_size]
-            out.append((start, self._chunk_size, hash_chunk_tokens(chunk)))
+            hasher.update(chunk)
+            chain_after = hasher.digest()
+            out.append(
+                (
+                    start,
+                    self._chunk_size,
+                    hash_chunk_tokens(chunk),
+                    chain_before,
+                    chain_after,
+                )
+            )
+            chain_before = chain_after
             start += self._chunk_size
         return out
 
@@ -621,6 +644,8 @@ class EpicConnector(KVConnectorBase_V1):
                     old_pos_start=h.old_pos_start,
                     length=hi - new_lo,
                     src_offset=int(h.src_offset) + (new_lo - lo),
+                    chain_start=h.chain_start,
+                    chain_end=h.chain_end,
                 )
             )
         return ReuseSelection(
@@ -947,7 +972,9 @@ class EpicConnector(KVConnectorBase_V1):
             already_loaded = {
                 h for h, _ in self._matched_prefix.get(req_id, [])
             }
-            for start, length, h in self._split_prompt_into_chunks(token_ids):
+            for start, length, h, chain_before, chain_after in (
+                self._split_prompt_into_chunks(token_ids)
+            ):
                 if h in already_loaded or index.contains(h):
                     # Already cached (or being loaded this step). Refresh LRU on
                     # the index so its eviction order tracks the worker store,
@@ -972,12 +999,25 @@ class EpicConnector(KVConnectorBase_V1):
                 save.chunk_hashes.append(h)
                 save.chunk_slot_ids.append(slots)
                 save.chunk_positions.append(positions)
+                # Save-time context chain: what preceded this chunk in THIS
+                # prompt. Selection later folds a hash hit into the EXACT
+                # prefix only when the new prompt's chain matches -- an
+                # isolated fileKV warm records chain_before == digest(empty)
+                # and can then never masquerade as exact prefix under a
+                # different left context (it gets the link stitch instead).
+                save.chunk_chains.append((chain_before, chain_after))
                 # Mirror the worker store membership: registering with the same
                 # byte accounting + LRU policy means the index evicts in lock-step
                 # with the worker store (same save sequence -> same eviction).
                 # old_pos == start (this prompt's positions) for diagnostics; the
                 # worker resolves the real old positions from its own store.
-                index.register(h, length, old_pos_start=start)
+                index.register(
+                    h,
+                    length,
+                    old_pos_start=start,
+                    chain_start=chain_before,
+                    chain_end=chain_after,
+                )
             if save.chunk_hashes:
                 meta.add_save(save)
 
@@ -1608,10 +1648,17 @@ class EpicConnector(KVConnectorBase_V1):
 
                 stored = self._store.get(chunk_hash)
                 if stored is None:
+                    chains = (
+                        save.chunk_chains[ci]
+                        if ci < len(getattr(save, "chunk_chains", []))
+                        else (None, None)
+                    )
                     stored = StoredChunk(
                         chunk_hash=chunk_hash,
                         length=len(slot_ids),
                         old_positions=torch.as_tensor(positions, dtype=torch.int64),
+                        chain_start=chains[0],
+                        chain_end=chains[1],
                     )
                 stored.k_per_layer[layer_name] = k
                 stored.v_per_layer[layer_name] = v

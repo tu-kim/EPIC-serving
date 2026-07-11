@@ -267,7 +267,20 @@ class EpicSelection(SelectionStrategy):
 
     Walks chunks from the prompt start; contiguous hits form the prefix extent,
     everything else with a hit is recorded as a non-prefix candidate.
+
+    ``strict_prefix_chain`` (sparse/infix mode): a hit folds into the EXACT
+    prefix only when its SAVE-TIME context chain matches this prompt's
+    running chain -- content equality alone does not prove the stored KV was
+    computed under the same left context (an isolated fileKV warm was not).
+    Mismatches are demoted to non-prefix hits, which the sparse path loads
+    WITH the EPIC link stitch. In non-strict (Phase 1 dense) mode the legacy
+    lenient fold is kept: there is no stitch to demote to, and approximate
+    prefix reuse with PIC is Phase 1's documented behavior. Unknown chains
+    (legacy stores) fold leniently in both modes.
     """
+
+    def __init__(self, strict_prefix_chain: bool = False):
+        self._strict_prefix_chain = bool(strict_prefix_chain)
 
     def select(
         self,
@@ -278,13 +291,38 @@ class EpicSelection(SelectionStrategy):
     ) -> ReuseSelection:
         sel = ReuseSelection()
         contiguous = True
-        # Optional membership extension: the stored chunk's original first
-        # position. -1 == unknown (the protocol only requires contains /
-        # get_length). Used by per-run link detection (LegoLinkRecompute).
+        # Optional membership extensions (the protocol only requires
+        # contains / get_length):
+        #   * get_old_pos_start -- stored first position (per-run fallback).
+        #   * get_chain -- SAVE-TIME context chain. The exact-prefix fold is
+        #     only sound when the stored chunk was computed under the SAME
+        #     left context as this prompt: a content hash says "same bytes",
+        #     not "same context". A fileKV chunk warmed in isolation (chain
+        #     digest of the empty prefix) must NOT fold into the prefix of a
+        #     prompt where other content precedes it -- it is demoted to a
+        #     non-prefix hit and gets the EPIC link stitch instead. Unknown
+        #     chains (legacy/test chunks) keep the legacy fold behavior.
         get_old = getattr(store, "get_old_pos_start", None)
-        for start, length, h in chunks:
+        get_chain = getattr(store, "get_chain", None)
+        for entry in chunks:
+            start, length, h = entry[0], entry[1], entry[2]
+            chain_before = entry[3] if len(entry) > 4 else None
             hit = store.contains(h)
-            if contiguous and start == sel.prefix_extent and hit:
+            stored_chain: tuple[str | None, str | None] = (None, None)
+            if hit and get_chain is not None:
+                stored_chain = get_chain(h) or (None, None)
+            chain_ok = (
+                not self._strict_prefix_chain
+                or stored_chain[0] is None
+                or chain_before is None
+                or stored_chain[0] == chain_before
+            )
+            if (
+                contiguous
+                and start == sel.prefix_extent
+                and hit
+                and chain_ok
+            ):
                 sel.prefix_chunks.append((h, start))
                 sel.prefix_extent += length
             else:
@@ -300,6 +338,8 @@ class EpicSelection(SelectionStrategy):
                                 -1 if old_start is None else int(old_start)
                             ),
                             length=stored_len,
+                            chain_start=stored_chain[0],
+                            chain_end=stored_chain[1],
                         )
                     )
         return sel
@@ -386,13 +426,25 @@ class LegoLinkRecompute(RecomputePolicy):
     def _run_continuous(prev: NonPrefixHit, cur: NonPrefixHit) -> bool:
         """Whether ``cur`` provably continues ``prev``'s saved run (same file).
 
-        Requires BOTH prompt adjacency and stored-old-position contiguity
-        (each first old position accounts for any head trim via src_offset).
-        Unknown old positions (-1) never qualify -- fail toward per-chunk
-        links, which is the conservative (more-recompute) side.
+        Requires prompt adjacency plus proof the two chunks were saved from
+        ONE contiguous warm. Proof, strongest first:
+
+          * save-time context chains: ``prev.chain_end == cur.chain_start``
+            means cur's save-time left context was exactly prev's context
+            plus prev's content -- same warm request, byte-provable.
+          * fallback (chains unknown): stored-old-position contiguity, with
+            each first old position accounting for any head trim
+            (src_offset). Position-only, weaker, kept for legacy stores.
+
+        Unknown on both counts never qualifies -- fail toward per-chunk
+        links, the conservative (more-recompute) side.
         """
         if int(prev.prompt_offset) + int(prev.length) != int(cur.prompt_offset):
             return False
+        p_end = getattr(prev, "chain_end", None)
+        c_start = getattr(cur, "chain_start", None)
+        if p_end is not None and c_start is not None:
+            return p_end == c_start
         p_old = int(getattr(prev, "old_pos_start", -1))
         c_old = int(getattr(cur, "old_pos_start", -1))
         if p_old < 0 or c_old < 0:

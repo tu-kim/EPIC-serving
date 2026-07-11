@@ -62,6 +62,12 @@ class NonPrefixHit:
     # leading part of this hit falls below the native-computed extent, the hit
     # is clamped and this records how many stored tokens to skip at load time.
     src_offset: int = 0
+    # Save-time context chain of the STORED chunk (ChainHasher digests of the
+    # save prompt's tokens [0, start) / [0, start+len)). None == unknown.
+    # Per-run link continuity uses prev.chain_end == cur.chain_start to prove
+    # two adjacent hits came from one contiguous warm (same file).
+    chain_start: str | None = None
+    chain_end: str | None = None
 
 
 @dataclass
@@ -80,6 +86,11 @@ class EpicReqSave:
     chunk_hashes: list[str] = field(default_factory=list)
     chunk_slot_ids: list[list[int]] = field(default_factory=list)
     chunk_positions: list[list[int]] = field(default_factory=list)
+    # Per-chunk save-time context chain (chain_before, chain_after): the
+    # ChainHasher digests of this prompt's tokens up to the chunk's start/end.
+    # Parallel to chunk_hashes; the worker persists these on the StoredChunk
+    # so future selections can verify fold/run soundness.
+    chunk_chains: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass

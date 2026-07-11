@@ -105,7 +105,7 @@ def _make_connector(*, sparse: bool, link: int = 8, store=None):
     c._long_prefill_threshold = 0
     c._sparse_forward = sparse
     c._link_tokens = link
-    c._selection = EpicSelection()
+    c._selection = EpicSelection(strict_prefix_chain=sparse)
     c._recompute = LegoLinkRecompute(
         num_link_tokens=link, phase1_dense=not sparse
     )

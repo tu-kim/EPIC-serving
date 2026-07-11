@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.chunk_store import (
+    chain_hash_tokens,
     EpicChunkStore,
     EpicSchedulerIndex,
     StoredChunk,
@@ -76,6 +77,12 @@ class _LiveIndex(EpicSchedulerIndex):
         old = self._backing.get_old_pos_start(chunk_hash)
         return old if old is not None else super().get_old_pos_start(chunk_hash)
 
+    def get_chain(self, chunk_hash: str):
+        chain = self._backing.get_chain(chunk_hash)
+        if chain is not None and chain != (None, None):
+            return chain
+        return super().get_chain(chunk_hash)
+
 
 def _connector(store: EpicChunkStore, *, link: int = LINK,
                link_per_run: bool = False):
@@ -94,7 +101,7 @@ def _connector(store: EpicChunkStore, *, link: int = LINK,
     c._long_prefill_threshold = 0
     c._sparse_forward = True
     c._link_tokens = link
-    c._selection = EpicSelection()
+    c._selection = EpicSelection(strict_prefix_chain=True)
     c._recompute = LegoLinkRecompute(
         num_link_tokens=link, phase1_dense=False, link_per_run=link_per_run
     )
@@ -102,14 +109,28 @@ def _connector(store: EpicChunkStore, *, link: int = LINK,
     return c
 
 
-def _store_chunk(store: EpicChunkStore, tokens: list[int], old_start: int = 0):
+def _store_chunk(
+    store: EpicChunkStore,
+    tokens: list[int],
+    old_start: int = 0,
+    save_context: list[int] | None = None,
+):
+    """Store a chunk; ``save_context`` = the tokens that preceded it in its
+    SAVE-TIME prompt (None = legacy chunk with unknown context chain;
+    [] = warmed isolated at the prompt start)."""
     h = hash_chunk_tokens(tokens)
+    chain_start = chain_end = None
+    if save_context is not None:
+        chain_start = chain_hash_tokens(save_context)
+        chain_end = chain_hash_tokens(save_context + tokens)
     sc = StoredChunk(
         chunk_hash=h,
         length=len(tokens),
         old_positions=torch.arange(
             old_start, old_start + len(tokens), dtype=torch.int64
         ),
+        chain_start=chain_start,
+        chain_end=chain_end,
     )
     sc.k_per_layer["l0"] = torch.zeros(len(tokens), 1, 1)
     sc.v_per_layer["l0"] = torch.zeros(len(tokens), 1, 1)
@@ -392,3 +413,163 @@ def test_per_chunk_default_links_every_chunk_head():
     m = _m(meta)
     assert set(range(2 * CHUNK, 2 * CHUNK + LINK)) <= m
     assert set(range(3 * CHUNK, 3 * CHUNK + LINK)) <= m
+
+
+# ---------------------------------------------------------------------------
+# Corner 9 (context soundness): A cached, C warmed INDEPENDENTLY (isolated
+# fileKV). A+C is contiguous in the prompt, but C's stored KV was computed
+# WITHOUT A in context -- it must NOT fold into the exact prefix; it needs
+# the EPIC link stitch (non-prefix reuse) instead.
+# ---------------------------------------------------------------------------
+
+
+def test_independent_file_adjacent_to_prefix_is_not_folded():
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    a, csg, g = _seg(0), _seg(2000), _seg(4000)
+    # A saved as a prompt prefix (context = nothing before it).
+    _store_chunk(store, a, save_context=[])
+    # C warmed ISOLATED as fileKV: its save-time context is ALSO empty --
+    # i.e. computed without A. Content-adjacent != context-continuous.
+    _store_chunk(store, csg, save_context=[])
+    c = _connector(store)
+
+    tokens = a + csg + g  # A|C|G, C immediately after A.
+    ext, meta = _schedule(c, tokens, nc=0)
+
+    # A folds (its save context == this prompt's context at position 0).
+    # C must NOT fold: it becomes a non-prefix hit -> loaded + link-stitched.
+    assert ext == 2 * CHUNK  # A (prefix) + C (non-prefix) both external.
+    m = _m(meta)
+    assert m.isdisjoint(range(0, CHUNK))  # A exact, not in M.
+    assert set(range(CHUNK, CHUNK + LINK)) <= m  # C head: LINK STITCH.
+    assert (CHUNK + LINK) not in m  # C body reused.
+    # C is loaded as a NON-prefix chunk (still reused, PIC delta 0 here).
+    loaded = _load_positions(meta)
+    assert set(range(CHUNK, 2 * CHUNK)) <= loaded
+
+
+def test_file_saved_with_matching_context_still_folds():
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    a, csg, g = _seg(0), _seg(2000), _seg(4000)
+    _store_chunk(store, a, save_context=[])
+    # C saved from a previous DENSE run of A+C...: context == A -> its KV is
+    # exactly what this prompt's positions [64,128) would compute.
+    _store_chunk(store, csg, save_context=list(a))
+    c = _connector(store)
+
+    tokens = a + csg + g
+    ext, meta = _schedule(c, tokens, nc=0)
+
+    assert ext == 2 * CHUNK  # A+C fold into one exact contiguous prefix.
+    assert meta.sparse == []  # no non-prefix hit at all -> dense remainder.
+    m_loads = _load_positions(meta)
+    assert m_loads == set(range(0, 2 * CHUNK))
+
+
+def test_context_mismatched_prefix_head_never_folds():
+    """Even the FIRST chunk must satisfy the chain: content that matches the
+    prompt head but was saved mid-prompt elsewhere is not exact prefix."""
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    a, g = _seg(0), _seg(4000)
+    # A's content saved from a DIFFERENT context (it followed 64 other tokens
+    # in its save prompt) -> chain_start != digest(empty).
+    _store_chunk(store, a, save_context=_seg(9000))
+    c = _connector(store)
+
+    tokens = a + g
+    ext, meta = _schedule(c, tokens, nc=0)
+
+    # Not foldable; it becomes a non-prefix hit at offset 0 -> link stitch.
+    assert ext == CHUNK
+    m = _m(meta)
+    assert set(range(0, LINK)) <= m  # stitch at the very head.
+    assert LINK not in m
+
+
+def test_legacy_chunks_without_chains_keep_folding():
+    """Chunks stored without chain info (legacy/hand-built) keep the lenient
+    Phase-1 fold so existing stores stay usable."""
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    a, csg = _seg(0), _seg(2000)
+    _store_chunk(store, a)  # save_context=None -> no chains recorded.
+    _store_chunk(store, csg)
+    c = _connector(store)
+
+    tokens = a + csg + _seg(4000)
+    ext, meta = _schedule(c, tokens, nc=0)
+    assert ext == 2 * CHUNK
+    assert meta.sparse == []  # folded as before (lenient on unknown chains).
+
+
+def test_save_path_records_chains_end_to_end():
+    """The REAL save path (build_connector_meta) must register chains so a
+    SECOND request with a different left context does not fold the chunk."""
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    c = _connector(store)
+
+    # Request 1: prompt = C1+C2 (a standalone fileKV warm). Saves register
+    # chains into the scheduler index (and the EpicReqSave carries them).
+    file_tokens = _seg(2000) + _seg(3000)
+    ext1, meta1 = _schedule(c, file_tokens, nc=0)
+    assert len(meta1.saves) == 1
+    assert len(meta1.saves[0].chunk_chains) == 2
+    # Mirror what the worker store would hold (chains included).
+    for ci, h in enumerate(meta1.saves[0].chunk_hashes):
+        cs, ce = meta1.saves[0].chunk_chains[ci]
+        sc = StoredChunk(
+            chunk_hash=h,
+            length=CHUNK,
+            old_positions=torch.arange(
+                ci * CHUNK, (ci + 1) * CHUNK, dtype=torch.int64
+            ),
+            chain_start=cs,
+            chain_end=ce,
+        )
+        sc.k_per_layer["l0"] = torch.zeros(CHUNK, 1, 1)
+        sc.v_per_layer["l0"] = torch.zeros(CHUNK, 1, 1)
+        store.put(sc)
+
+    # Request 2: prompt = A + C1 + C2 + G. C1's save context was EMPTY, the
+    # new context is A -> C1/C2 must NOT fold; they are non-prefix hits and
+    # (being one contiguous warm) form ONE run for per-run links.
+    tokens = _seg(0) + file_tokens + _seg(4000)
+    ext2, meta2 = _schedule(c, tokens, nc=0)
+    m = _m(meta2)
+    assert set(range(CHUNK, CHUNK + LINK)) <= m  # stitch at file head.
+    # Per-chunk default: second chunk head stitched too.
+    assert set(range(2 * CHUNK, 2 * CHUNK + LINK)) <= m
+
+
+def test_link_per_run_uses_chain_continuity():
+    """Per-run links accept chain proof: two chunks saved from ONE warm
+    (prev.chain_end == cur.chain_start) get a single head stitch even when
+    judged by chains alone."""
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    c1, c2 = _seg(2000), _seg(3000)
+    _store_chunk(store, c1, old_start=0, save_context=[])
+    _store_chunk(store, c2, old_start=CHUNK, save_context=list(c1))
+    c = _connector(store, link_per_run=True)
+
+    tokens = _seg(0) + _seg(1000) + c1 + c2 + _seg(4000)
+    _, meta = _schedule(c, tokens, nc=0)
+    m = _m(meta)
+    assert set(range(2 * CHUNK, 2 * CHUNK + LINK)) <= m  # run head stitched.
+    assert m.isdisjoint(range(3 * CHUNK, 3 * CHUNK + LINK))  # internal: none.
+
+
+def test_link_per_run_chain_mismatch_stitches_both():
+    """Adjacent hits whose chains do NOT chain (independent warms) must get
+    per-chunk stitches even in per-run mode -- chains override the old-pos
+    heuristic (here old positions LOOK contiguous but contexts differ)."""
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    c1, c2 = _seg(2000), _seg(3000)
+    _store_chunk(store, c1, old_start=0, save_context=[])
+    # c2 saved at old positions [64,128) but after DIFFERENT content.
+    _store_chunk(store, c2, old_start=CHUNK, save_context=_seg(9000))
+    c = _connector(store, link_per_run=True)
+
+    tokens = _seg(0) + _seg(1000) + c1 + c2 + _seg(4000)
+    _, meta = _schedule(c, tokens, nc=0)
+    m = _m(meta)
+    assert set(range(2 * CHUNK, 2 * CHUNK + LINK)) <= m
+    assert set(range(3 * CHUNK, 3 * CHUNK + LINK)) <= m  # stitched: no proof.
