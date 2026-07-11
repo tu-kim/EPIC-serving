@@ -278,6 +278,10 @@ class EpicSelection(SelectionStrategy):
     ) -> ReuseSelection:
         sel = ReuseSelection()
         contiguous = True
+        # Optional membership extension: the stored chunk's original first
+        # position. -1 == unknown (the protocol only requires contains /
+        # get_length). Used by per-run link detection (LegoLinkRecompute).
+        get_old = getattr(store, "get_old_pos_start", None)
         for start, length, h in chunks:
             hit = store.contains(h)
             if contiguous and start == sel.prefix_extent and hit:
@@ -287,11 +291,14 @@ class EpicSelection(SelectionStrategy):
                 contiguous = False
                 if hit:
                     stored_len = store.get_length(h) or length
+                    old_start = get_old(h) if get_old is not None else None
                     sel.non_prefix_hits.append(
                         NonPrefixHit(
                             chunk_hash=h,
                             prompt_offset=start,
-                            old_pos_start=0,  # resolved at load from store
+                            old_pos_start=(
+                                -1 if old_start is None else int(old_start)
+                            ),
                             length=stored_len,
                         )
                     )
@@ -352,12 +359,47 @@ class LegoLinkRecompute(RecomputePolicy):
     runs, producing the sorted, deduplicated M with its invariants asserted.
     """
 
-    def __init__(self, num_link_tokens: int = 0, phase1_dense: bool = True):
+    def __init__(
+        self,
+        num_link_tokens: int = 0,
+        phase1_dense: bool = True,
+        link_per_run: bool = False,
+    ):
         self._num_link_tokens = max(0, int(num_link_tokens))
         self._phase1_dense = phase1_dense
+        # Link granularity. False (default) == EPIC original LegoLink: the
+        # leading k tokens of EVERY non-prefix chunk are recomputed. True ==
+        # per-run ("file") links: when consecutive hits form a PROVABLY
+        # coherent run -- adjacent in the prompt AND with contiguous stored
+        # old positions, i.e. they were saved from one contiguous warm request
+        # (same file) -- only the run's HEAD chunk gets link tokens. The
+        # run-internal boundaries carried full left-context at save time, so
+        # their cached KV needs no boundary stitch. Falls back to per-chunk
+        # whenever contiguity cannot be proven (unknown old positions,
+        # unrelated adjacent files).
+        self._link_per_run = bool(link_per_run)
 
     def needs_importance_prepass(self) -> bool:
         return False  # LegoLink is static.
+
+    @staticmethod
+    def _run_continuous(prev: NonPrefixHit, cur: NonPrefixHit) -> bool:
+        """Whether ``cur`` provably continues ``prev``'s saved run (same file).
+
+        Requires BOTH prompt adjacency and stored-old-position contiguity
+        (each first old position accounts for any head trim via src_offset).
+        Unknown old positions (-1) never qualify -- fail toward per-chunk
+        links, which is the conservative (more-recompute) side.
+        """
+        if int(prev.prompt_offset) + int(prev.length) != int(cur.prompt_offset):
+            return False
+        p_old = int(getattr(prev, "old_pos_start", -1))
+        c_old = int(getattr(cur, "old_pos_start", -1))
+        if p_old < 0 or c_old < 0:
+            return False
+        p_first = p_old + int(getattr(prev, "src_offset", 0))
+        c_first = c_old + int(getattr(cur, "src_offset", 0))
+        return p_first + int(prev.length) == c_first
 
     def _seq_len(
         self, request: "Request | None", selection: ReuseSelection
@@ -432,9 +474,26 @@ class LegoLinkRecompute(RecomputePolicy):
         # (2) link tokens -- the leading ``num_link_tokens`` of each non-prefix
         # chunk B. ``min`` clamps the boundary case where link > chunk length.
         # Prefix-A chunks contribute NO link tokens (A is fully native).
+        # Per-run mode: a hit that provably CONTINUES the previous hit's saved
+        # run (same file, contiguous old positions) is a run-internal boundary
+        # -- its cached KV already carried the full left context at save time,
+        # so no stitch is needed and its link window is skipped.
         link = self._num_link_tokens
         if link > 0:
-            for hit in selection.non_prefix_hits:
+            hits = sorted(
+                selection.non_prefix_hits,
+                key=lambda h: int(h.prompt_offset),
+            )
+            prev: NonPrefixHit | None = None
+            for hit in hits:
+                run_internal = (
+                    self._link_per_run
+                    and prev is not None
+                    and self._run_continuous(prev, hit)
+                )
+                prev = hit
+                if run_internal:
+                    continue
                 lo = max(0, int(hit.prompt_offset))
                 hi = min(n, lo + min(link, max(0, int(hit.length))))
                 m.update(range(lo, hi))
