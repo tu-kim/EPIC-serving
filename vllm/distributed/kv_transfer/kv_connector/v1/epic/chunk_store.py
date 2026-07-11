@@ -45,6 +45,38 @@ def hash_chunk_tokens(token_ids: list[int]) -> str:
     return h.hexdigest()
 
 
+class ChainHasher:
+    """Incremental digest of a prompt's token sequence from position 0.
+
+    ``digest()`` after feeding tokens [0, i) identifies the SAVE-TIME LEFT
+    CONTEXT of a chunk starting at i. Two chunks agree on their chain digest
+    iff their preceding token sequences are identical (collision-negligible).
+
+    This is what makes the EXACT-prefix fold sound: a content-hash hit says
+    "same bytes", but only a matching chain says "computed with the same
+    context" -- a fileKV chunk warmed in isolation has chain == digest(empty)
+    and must NOT be folded into the exact prefix of a prompt where other
+    content precedes it (it needs the EPIC link stitch instead).
+    """
+
+    def __init__(self) -> None:
+        self._h = hashlib.sha256(b"epic-chain-v1")
+
+    def update(self, token_ids: list[int]) -> None:
+        for t in token_ids:
+            self._h.update(int(t).to_bytes(4, "little", signed=False))
+
+    def digest(self) -> str:
+        return self._h.copy().hexdigest()
+
+
+def chain_hash_tokens(token_ids: list[int]) -> str:
+    """Chain digest of a full token prefix (convenience for tests/clients)."""
+    ch = ChainHasher()
+    ch.update(list(token_ids))
+    return ch.digest()
+
+
 @dataclass
 class StoredChunk:
     """One cached chunk's KV across all layers."""
@@ -57,6 +89,11 @@ class StoredChunk:
     # V [length, num_kv_heads, head_size], CPU (pinned if available).
     k_per_layer: dict[str, torch.Tensor] = field(default_factory=dict)
     v_per_layer: dict[str, torch.Tensor] = field(default_factory=dict)
+    # Save-time context chain (see ChainHasher): digests of the save prompt's
+    # tokens [0, start) and [0, start+length). None == unknown (legacy /
+    # hand-built test chunks) -> consumers treat context as unverifiable.
+    chain_start: str | None = None
+    chain_end: str | None = None
 
     def nbytes(self) -> int:
         total = self.old_positions.element_size() * self.old_positions.nelement()
@@ -97,6 +134,17 @@ class EpicChunkStore:
         if chunk is None or chunk.old_positions.numel() == 0:
             return None
         return int(chunk.old_positions[0].item())
+
+    def get_chain(self, chunk_hash: str) -> tuple[str | None, str | None] | None:
+        """Save-time context chain (chain_start, chain_end); None == not stored.
+
+        Membership-style query (no LRU touch). ``(None, None)`` entries are
+        legacy/hand-built chunks whose save context is unverifiable.
+        """
+        chunk = self._store.get(chunk_hash)
+        if chunk is None:
+            return None
+        return (chunk.chain_start, chunk.chain_end)
 
     # ----- read (worker side; marks as recently used) -----
 
@@ -145,7 +193,8 @@ class EpicChunkStore:
         return len(self._store)
 
     def iter_membership(self):
-        """Yield ``(chunk_hash, length, old_pos_start)`` in LRU order.
+        """Yield ``(chunk_hash, length, old_pos_start, chain_start, chain_end)``
+        in LRU order.
 
         Lets a scheduler index be seeded from a (test-built or pre-warmed) store
         without reaching into private state.
@@ -156,7 +205,7 @@ class EpicChunkStore:
                 if chunk.old_positions.numel() > 0
                 else -1
             )
-            yield h, chunk.length, old_pos
+            yield h, chunk.length, old_pos, chunk.chain_start, chunk.chain_end
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +243,9 @@ class _IndexEntry:
     length: int
     nbytes: int
     old_pos_start: int = -1  # diagnostics only; worker resolves real old pos.
+    # Save-time context chain (mirrors StoredChunk.chain_start/chain_end).
+    chain_start: str | None = None
+    chain_end: str | None = None
 
 
 def stored_chunk_nbytes(
@@ -278,7 +330,12 @@ class EpicSchedulerIndex:
     # ----- mirror write (scheduler side, at save-emit time) -----
 
     def register(
-        self, chunk_hash: str, length: int, old_pos_start: int = -1
+        self,
+        chunk_hash: str,
+        length: int,
+        old_pos_start: int = -1,
+        chain_start: str | None = None,
+        chain_end: str | None = None,
     ) -> None:
         """Mirror a save the scheduler just emitted.
 
@@ -293,10 +350,21 @@ class EpicSchedulerIndex:
         if nbytes > self.capacity_bytes:
             return
         self._store[chunk_hash] = _IndexEntry(
-            length=length, nbytes=nbytes, old_pos_start=old_pos_start
+            length=length,
+            nbytes=nbytes,
+            old_pos_start=old_pos_start,
+            chain_start=chain_start,
+            chain_end=chain_end,
         )
         self._cur_bytes += nbytes
         self._evict_if_needed()
+
+    def get_chain(self, chunk_hash: str) -> tuple[str | None, str | None] | None:
+        """Save-time context chain (matches EpicChunkStore.get_chain)."""
+        entry = self._store.get(chunk_hash)
+        if entry is None:
+            return None
+        return (entry.chain_start, entry.chain_end)
 
     def seed_from_store(self, store: "EpicChunkStore") -> None:
         """Mirror an existing store's membership (LRU order preserved).
@@ -305,8 +373,16 @@ class EpicSchedulerIndex:
         that was populated out of band. In production the index is kept in sync
         incrementally via ``register`` at save-emit time.
         """
-        for chunk_hash, length, old_pos in store.iter_membership():
-            self.register(chunk_hash, length, old_pos_start=old_pos)
+        for chunk_hash, length, old_pos, c_start, c_end in (
+            store.iter_membership()
+        ):
+            self.register(
+                chunk_hash,
+                length,
+                old_pos_start=old_pos,
+                chain_start=c_start,
+                chain_end=c_end,
+            )
 
     def touch(self, chunk_hash: str) -> None:
         """Mark a chunk most-recently-used (mirrors EpicChunkStore.get's
