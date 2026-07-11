@@ -26,7 +26,24 @@ import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
+import numpy as np
 import torch
+
+
+def _tokens_to_bytes(token_ids: "list[int] | np.ndarray") -> bytes:
+    """Fixed-width little-endian uint32 encoding of a token sequence.
+
+    Byte-identical to the original per-token
+    ``int(t).to_bytes(4, "little", signed=False)`` loop, but one vectorized
+    numpy conversion instead of len(token_ids) Python calls -- hashing is on
+    the scheduler hot path (every prompt is content- AND chain-hashed at
+    match and save time). Raises OverflowError for out-of-range ids exactly
+    like ``int.to_bytes`` did (numpy would silently wrap otherwise).
+    """
+    arr = np.asarray(token_ids, dtype=np.int64)
+    if arr.size and (int(arr.min()) < 0 or int(arr.max()) >= 1 << 32):
+        raise OverflowError("token id out of uint32 range")
+    return arr.astype("<u4").tobytes()
 
 
 def hash_chunk_tokens(token_ids: list[int]) -> str:
@@ -40,8 +57,7 @@ def hash_chunk_tokens(token_ids: list[int]) -> str:
     # Fixed-width little-endian ints for a stable, language-agnostic encoding.
     h.update(b"epic-chunk-v1")
     h.update(len(token_ids).to_bytes(4, "little"))
-    for t in token_ids:
-        h.update(int(t).to_bytes(4, "little", signed=False))
+    h.update(_tokens_to_bytes(token_ids))
     return h.hexdigest()
 
 
@@ -63,8 +79,7 @@ class ChainHasher:
         self._h = hashlib.sha256(b"epic-chain-v1")
 
     def update(self, token_ids: list[int]) -> None:
-        for t in token_ids:
-            self._h.update(int(t).to_bytes(4, "little", signed=False))
+        self._h.update(_tokens_to_bytes(token_ids))
 
     def digest(self) -> str:
         return self._h.copy().hexdigest()

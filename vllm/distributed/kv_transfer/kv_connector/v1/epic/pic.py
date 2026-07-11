@@ -116,6 +116,13 @@ class PICRotator:
                     f"See epic/PHASE2.md."
                 )
         self.register_inv_freq = inv_freq
+        # Single-entry cos/sin memo. The load path calls rotate_keys once per
+        # LAYER with the SAME (old_positions, new_positions) tensor objects for
+        # a chunk, so without this the identical delta trig was recomputed
+        # num_layers times per chunk. Keyed by tensor IDENTITY (strong refs
+        # held in the entry, so ids cannot be recycled while cached) plus
+        # device/dtype; any other call pattern just misses and recomputes.
+        self._cos_sin_memo: tuple | None = None
         # NOTE: we deliberately do NOT instantiate ApplyRotaryEmb (a CustomOp,
         # which requires an active vLLM config context at construction). We only
         # call its pure staticmethod `forward_static`, so PICRotator is usable
@@ -158,8 +165,28 @@ class PICRotator:
         assert old_positions.shape[0] == num_tokens
         assert new_positions.shape[0] == num_tokens
 
-        delta = new_positions.to(torch.float32) - old_positions.to(torch.float32)
-        cos, sin = self._cos_sin_for_delta(delta, key.device, key.dtype)
+        memo = self._cos_sin_memo
+        if (
+            memo is not None
+            and memo[0] is old_positions
+            and memo[1] is new_positions
+            and memo[2] == key.device
+            and memo[3] == key.dtype
+        ):
+            cos, sin = memo[4], memo[5]
+        else:
+            delta = new_positions.to(torch.float32) - old_positions.to(
+                torch.float32
+            )
+            cos, sin = self._cos_sin_for_delta(delta, key.device, key.dtype)
+            self._cos_sin_memo = (
+                old_positions,
+                new_positions,
+                key.device,
+                key.dtype,
+                cos,
+                sin,
+            )
 
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]

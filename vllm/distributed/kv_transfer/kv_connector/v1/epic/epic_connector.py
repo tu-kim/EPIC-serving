@@ -732,7 +732,16 @@ class EpicConnector(KVConnectorBase_V1):
         if not token_ids:
             return 0, False
 
-        chunks = self._split_prompt_into_chunks(token_ids)
+        # Per-step split cache: build_connector_meta re-splits the SAME prompt
+        # for its save walk, so hashing every token twice per request is pure
+        # waste. Keyed by req_id (a request's prompt is immutable); populated
+        # here, consumed by the save walk, cleared each step. setdefault keeps
+        # partially-built test connectors working without the attribute.
+        split_cache: dict = self.__dict__.setdefault("_chunk_split_cache", {})
+        chunks = split_cache.get(request.request_id)
+        if chunks is None:
+            chunks = self._split_prompt_into_chunks(token_ids)
+            split_cache[request.request_id] = chunks
 
         # SelectionStrategy (scheduler side, side-effect free): which content
         # chunks to reuse. EPIC = exact-hash prefix walk; the contiguous prefix
@@ -886,6 +895,10 @@ class EpicConnector(KVConnectorBase_V1):
             request=request, selection=sel, block_size=self._block_size
         )
         rows_post = len(plan.recompute_offsets)  # |M|, forwarded after override.
+        # Cache the plan for _emit_sparse: the derivation is deterministic in
+        # (selection, N), both of which are stashed unchanged for the emit, so
+        # re-deriving M there (O(N) set walks) would be duplicate work.
+        self.__dict__.setdefault("_plan_cache", {})[request.request_id] = plan
         fits = (
             budget <= 0 or (rows_pre <= budget and rows_post <= budget)
         ) and (threshold <= 0 or rows_pre <= threshold)
@@ -1148,9 +1161,14 @@ class EpicConnector(KVConnectorBase_V1):
             already_loaded = {
                 h for h, _ in self._matched_prefix.get(req_id, [])
             }
-            for start, length, h, chain_before, chain_after in (
-                self._split_prompt_into_chunks(token_ids)
-            ):
+            # Reuse the match-time split (same prompt -> same chunks/hashes);
+            # only requests that skipped matching entirely re-split here.
+            req_chunks = self.__dict__.setdefault(
+                "_chunk_split_cache", {}
+            ).pop(req_id, None)
+            if req_chunks is None:
+                req_chunks = self._split_prompt_into_chunks(token_ids)
+            for start, length, h, chain_before, chain_after in req_chunks:
                 if h in already_loaded or index.contains(h):
                     # Already cached (or being loaded this step). Refresh LRU on
                     # the index so its eviction order tracks the worker store,
@@ -1216,6 +1234,10 @@ class EpicConnector(KVConnectorBase_V1):
         self._selections.clear()
         self._sparse_reqs.clear()
         self._native_computed.clear()
+        # Per-step derivation caches (match-time split/plan reuse; entries for
+        # requests that were matched but not scheduled this step die here too).
+        self.__dict__.setdefault("_chunk_split_cache", {}).clear()
+        self.__dict__.setdefault("_plan_cache", {}).clear()
         return meta
 
     def _emit_sparse(
@@ -1272,14 +1294,22 @@ class EpicConnector(KVConnectorBase_V1):
             )
             return None
 
-        # The policy's _seq_len() reads request.prompt_token_ids first; pass a
-        # minimal shim carrying the exact N (the V1 Request isn't in scope in
-        # build_connector_meta, only the new-req descriptor's token ids).
-        plan: RecomputePlan = self._recompute.plan_recompute(
-            request=_PromptLenShim(token_ids),
-            selection=sel,
-            block_size=self._block_size,
-        )
+        # Prefer the plan the budget guard already derived at match time: the
+        # derivation is deterministic in (selection, N) and both are the
+        # stashed values, so this skips a duplicate O(N) M-derivation. Absent
+        # (budget guard disabled -> it early-returned without a plan), derive
+        # fresh. The policy's _seq_len() reads request.prompt_token_ids first;
+        # pass a minimal shim carrying the exact N (the V1 Request isn't in
+        # scope in build_connector_meta, only the new-req token ids).
+        plan: RecomputePlan | None = self.__dict__.setdefault(
+            "_plan_cache", {}
+        ).pop(req_id, None)
+        if plan is None:
+            plan = self._recompute.plan_recompute(
+                request=_PromptLenShim(token_ids),
+                selection=sel,
+                block_size=self._block_size,
+            )
         if not plan.recompute_offsets:
             return None  # dense / degenerate -> no sparse emission, no guard.
 
@@ -1728,6 +1758,23 @@ class EpicConnector(KVConnectorBase_V1):
                     "prefetch_hit" if staged is not None else "prefetch_miss"
                 )
 
+        # Identity-delta skip: a chunk reloaded at its ORIGINAL positions (the
+        # common prefix-reload case) needs no rotation at all -- R(0) is exactly
+        # the identity, so skipping is bit-equivalent for PIC and a no-op for
+        # IdentityAlignment. Checked once per chunk on CPU ints; positions on
+        # another device (prefetch-staged sources) skip the check and align
+        # normally rather than paying a device sync.
+        needs_align = self._alignment is not None and (
+            old_positions.device.type != "cpu"
+            or not torch.equal(old_positions, new_positions)
+        )
+
+        # Hoist the positions' device transfer out of the per-layer loop: all
+        # attention layers share one KV device, and handing the SAME tensor
+        # objects to every align_keys call lets PICRotator's cos/sin memo hit
+        # (the delta trig is computed once per chunk, not once per layer).
+        device_positions: tuple[torch.Tensor, torch.Tensor] | None = None
+
         for layer_name in self._layer_names:
             kv_cache = self._kv_caches.get(layer_name)
             if kv_cache is None or layer_name not in stored.k_per_layer:
@@ -1751,12 +1798,18 @@ class EpicConnector(KVConnectorBase_V1):
             # AlignmentStrategy: EPIC = PIC delta re-rotary (no fake_q hack;
             # see pic.py). CacheBlend would plug IdentityAlignment here.
             assert self._alignment is not None
-            k = self._alignment.align_keys(
-                k,
-                old_positions.to(device),
-                new_positions.to(device),
-                layer_name,
-            )
+            if needs_align:
+                if device_positions is None:
+                    device_positions = (
+                        old_positions.to(device),
+                        new_positions.to(device),
+                    )
+                k = self._alignment.align_keys(
+                    k,
+                    device_positions[0],
+                    device_positions[1],
+                    layer_name,
+                )
 
             self._scatter_kv(kv_cache, k, v, spec.dst_slot_ids[:length])
 
@@ -1906,10 +1959,8 @@ class EpicConnector(KVConnectorBase_V1):
                 slots = torch.as_tensor(
                     slot_ids, device=kv_layer.device, dtype=torch.long
                 )
-                k = k_bank[slots].detach().to("cpu")
-                v = v_bank[slots].detach().to("cpu")
-                k = self._store.maybe_pin(k)
-                v = self._store.maybe_pin(v)
+                k = self._harvest_to_cpu(k_bank[slots].detach())
+                v = self._harvest_to_cpu(v_bank[slots].detach())
 
                 stored = self._store.get(chunk_hash)
                 if stored is None:
@@ -1930,7 +1981,35 @@ class EpicConnector(KVConnectorBase_V1):
                 # put() refreshes bytes / LRU; safe to call repeatedly per layer.
                 self._store.put(stored)
 
+    def _harvest_to_cpu(self, src: torch.Tensor) -> torch.Tensor:
+        """Copy one harvested K/V tensor to (pinned) CPU for the store.
+
+        CUDA source with pinning enabled: allocate the PINNED destination
+        directly and issue an ASYNC D2H on the current stream -- one host
+        copy instead of the old two (GPU -> pageable CPU -> pin_memory()
+        re-copy), and the forward is not blocked; ``wait_for_save`` fences
+        before the tensors are considered valid. The gathered source stays
+        stream-ordered ahead of the copy, so no extra retention is needed.
+        Non-CUDA sources (CPU tests) keep the synchronous path byte-for-byte.
+        """
+        if src.device.type == "cuda" and self._store is not None and (
+            self._store.pin_memory
+        ):
+            dst = torch.empty(
+                src.shape, dtype=src.dtype, device="cpu", pin_memory=True
+            )
+            dst.copy_(src, non_blocking=True)
+            self._pending_save_sync = True
+            return dst
+        out = src.to("cpu")
+        return self._store.maybe_pin(out) if self._store is not None else out
+
     def wait_for_save(self):
-        # All saves are synchronous CPU copies in save_kv_layer.
-        # TODO(Phase 2): async D2H copy with a stream + wait here.
+        # Saves issue ASYNC D2H copies into pinned store tensors on the
+        # current stream (_harvest_to_cpu); fence here -- the runner calls
+        # wait_for_save after the forward, which is exactly when the store
+        # contents must become host-visible. No-op when nothing was async.
+        if getattr(self, "_pending_save_sync", False):
+            torch.cuda.current_stream().synchronize()
+            self._pending_save_sync = False
         return
