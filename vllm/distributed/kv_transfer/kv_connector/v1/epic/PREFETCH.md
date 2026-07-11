@@ -71,3 +71,69 @@ turn t+1 prefill → _load_chunk
   prompt, which is unknown until the request arrives; rotation stays at load
   time (it is GPU-side and cheap relative to H2D).
 * Cross-engine staging transfer / eviction coordination.
+
+## External command injection (dynamo frontend)
+
+The full multi-worker loop, no in-process coupling:
+
+```
+decode worker ──► LLM response with tool-call schema
+      │
+      ▼
+dynamo frontend        parses the response (prefetch_parser)
+      │                owns worker scheduling → picks dst_worker
+      ▼
+DynamoPrefetchBridge.on_turn_response(response, dst_worker)
+      │  render → tokenize → chunk hashes
+      ▼
+EpicPrefetchClient ──ZMQ REQ──► EpicPrefetchListener        [engine core]
+                                      │
+                                      ▼
+                        EpicConnector.handle_prefetch_command
+                              queued / dropped reply
+      │  dropped hashes → warm_fn(read, text)   (populate fileKV for next time)
+      ▼
+next step's connector metadata ──► workers stage ──► turn t+1 reuses
+```
+
+* Enable the listener with `epic_prefetch_endpoint`
+  (e.g. `tcp://0.0.0.0:5557`, `ipc:///run/epic-prefetch.sock`) — SCHEDULER
+  role only; it is a control-plane socket, bind it on a trusted interface.
+* Protocol: JSON over REQ/REP — `{"cmd":"prefetch", "chunk_hashes":[...],
+  "token_ids":[...], "dst_worker":k}` → `{"ok":true, "queued":[...],
+  "dropped":[...]}`; `{"cmd":"ping"}`.
+* `dropped` = chunks the engine's fileKV store does not hold; the bridge's
+  optional `warm_fn` (typically a max_tokens=1 request over the rendered
+  file text) populates the store so the next prefetch hits.
+
+## Dedicated staging worker (advanced; `epic_staging_mode: "external"`)
+
+Staging inside the vLLM worker can contend with in-flight generation
+(allocator pressure on the same CUDA context, host time on the worker loop).
+`staging_worker.py` isolates it into a **dedicated process per rank**:
+
+* **MIG reviewed and rejected**: MIG instances cannot share memory (no P2P /
+  CUDA IPC across instances), so a staging buffer on another slice is
+  unreachable from the vLLM worker — the transfer would bounce through host
+  memory, worse than the copy it replaces. MIG also permanently shrinks the
+  vLLM slice.
+* Chosen: **same GPU, separate process + CUDA IPC** (optionally under MPS
+  with `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` to cap the staging process's SM
+  share; H2D itself is DMA-engine work). Own CUDA context + memory pool
+  (capped by the staging budget) → cannot fragment/OOM the vLLM allocator.
+* The vLLM worker only *checks and maps*: staged tensors travel as CUDA IPC
+  handles (torch.multiprocessing pickling), mapped zero-copy and read
+  directly by the PIC-rotate + scatter. torch's IPC ref-counting keeps an
+  allocation alive across a staging-side LRU eviction until consumers
+  release it. The child synchronizes its copies before answering `get`.
+
+### TP correctness (verified in test_staging_worker.py)
+
+* One staging worker per rank, pinned to that rank's device; each rank ships
+  chunks from its OWN per-rank CPU store → shards cannot mix by construction.
+* Directives are broadcast metadata: every rank stages the same hash but its
+  own shard tensors.
+* Divergent hit/miss across ranks is safe: the load path is purely local
+  (gather → rotate → scatter, no collective), so a skew only shows up as
+  per-rank latency, never as wrong KV. Shapes/positions/masks come from
+  scheduler metadata identical on all ranks.

@@ -333,12 +333,36 @@ class EpicConnector(KVConnectorBase_V1):
             extra.get("epic_prefetch_gpu_bytes", 0)
         )
         self._worker_id: int = int(extra.get("epic_worker_id", -1))
+        # Staging placement: "inprocess" (default) keeps the staging store in
+        # the vLLM worker process; "external" spawns a DEDICATED staging
+        # worker process per rank (same GPU, own CUDA context; CUDA-IPC-shared
+        # tensors) so H2D and allocator pressure never touch the vLLM worker.
+        # See staging_worker.py for the architecture review (incl. why MIG
+        # cannot host the staging worker) and the TP correctness argument.
+        self._staging_mode: str = str(
+            extra.get("epic_staging_mode", "inprocess")
+        )
         # Scheduler-side prefetch directive queue, fed by enqueue_prefetch()
         # (possibly from a frontend thread) and drained into the connector
         # metadata each build_connector_meta. Lock-guarded: the enqueue may
         # come from outside the engine-core loop.
         self._prefetch_lock = threading.Lock()
         self._prefetch_queue: list[EpicReqPrefetch] = []
+        # External command injection (dynamo frontend): when
+        # epic_prefetch_endpoint is set, the SCHEDULER-role connector serves
+        # prefetch commands over ZMQ (see prefetch_service.py). The listener
+        # thread only calls handle_prefetch_command, which is thread-safe.
+        self._prefetch_listener = None
+        endpoint = str(extra.get("epic_prefetch_endpoint", "") or "")
+        if role == KVConnectorRole.SCHEDULER and endpoint:
+            from vllm.distributed.kv_transfer.kv_connector.v1.epic.prefetch_service import (  # noqa: E501
+                EpicPrefetchListener,
+            )
+
+            self._prefetch_listener = EpicPrefetchListener(
+                endpoint, self.handle_prefetch_command
+            )
+            self._prefetch_listener.start()
 
         # --- DIAGNOSTIC: worker load fidelity self-check (default OFF) ------
         # When ``epic_debug_check_load`` is on, the worker re-reads the dst KV
@@ -411,12 +435,20 @@ class EpicConnector(KVConnectorBase_V1):
         self._alignment: AlignmentStrategy | None = None
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._layer_names: list[str] = []
-        # Worker-side GPU staging store for prefetched fileKV chunks. None when
-        # prefetch is disabled (epic_prefetch_gpu_bytes == 0) -> load path
-        # byte-for-byte unchanged.
-        self._staging: EpicGpuStagingStore | None = None
+        # Worker-side staging for prefetched fileKV chunks. None when prefetch
+        # is disabled (epic_prefetch_gpu_bytes == 0) -> load path byte-for-byte
+        # unchanged. "external" mode swaps in the dedicated staging-worker
+        # process backend (same contains/get/stage interface).
+        self._staging: "EpicGpuStagingStore | Any | None" = None
         if role == KVConnectorRole.WORKER and self._prefetch_gpu_bytes > 0:
-            self._staging = EpicGpuStagingStore(self._prefetch_gpu_bytes)
+            if self._staging_mode == "external":
+                from vllm.distributed.kv_transfer.kv_connector.v1.epic.staging_worker import (  # noqa: E501
+                    ExternalStagingBackend,
+                )
+
+                self._staging = ExternalStagingBackend(self._prefetch_gpu_bytes)
+            else:
+                self._staging = EpicGpuStagingStore(self._prefetch_gpu_bytes)
         # Worker-side fusion-mask builder (owns fixed-size mask tensors + the
         # single stable mask_mod object). Built lazily on first install.
         self._mask_builder: LegoLinkMaskBuilder | None = None
@@ -923,6 +955,41 @@ class EpicConnector(KVConnectorBase_V1):
             int(dst_worker),
         )
         return known
+
+    def handle_prefetch_command(self, msg: dict) -> dict:
+        """Decode-and-execute one external prefetch command (dynamo frontend).
+
+        Transport-agnostic: the ZMQ listener (prefetch_service.py) or any
+        other injection path hands the decoded dict here. Thread-safe (the
+        underlying queue is lock-guarded; the index reads are dict lookups).
+        Reply carries ``dropped`` so the frontend can WARM files whose chunks
+        the fileKV store does not hold yet.
+        """
+        cmd = msg.get("cmd")
+        if cmd == "ping":
+            return {"ok": True}
+        if cmd != "prefetch":
+            return {"ok": False, "error": f"unknown cmd {cmd!r}"}
+        hashes = [str(h) for h in (msg.get("chunk_hashes") or [])]
+        token_ids = msg.get("token_ids") or None
+        if token_ids:
+            hashes.extend(
+                h
+                for _, _, h in self._split_prompt_into_chunks(
+                    [int(t) for t in token_ids]
+                )
+            )
+        unique = list(dict.fromkeys(hashes))
+        queued = self.enqueue_prefetch(
+            chunk_hashes=unique,
+            dst_worker=int(msg.get("dst_worker", -1)),
+        )
+        queued_set = set(queued)
+        return {
+            "ok": True,
+            "queued": queued,
+            "dropped": [h for h in unique if h not in queued_set],
+        }
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

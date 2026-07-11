@@ -39,6 +39,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.epic.prefetch_parser import (
     ToolCallRead,
     parse_tool_call_reads,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.epic.prefetch_service import (
+    DynamoPrefetchBridge,
+    EpicPrefetchClient,
+    EpicPrefetchListener,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.epic.staging_worker import (
+    ExternalStagingBackend,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.reuse_strategy import (
     AlignmentStrategy,
     EpicSelection,
@@ -69,6 +77,10 @@ __all__ = [
     "FileKVPrefetcher",
     "ToolCallRead",
     "parse_tool_call_reads",
+    "DynamoPrefetchBridge",
+    "EpicPrefetchClient",
+    "EpicPrefetchListener",
+    "ExternalStagingBackend",
     "FusionMaskTensors",
     "build_legolink_mask_mod",
     "EpicChunkStore",
