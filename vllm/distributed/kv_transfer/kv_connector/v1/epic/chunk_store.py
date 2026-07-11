@@ -85,6 +85,19 @@ class EpicChunkStore:
         chunk = self._store.get(chunk_hash)
         return None if chunk is None else chunk.length
 
+    def get_old_pos_start(self, chunk_hash: str) -> int | None:
+        """First absolute position the stored chunk's K was rotated at.
+
+        Membership-style query (no LRU touch). Used by selection to detect
+        SAME-FILE contiguity between adjacent hits: two chunks saved from one
+        contiguous warm request have contiguous old positions, which is what
+        makes a run-internal chunk boundary coherent (per-run link tokens).
+        """
+        chunk = self._store.get(chunk_hash)
+        if chunk is None or chunk.old_positions.numel() == 0:
+            return None
+        return int(chunk.old_positions[0].item())
+
     # ----- read (worker side; marks as recently used) -----
 
     def get(self, chunk_hash: str) -> StoredChunk | None:

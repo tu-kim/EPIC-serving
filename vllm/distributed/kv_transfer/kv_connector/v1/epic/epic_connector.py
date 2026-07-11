@@ -284,6 +284,12 @@ class EpicConnector(KVConnectorBase_V1):
         # LegoLink link-token count: leading tokens of each non-prefix chunk
         # that are always recomputed (the boundary stitch). DESIGN §4.1.
         self._link_tokens: int = int(extra.get("epic_link_tokens", 8))
+        # Link granularity: False (default) == EPIC original per-chunk links;
+        # True == per-run ("per-file") links: only the head chunk of a provably
+        # coherent run (prompt-adjacent AND stored-old-position-contiguous,
+        # i.e. saved from ONE contiguous warm request == the same file) gets
+        # link tokens. See LegoLinkRecompute._run_continuous.
+        self._link_per_run: bool = bool(extra.get("epic_link_per_run", False))
 
         # --- Sparse scheduling-budget guard ---------------------------------
         # The sparse override rewrites num_scheduled_tokens AFTER the scheduler
@@ -339,6 +345,7 @@ class EpicConnector(KVConnectorBase_V1):
         self._recompute: RecomputePolicy = LegoLinkRecompute(
             num_link_tokens=self._link_tokens,
             phase1_dense=not self._sparse_forward,
+            link_per_run=self._link_per_run,
         )
         # Scheduler-side: req_id -> ReuseSelection from get_num_new_matched_tokens
         # (kept only when sparse_forward is on; needed to derive M at build time).
