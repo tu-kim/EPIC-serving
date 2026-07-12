@@ -46,6 +46,22 @@ def _tokens_to_bytes(token_ids: "list[int] | np.ndarray") -> bytes:
     return arr.astype("<u4").tobytes()
 
 
+def hash_chunk_bytes(chunk_bytes: "bytes | memoryview", num_tokens: int) -> str:
+    """Content hash over an ALREADY-ENCODED token byte window.
+
+    Same digest as ``hash_chunk_tokens`` for the corresponding tokens. Lets
+    the connector's prompt split encode the whole prompt ONCE
+    (``_tokens_to_bytes``) and hash chunk windows as memoryview slices,
+    instead of re-encoding every chunk (and again for the chain hash).
+    """
+    h = hashlib.sha256()
+    # Fixed-width little-endian ints for a stable, language-agnostic encoding.
+    h.update(b"epic-chunk-v1")
+    h.update(int(num_tokens).to_bytes(4, "little"))
+    h.update(chunk_bytes)
+    return h.hexdigest()
+
+
 def hash_chunk_tokens(token_ids: list[int]) -> str:
     """Position-independent content hash of a chunk's token ids.
 
@@ -53,12 +69,7 @@ def hash_chunk_tokens(token_ids: list[int]) -> str:
     no cache_salt -- purely the chunk's own bytes. Identical content at any
     position collides intentionally (that is the reuse signal).
     """
-    h = hashlib.sha256()
-    # Fixed-width little-endian ints for a stable, language-agnostic encoding.
-    h.update(b"epic-chunk-v1")
-    h.update(len(token_ids).to_bytes(4, "little"))
-    h.update(_tokens_to_bytes(token_ids))
-    return h.hexdigest()
+    return hash_chunk_bytes(_tokens_to_bytes(token_ids), len(token_ids))
 
 
 class ChainHasher:
@@ -80,6 +91,11 @@ class ChainHasher:
 
     def update(self, token_ids: list[int]) -> None:
         self._h.update(_tokens_to_bytes(token_ids))
+
+    def update_bytes(self, token_bytes: "bytes | memoryview") -> None:
+        """Feed an already-encoded (``_tokens_to_bytes``) window -- same digest
+        as ``update`` on the corresponding tokens, no re-encoding."""
+        self._h.update(token_bytes)
 
     def digest(self) -> str:
         return self._h.copy().hexdigest()

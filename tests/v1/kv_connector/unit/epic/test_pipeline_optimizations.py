@@ -424,3 +424,165 @@ def test_harvest_to_cpu_on_cpu_is_identity_copy():
     # No pending fence on the pure-CPU path.
     assert getattr(w, "_pending_save_sync", False) is False
     w.wait_for_save()  # must be a no-op, not a crash, without CUDA.
+
+
+# ---------------------------------------------------------------------------
+# G-pass (2nd round): single-buffer split, vectorized plan/slots, slot-tensor
+# hoists -- each locked against a reference implementation.
+# ---------------------------------------------------------------------------
+
+
+def test_single_buffer_split_matches_per_chunk_hashing():
+    """_split_prompt_into_chunks (single whole-prompt buffer + memoryview
+    windows) must produce the SAME hashes/chains as hashing each chunk's
+    token list independently."""
+    c = _connector(EpicChunkStore(capacity_bytes=10**8, pin_memory=False))
+    tokens = torch.randint(0, 2**31, (5 * CHUNK + 17,)).tolist()  # ragged tail
+    out = c._split_prompt_into_chunks(tokens)
+    assert len(out) == 5  # tail below chunk size never emitted.
+    for start, length, h, cb, ca in out:
+        assert length == CHUNK
+        assert h == hash_chunk_tokens(tokens[start : start + CHUNK])
+        assert cb == chain_hash_tokens(tokens[:start])
+        assert ca == chain_hash_tokens(tokens[: start + CHUNK])
+    # Shorter-than-chunk prompt: empty split (early return path).
+    assert c._split_prompt_into_chunks(tokens[: CHUNK - 1]) == []
+
+
+def test_vectorized_slot_ids_match_loop_reference():
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.epic_connector import (
+        _slot_ids_from_blocks,
+    )
+
+    def reference(block_ids, block_size, start, num):
+        return [
+            block_ids[i // block_size] * block_size + i % block_size
+            for i in range(start, start + num)
+        ]
+
+    block_ids = [7, 3, 11, 0, 42, 5]
+    for start, num in [(0, 16), (5, 40), (16, 64), (37, 3), (0, 96), (95, 1)]:
+        assert _slot_ids_from_blocks(block_ids, 16, start, num) == reference(
+            block_ids, 16, start, num
+        )
+    with pytest.raises(IndexError):
+        _slot_ids_from_blocks(block_ids, 16, 90, 16)  # past the last block.
+
+
+def _reference_plan(n, prefix_extent, hits, link, link_per_run, policy):
+    """The original set-based M derivation, kept as the oracle."""
+    if prefix_extent >= n or n <= 0:
+        return None
+    reused = set(range(min(prefix_extent, n)))
+    for hit in hits:
+        lo = max(0, int(hit.prompt_offset))
+        hi = min(n, lo + max(0, int(hit.length)))
+        reused.update(range(lo, hi))
+    m = {p for p in range(n) if p not in reused}
+    if link > 0:
+        prev = None
+        for hit in sorted(hits, key=lambda h: int(h.prompt_offset)):
+            run_internal = (
+                link_per_run
+                and prev is not None
+                and policy._run_continuous(prev, hit)
+            )
+            prev = hit
+            if run_internal:
+                continue
+            lo = max(0, int(hit.prompt_offset))
+            hi = min(n, lo + min(link, max(0, int(hit.length))))
+            m.update(range(lo, hi))
+    m.add(n - 1)
+    offsets = sorted(m)
+    reused.update(offsets)
+    return offsets, sorted(reused)
+
+
+def test_vectorized_plan_matches_set_reference_fuzz():
+    """Randomized layouts: numpy-mask M derivation == the original set-based
+    derivation, including per-run link mode."""
+    import random
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.metadata import (
+        NonPrefixHit,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.reuse_strategy import (
+        ReuseSelection,
+    )
+
+    rng = random.Random(1234)
+
+    class _R:
+        def __init__(self, n):
+            self.prompt_token_ids = list(range(n))
+
+    for trial in range(60):
+        n = rng.randrange(2, 700)
+        prefix = rng.choice([0, 0, CHUNK, 2 * CHUNK, n // 2])
+        prefix = min(prefix, n - 1)
+        hits = []
+        pos = prefix
+        while pos + 8 < n and len(hits) < 4 and rng.random() < 0.75:
+            pos += rng.randrange(0, 64)
+            length = rng.randrange(1, 128)
+            if pos + length > n or pos < prefix:
+                break
+            old = rng.choice([-1, 0, pos, 4096])
+            hits.append(
+                NonPrefixHit(
+                    chunk_hash=f"h{len(hits)}",
+                    prompt_offset=pos,
+                    old_pos_start=old,
+                    length=length,
+                )
+            )
+            pos += length
+        link = rng.choice([0, 1, 8, 64, 1000])
+        per_run = rng.random() < 0.5
+        policy = LegoLinkRecompute(
+            num_link_tokens=link, phase1_dense=False, link_per_run=per_run
+        )
+        sel = ReuseSelection(prefix_extent=prefix, non_prefix_hits=hits)
+        plan = policy.plan_recompute(_R(n), sel, block_size=16)
+        ref = _reference_plan(n, prefix, hits, link, per_run, policy)
+        if ref is None:
+            assert plan.recompute_offsets == [], (trial, n, prefix)
+            continue
+        ref_offsets, ref_reused = ref
+        assert plan.recompute_offsets == ref_offsets, (trial, n, prefix, link)
+        assert plan.reused_offsets == ref_reused, (trial, n, prefix, link)
+
+
+def test_load_chunk_converts_slots_once_per_chunk():
+    """_scatter_kv must receive the SAME slots tensor object for every layer
+    of a chunk (one list->tensor conversion per chunk, not per layer)."""
+    spy_slots: list[int] = []
+    w = _worker(_SpyAlignment(), num_layers=3)
+    sc = _stored_multi(3, old_start=0)
+    orig = w._scatter_kv
+
+    def spying_scatter(kv_cache, k, v, slots):
+        spy_slots.append(id(slots))
+        return EpicConnector._scatter_kv(w, kv_cache, k, v, slots)
+
+    w._scatter_kv = spying_scatter
+    w._load_chunk(sc, _spec(new_start=16))
+    assert len(spy_slots) == 3
+    assert len(set(spy_slots)) == 1  # one tensor object shared by all layers.
+
+
+def test_save_slots_tensor_memoized_per_list_identity():
+    w = object.__new__(EpicConnector)
+    slot_ids = list(range(32, 32 + CHUNK))
+    t1 = w._save_slots_tensor(slot_ids, torch.device("cpu"))
+    t2 = w._save_slots_tensor(slot_ids, torch.device("cpu"))
+    assert t1 is t2  # memo hit for the same list object.
+    other = list(slot_ids)
+    t3 = w._save_slots_tensor(other, torch.device("cpu"))
+    assert t3 is not t1
+    torch.testing.assert_close(t3, t1)
+    # wait_for_save clears the memo (metadata lifetime boundary).
+    w._store = None
+    w.wait_for_save()
+    assert w.__dict__["_save_slots_cache"] == {}
