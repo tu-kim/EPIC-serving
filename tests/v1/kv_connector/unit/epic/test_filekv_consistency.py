@@ -486,3 +486,164 @@ def test_external_staging_evict_roundtrip():
         assert backend._mapped_bytes == 0
     finally:
         backend.close()
+
+
+# ---------------------------------------------------------------------------
+# 3rd corner pass: consistency-feature edges.
+# ---------------------------------------------------------------------------
+
+
+def test_modify_unknown_path_falls_back_to_whole_file():
+    """on_file_modified for a path the catalog never saw: nothing to evict,
+    but the whole file is rendered at the current content and prefetched
+    (dropped -> warm) so the store converges anyway."""
+    cat = FileKVCatalog()
+    fps = {"new.py": "v1"}
+    warmed: list[str] = []
+    client = _FakeClient(known=[])
+    bridge = _bridge(client, cat, fps, warm=lambda r, t: warmed.append(t))
+
+    out = bridge.on_file_modified("new.py", dst_worker=0)
+    assert out["evicted"] == []
+    assert out["dropped"]  # whole-file fallback rendered + prefetched.
+    assert warmed and "new.py|None|None" in warmed[0]
+    assert cat.lookup(RangeKey("new.py")) is not None
+
+
+def test_shared_content_eviction_is_collateral_only():
+    """Two files with IDENTICAL bytes share chunk hashes. Modifying A evicts
+    the shared hashes from staging -- collateral for B, but only latency:
+    B's catalog unit stays valid and B's next round simply re-prefetches
+    (the CPU store was never touched)."""
+    cat = FileKVCatalog()
+    client = _FakeClient(known=[])
+    fps = {"a.py": "v1", "b.py": "v1"}
+    bridge = DynamoPrefetchBridge(
+        client=client,
+        render_fn=lambda read: "IDENTICAL-CONTENT",  # same bytes for both.
+        tokenize_fn=lambda text: list(range(CHUNK)),
+        chunk_size=CHUNK,
+        catalog=cat,
+        fingerprint_fn=lambda path: fps[path],
+    )
+    calls = (
+        "<tool_call><function=read>"
+        "<parameter=filePath>a.py</parameter></function></tool_call>"
+        "<tool_call><function=read>"
+        "<parameter=filePath>b.py</parameter></function></tool_call>"
+    )
+    bridge.on_turn_response(calls, dst_worker=0)
+    rec_a = cat.lookup(RangeKey("a.py"))
+    rec_b = cat.lookup(RangeKey("b.py"))
+    assert rec_a.chunk_hashes == rec_b.chunk_hashes  # shared content.
+
+    fps["a.py"] = "v2"
+    out = bridge.on_file_modified("a.py", dst_worker=0)
+    assert set(out["evicted"]) == set(rec_b.chunk_hashes)  # collateral evict.
+    # B is untouched in the catalog and still current.
+    assert cat.is_current(RangeKey("b.py"), "v1")
+    # B's next round re-prefetches the (still CPU-stored) shared hashes.
+    n_calls = len(client.calls)
+    bridge.on_turn_response(
+        "<tool_call><function=read>"
+        "<parameter=filePath>b.py</parameter></function></tool_call>",
+        dst_worker=0,
+    )
+    assert len(client.calls) == n_calls + 1
+    assert client.calls[-1]["hashes"] == rec_b.chunk_hashes
+
+
+def test_double_modification_evicts_each_generation_once():
+    cat = FileKVCatalog()
+    fps = {"f.py": "v1"}
+    client = _FakeClient(known=[])
+    bridge = _bridge(client, cat, fps)
+    bridge.on_turn_response(
+        "<tool_call><function=read>"
+        "<parameter=filePath>f.py</parameter></function></tool_call>",
+        dst_worker=0,
+    )
+    v1_hashes = list(cat.lookup(RangeKey("f.py")).chunk_hashes)
+
+    fps["f.py"] = "v2"
+    out2 = bridge.on_file_modified("f.py", dst_worker=0)
+    assert set(out2["evicted"]) == set(v1_hashes)
+    v2_hashes = list(cat.lookup(RangeKey("f.py")).chunk_hashes)
+    assert set(v2_hashes).isdisjoint(v1_hashes)
+
+    fps["f.py"] = "v3"
+    out3 = bridge.on_file_modified("f.py", dst_worker=0)
+    # Second modify evicts exactly the v2 generation, never re-evicts v1.
+    assert set(out3["evicted"]) == set(v2_hashes)
+    assert cat.current_version("f.py") == 2
+
+
+def test_modify_deleted_file_sends_evict_only():
+    """File edited then DELETED before the re-render: the eviction must still
+    go out (stale staging reclaimed); no new unit is recorded."""
+    cat = FileKVCatalog()
+    fps = {"f.py": "v1"}
+    client = _FakeClient(known=[])
+    bridge = _bridge(client, cat, fps)
+    bridge.on_turn_response(
+        "<tool_call><function=read>"
+        "<parameter=filePath>f.py</parameter></function></tool_call>",
+        dst_worker=0,
+    )
+    old_hashes = list(cat.lookup(RangeKey("f.py")).chunk_hashes)
+
+    # Deletion: fingerprint/render now raise.
+    def boom(path):
+        raise FileNotFoundError(path)
+
+    bridge._fingerprint = boom
+    out = bridge.on_file_modified("f.py", dst_worker=0)
+    assert set(out["evicted"]) == set(old_hashes)
+    assert out["queued"] == [] and out["warmed"] == []
+    assert client.calls[-1]["evict"] == out["evicted"]
+    assert client.calls[-1]["hashes"] == []
+    assert cat.lookup(RangeKey("f.py")) is None  # nothing re-recorded.
+
+
+def test_revert_within_one_directive_ends_staged():
+    """File reverted to old content between edit and re-render: the SAME hash
+    appears in evict_hashes AND chunk_hashes of one directive. Worker order
+    (evict first, stage second) must leave the chunk STAGED."""
+    EpicConnector.reset_debug_counters()
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    h = _store_chunk(store, list(range(2000, 2000 + CHUNK)))
+    staging = EpicGpuStagingStore(capacity_bytes=10**8)
+    w = _worker(store, staging)
+
+    meta0 = EpicConnectorMetadata()
+    meta0.add_prefetch(EpicReqPrefetch(chunk_hashes=[h], dst_worker=-1))
+    w._consume_prefetches(meta0)
+    assert staging.contains(h)
+
+    meta1 = EpicConnectorMetadata()
+    meta1.add_prefetch(
+        EpicReqPrefetch(chunk_hashes=[h], dst_worker=-1, evict_hashes=[h])
+    )
+    w._consume_prefetches(meta1)
+    assert staging.contains(h)  # net effect of revert: still staged.
+
+
+def test_evict_respects_worker_targeting():
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    h = _store_chunk(store, list(range(2000, 2000 + CHUNK)))
+    staging = EpicGpuStagingStore(capacity_bytes=10**8)
+    w = _worker(store, staging)
+    w._worker_id = 0
+
+    meta0 = EpicConnectorMetadata()
+    meta0.add_prefetch(EpicReqPrefetch(chunk_hashes=[h], dst_worker=-1))
+    w._consume_prefetches(meta0)
+    assert staging.contains(h)
+
+    # Eviction addressed to worker 1 must NOT touch worker 0's staging.
+    meta1 = EpicConnectorMetadata()
+    meta1.add_prefetch(
+        EpicReqPrefetch(chunk_hashes=[], dst_worker=1, evict_hashes=[h])
+    )
+    w._consume_prefetches(meta1)
+    assert staging.contains(h)
