@@ -386,3 +386,115 @@ def test_miss_never_produces_wrong_kv_end_to_end():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ---------------------------------------------------------------------------
+# 2nd-pass robustness: bounded parent memo, bounded command queue/frame,
+# staged source under a head trim.
+# ---------------------------------------------------------------------------
+
+
+def test_external_backend_parent_memo_is_bounded_lru():
+    """The parent-side mapping memo must not hold every chunk ever gotten
+    (a held mapping keeps the shared allocation alive past child eviction);
+    it is LRU-bounded by the same byte budget."""
+    one = _stored("probe", seed=1).nbytes()
+    backend = ExternalStagingBackend(capacity_bytes=2 * one)
+    try:
+        dev = torch.device("cpu")
+        for i, h in enumerate(["m1", "m2", "m3"]):
+            backend.stage(_stored(h, seed=70 + i), dev)
+            got = backend.get(h)
+            assert got is not None
+        # Memo bounded to ~2 chunks worth of bytes -> the oldest mapping fell.
+        assert len(backend._mapped) <= 2
+        assert "m1" not in backend._mapped
+        assert backend._mapped_bytes <= 2 * one
+        # Re-get of an evicted memo entry still works (child roundtrip or
+        # CPU-store fallback at the caller); here the child still has m2/m3.
+        assert backend.get("m3") is not None
+    finally:
+        backend.close()
+
+
+def test_prefetch_queue_drop_oldest_beyond_cap():
+    c, index = _scheduler_connector()
+    tokens = list(range(CHUNK))
+    h = hash_chunk_tokens(tokens)
+    index.register(h, CHUNK)
+    c._max_pending_prefetch = 5  # test-sized cap.
+    for i in range(9):
+        c.enqueue_prefetch(chunk_hashes=[h], dst_worker=i)
+    assert len(c._prefetch_queue) == 5
+    # Drop-oldest: the NEWEST intents survive (dst_worker 4..8).
+    assert [d.dst_worker for d in c._prefetch_queue] == [4, 5, 6, 7, 8]
+
+
+def test_listener_rejects_oversized_frame_without_parsing():
+    c, index = _scheduler_connector()
+    tokens = list(range(CHUNK))
+    h = hash_chunk_tokens(tokens)
+    index.register(h, CHUNK)
+
+    endpoint = f"ipc:///tmp/epic-pf-frame-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    listener = EpicPrefetchListener(
+        endpoint, c.handle_prefetch_command, max_frame_bytes=1024
+    )
+    listener.start()
+    try:
+        import zmq
+
+        ctx = zmq.Context.instance()
+        raw = ctx.socket(zmq.REQ)
+        raw.rcvtimeo = 5000
+        raw.linger = 0
+        raw.connect(endpoint)
+        raw.send(b"x" * 4096)  # over the 1 KiB test cap; not even valid JSON.
+        rep = json.loads(raw.recv())
+        assert rep["ok"] is False and "frame too large" in rep["error"]
+        raw.close(linger=0)
+
+        # Listener alive; a normal-sized command still works.
+        client = EpicPrefetchClient(endpoint, timeout_ms=5000)
+        queued, _ = client.prefetch(chunk_hashes=[h], dst_worker=0)
+        assert queued == [h]
+        client.close()
+    finally:
+        listener.stop()
+
+
+def test_staged_source_respects_head_trim():
+    """A prefetch-staged chunk consumed by a head-trimmed load spec (native
+    extent straddle) must scatter exactly the stored TAIL, same as the CPU
+    path."""
+    EpicConnector.reset_debug_counters()
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    sc = _stored("h-trim", seed=81)
+    store.put(sc)
+    staging = EpicGpuStagingStore(capacity_bytes=10**8)
+    w = _worker(store, staging)
+
+    meta = EpicConnectorMetadata()
+    meta.add_prefetch(EpicReqPrefetch(chunk_hashes=["h-trim"], dst_worker=-1))
+    w._consume_prefetches(meta)
+    assert staging.contains("h-trim")
+
+    trim = 16
+    dst = list(range(64, 64 + (CHUNK - trim)))
+    spec = ChunkLoadSpec(
+        chunk_hash="h-trim",
+        dst_slot_ids=dst,
+        old_pos_start=-1,
+        new_pos_start=trim,  # reload at original positions -> identity skip
+        length=CHUNK - trim,
+        src_offset=trim,
+    )
+    w._load_chunk(sc, spec)
+    assert EpicConnector.debug_counters["prefetch_hit"] == 1
+    res = check_scatter_fidelity(
+        w._kv_caches["l0"],
+        sc.k_per_layer["l0"][trim:],
+        sc.v_per_layer["l0"][trim:],
+        dst,
+    )
+    assert res is not None and res[0] and res[2]

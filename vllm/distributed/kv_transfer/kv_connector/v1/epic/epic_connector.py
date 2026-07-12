@@ -82,6 +82,10 @@ logger = init_logger(__name__)
 # 8 GB default CPU budget for cached chunks.
 DEFAULT_CAPACITY_BYTES = 8 * (1024**3)
 DEFAULT_CHUNK_SIZE = 256
+# Cap on externally-fed prefetch directives pending between engine steps
+# (drop-oldest beyond this; the endpoint is a control-plane socket driven by
+# the frontend, so the queue must not be unbounded).
+_MAX_PENDING_PREFETCH = 256
 
 
 class _PromptLenShim:
@@ -1000,6 +1004,23 @@ class EpicConnector(KVConnectorBase_V1):
             self._prefetch_queue.append(
                 EpicReqPrefetch(chunk_hashes=known, dst_worker=int(dst_worker))
             )
+            # Bounded queue: the endpoint is externally driven, so a frontend
+            # spamming commands between engine steps must not grow memory
+            # unboundedly. Drop the OLDEST directives (a prefetch is a hint;
+            # the newest intent is the most likely to matter next turn).
+            max_pending = int(
+                getattr(self, "_max_pending_prefetch", 0)
+                or _MAX_PENDING_PREFETCH
+            )
+            dropped_directives = len(self._prefetch_queue) - max_pending
+            if dropped_directives > 0:
+                del self._prefetch_queue[:dropped_directives]
+                logger.warning(
+                    "EPIC prefetch: queue over %d pending directives; "
+                    "dropped the %d oldest.",
+                    max_pending,
+                    dropped_directives,
+                )
         logger.info(
             "EPIC prefetch: queued %d chunks for worker %d.",
             len(known),

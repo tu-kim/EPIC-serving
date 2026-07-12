@@ -194,8 +194,12 @@ class ExternalStagingBackend:
     shm handles out and maps device tensors back (CUDA IPC / CPU shm).
 
     ``get`` results are memoized per hash so repeated loads of a staged chunk
-    cost one pipe roundtrip total; the memo is invalidated lazily by capacity
-    (it holds mappings, not copies).
+    cost one pipe roundtrip total. The memo is a BOUNDED LRU (same byte budget
+    as the staging worker): a parent-held mapping keeps the underlying shared
+    allocation alive even after a child-side eviction (that is the safety
+    property), so an unbounded memo would defeat the child's budget entirely
+    -- evicting the memo entry releases the mapping and lets the memory
+    actually return once the child has evicted too.
     """
 
     def __init__(self, capacity_bytes: int, spawn_method: str = "spawn"):
@@ -204,7 +208,10 @@ class ExternalStagingBackend:
         self._proc: Any = None
         self._conn: Any = None
         self._lock = threading.Lock()
-        self._mapped: dict[str, StagedChunk] = {}
+        from collections import OrderedDict
+
+        self._mapped: "OrderedDict[str, StagedChunk]" = OrderedDict()
+        self._mapped_bytes = 0
 
     # -- lifecycle --
 
@@ -244,6 +251,7 @@ class ExternalStagingBackend:
                     self._proc.terminate()
                 self._proc = None
         self._mapped.clear()
+        self._mapped_bytes = 0
 
     def _request(self, msg: tuple) -> tuple:
         assert self._conn is not None, "staging worker not started"
@@ -252,6 +260,13 @@ class ExternalStagingBackend:
             return self._conn.recv()
 
     # -- the connector-facing interface --
+
+    def _memo_put(self, chunk_hash: str, staged: StagedChunk) -> None:
+        self._mapped[chunk_hash] = staged
+        self._mapped_bytes += staged.nbytes()
+        while self._mapped_bytes > self.capacity_bytes and len(self._mapped) > 1:
+            _, evicted = self._mapped.popitem(last=False)  # LRU mapping.
+            self._mapped_bytes -= evicted.nbytes()
 
     def contains(self, chunk_hash: str) -> bool:
         if chunk_hash in self._mapped:
@@ -286,6 +301,7 @@ class ExternalStagingBackend:
     def get(self, chunk_hash: str) -> StagedChunk | None:
         cached = self._mapped.get(chunk_hash)
         if cached is not None:
+            self._mapped.move_to_end(chunk_hash)
             return cached
         if self._conn is None:
             return None
@@ -301,7 +317,7 @@ class ExternalStagingBackend:
             v_per_layer=dict(v_dict),
             ready_event=None,  # child synchronized before replying.
         )
-        self._mapped[chunk_hash] = staged
+        self._memo_put(chunk_hash, staged)
         return staged
 
     # -- introspection --

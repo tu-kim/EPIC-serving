@@ -63,11 +63,23 @@ CommandHandler = Callable[[dict], dict]
 
 
 class EpicPrefetchListener:
-    """ZMQ REP server thread that feeds commands to the connector."""
+    """ZMQ REP server thread that feeds commands to the connector.
 
-    def __init__(self, endpoint: str, handler: CommandHandler):
+    ``max_frame_bytes`` bounds a single command frame (default 16 MiB --
+    generous for hash lists, tiny for abuse): oversized frames are answered
+    with an error WITHOUT JSON-decoding them, keeping a misbehaving frontend
+    from ballooning the engine-core process.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        handler: CommandHandler,
+        max_frame_bytes: int = 16 * 1024 * 1024,
+    ):
         self._endpoint = endpoint
         self._handler = handler
+        self._max_frame_bytes = int(max_frame_bytes)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._ctx = None
@@ -90,8 +102,17 @@ class EpicPrefetchListener:
                 except zmq.ZMQError:
                     break
                 try:
-                    msg = json.loads(raw.decode("utf-8"))
-                    reply = self._handler(msg)
+                    if len(raw) > self._max_frame_bytes:
+                        reply = {
+                            "ok": False,
+                            "error": (
+                                f"frame too large ({len(raw)} bytes > "
+                                f"{self._max_frame_bytes})"
+                            ),
+                        }
+                    else:
+                        msg = json.loads(raw.decode("utf-8"))
+                        reply = self._handler(msg)
                 except Exception as e:  # noqa: BLE001 -- reply, don't die.
                     reply = {"ok": False, "error": repr(e)}
                 try:
