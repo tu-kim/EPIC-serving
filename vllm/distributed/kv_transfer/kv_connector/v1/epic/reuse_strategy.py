@@ -32,6 +32,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
+import numpy as np
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.metadata import (
@@ -503,25 +504,27 @@ class LegoLinkRecompute(RecomputePolicy):
         if prefix_extent >= n:
             return RecomputePlan()
 
+        # Vectorized derivation over boolean position masks (a 32k-token
+        # prompt is 32k Python-set inserts otherwise; per-hit slice writes and
+        # one flatnonzero replace all of it). Semantics identical to the
+        # original set formulation -- locked by the layout sweep tests and the
+        # reference-fuzz test in test_pipeline_optimizations.py.
+
         # ``reused``: logical positions served from reused (aligned) KV -- the
         # prefix A plus every non-prefix chunk B. M tokens that fall on a reused
         # position are *recomputed over* that position, but the position is
         # still "live" KV from attention's perspective.
-        reused: set[int] = set(range(min(prefix_extent, n)))
+        reused_mask = np.zeros(n, dtype=bool)
+        reused_mask[: min(prefix_extent, n)] = True
         for hit in selection.non_prefix_hits:
             lo = max(0, int(hit.prompt_offset))
             hi = min(n, lo + max(0, int(hit.length)))
-            reused.update(range(lo, hi))
-
-        # ``M`` set.
-        m: set[int] = set()
+            reused_mask[lo:hi] = True
 
         # (1) C -- genuinely new tokens: everything not covered by any reused
         # chunk (prefix A or non-prefix B). Prefix A is reused natively and is
         # excluded from M by construction.
-        for pos in range(n):
-            if pos not in reused:
-                m.add(pos)
+        m_mask = ~reused_mask
 
         # (2) link tokens -- the leading ``num_link_tokens`` of each non-prefix
         # chunk B. ``min`` clamps the boundary case where link > chunk length.
@@ -548,26 +551,25 @@ class LegoLinkRecompute(RecomputePolicy):
                     continue
                 lo = max(0, int(hit.prompt_offset))
                 hi = min(n, lo + min(link, max(0, int(hit.length))))
-                m.update(range(lo, hi))
+                m_mask[lo:hi] = True
 
-        # (3) last prompt token -- always recomputed. Skip-add if already in M
-        # (C or link) so there is no duplicate.
-        m.add(n - 1)
+        # (3) last prompt token -- always recomputed.
+        m_mask[n - 1] = True
 
-        offsets = sorted(m)
+        offsets_arr = np.flatnonzero(m_mask)
 
         # ---- invariants (DESIGN §4.1, brief S1) ----
-        assert offsets == sorted(set(offsets)), "M must be sorted + unique"
-        assert all(0 <= o < n for o in offsets), "M offsets must be in [0, N)"
-        assert offsets[-1] == n - 1, "last M offset must be N-1"
+        # flatnonzero is sorted+unique and in [0, N) by construction; the two
+        # content invariants remain asserted explicitly.
+        assert int(offsets_arr[-1]) == n - 1, "last M offset must be N-1"
         # Prefix A must never appear in M.
-        assert all(o >= prefix_extent for o in offsets), (
+        assert int(offsets_arr[0]) >= prefix_extent, (
             "prefix A positions must not be in M"
         )
 
+        offsets = offsets_arr.tolist()
         # Positions that participate in attention: reused KV ∪ M (sorted).
-        reused.update(offsets)
-        reused_offsets = sorted(reused)
+        reused_offsets = np.flatnonzero(reused_mask | m_mask).tolist()
 
         return RecomputePlan(
             recompute_offsets=offsets,

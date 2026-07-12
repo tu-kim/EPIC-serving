@@ -23,6 +23,7 @@ imp_indices), partial-mask fusion attention, sparse (non-prefix) forward.
 
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig
@@ -36,7 +37,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.epic.chunk_store import (
     EpicChunkStore,
     EpicSchedulerIndex,
     StoredChunk,
-    hash_chunk_tokens,
+    _tokens_to_bytes,
+    hash_chunk_bytes,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.metadata import (
     ChunkLoadSpec,
@@ -91,7 +93,7 @@ def check_scatter_fidelity(
     kv_cache: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    slot_ids: list[int],
+    slot_ids: "list[int] | torch.Tensor",
 ) -> tuple[bool, float, bool, float] | None:
     """Pure read-back comparison of a scatter (Implement 2 core, CPU-testable).
 
@@ -130,13 +132,16 @@ def check_scatter_fidelity(
 def _slot_ids_from_blocks(
     block_ids: list[int], block_size: int, start_token: int, num_tokens: int
 ) -> list[int]:
-    """Compute paged slot ids for tokens [start_token, start_token+num_tokens)."""
-    slots: list[int] = []
-    for i in range(start_token, start_token + num_tokens):
-        block_idx = i // block_size
-        offset = i % block_size
-        slots.append(block_ids[block_idx] * block_size + offset)
-    return slots
+    """Compute paged slot ids for tokens [start_token, start_token+num_tokens).
+
+    Vectorized: one numpy fancy-index instead of a per-token Python loop --
+    this runs for every load spec AND every saved chunk of every prompt.
+    Out-of-range block indices raise IndexError exactly like list indexing.
+    """
+    idx = np.arange(start_token, start_token + num_tokens, dtype=np.int64)
+    blocks = np.asarray(block_ids, dtype=np.int64)
+    slots = blocks[idx // block_size] * block_size + idx % block_size
+    return slots.tolist()
 
 
 class EpicConnector(KVConnectorBase_V1):
@@ -573,24 +578,32 @@ class EpicConnector(KVConnectorBase_V1):
         """
         out: list[tuple[int, int, str, str, str]] = []
         n = len(token_ids)
+        cs = self._chunk_size
+        if n < cs:
+            return out
+        # Encode the WHOLE prompt once; every chunk's content hash and every
+        # chain update then run over memoryview slices of the same buffer
+        # (previously: a list slice + one numpy encoding for the content hash
+        # + a second numpy encoding for the chain hash, per chunk).
+        buf = memoryview(_tokens_to_bytes(token_ids))
         start = 0
         hasher = ChainHasher()
         chain_before = hasher.digest()
-        while start + self._chunk_size <= n:
-            chunk = token_ids[start : start + self._chunk_size]
-            hasher.update(chunk)
+        while start + cs <= n:
+            window = buf[start * 4 : (start + cs) * 4]
+            hasher.update_bytes(window)
             chain_after = hasher.digest()
             out.append(
                 (
                     start,
-                    self._chunk_size,
-                    hash_chunk_tokens(chunk),
+                    cs,
+                    hash_chunk_bytes(window, cs),
                     chain_before,
                     chain_after,
                 )
             )
             chain_before = chain_after
-            start += self._chunk_size
+            start += cs
         return out
 
     # ===================== scheduler-side =====================
@@ -1519,12 +1532,20 @@ class EpicConnector(KVConnectorBase_V1):
         # objects to every align_keys call lets PICRotator's cos/sin memo hit
         # (the delta trig is computed once per chunk, not once per layer).
         device_positions: tuple[torch.Tensor, torch.Tensor] | None = None
+        # Same hoist for the destination slot ids: one list->tensor conversion
+        # (+H2D) per CHUNK; _scatter_kv passes an already-on-device tensor
+        # through torch.as_tensor unchanged.
+        slots_t: torch.Tensor | None = None
 
         for layer_name in self._layer_names:
             kv_cache = self._kv_caches.get(layer_name)
             if kv_cache is None or layer_name not in stored.k_per_layer:
                 continue
             device = kv_cache.device
+            if slots_t is None:
+                slots_t = torch.as_tensor(
+                    spec.dst_slot_ids[:length], device=device, dtype=torch.long
+                )
             k_cpu = stored.k_per_layer[layer_name][src_off : src_off + length]
             v_cpu = stored.v_per_layer[layer_name][src_off : src_off + length]
             k = k_cpu.to(device, non_blocking=True)
@@ -1546,14 +1567,14 @@ class EpicConnector(KVConnectorBase_V1):
                     layer_name,
                 )
 
-            self._scatter_kv(kv_cache, k, v, spec.dst_slot_ids[:length])
+            self._scatter_kv(kv_cache, k, v, slots_t)
 
             # DIAGNOSTIC (Implement 2): re-read the dst slots and compare to the
             # exact aligned K/V we just scattered. Catches paged-cache layout /
             # stride / aliasing bugs in situ. First loaded chunk only (latched).
             if debug_check and not check_done:
                 self._check_scatter_fidelity(
-                    kv_cache, k, v, spec.dst_slot_ids[:length], layer_name
+                    kv_cache, k, v, slots_t, layer_name
                 )
 
         # End-of-chunk: arm the latch so subsequent chunks this step are silent.
@@ -1583,7 +1604,7 @@ class EpicConnector(KVConnectorBase_V1):
         kv_cache: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        slot_ids: list[int],
+        slot_ids: "list[int] | torch.Tensor",
     ) -> None:
         """Scatter [num_tokens, heads, head_size] K/V into the paged cache.
 
@@ -1608,7 +1629,7 @@ class EpicConnector(KVConnectorBase_V1):
         kv_cache: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        slot_ids: list[int],
+        slot_ids: "list[int] | torch.Tensor",
         layer_name: str,
     ) -> None:
         """Read back the dst slots and compare to the scattered K/V (Implement 2).
@@ -1691,9 +1712,7 @@ class EpicConnector(KVConnectorBase_V1):
             for ci, chunk_hash in enumerate(save.chunk_hashes):
                 slot_ids = save.chunk_slot_ids[ci]
                 positions = save.chunk_positions[ci]
-                slots = torch.as_tensor(
-                    slot_ids, device=kv_layer.device, dtype=torch.long
-                )
+                slots = self._save_slots_tensor(slot_ids, kv_layer.device)
                 k = self._harvest_to_cpu(k_bank[slots].detach())
                 v = self._harvest_to_cpu(v_bank[slots].detach())
 
@@ -1715,6 +1734,30 @@ class EpicConnector(KVConnectorBase_V1):
                 stored.v_per_layer[layer_name] = v
                 # put() refreshes bytes / LRU; safe to call repeatedly per layer.
                 self._store.put(stored)
+
+    def _save_slots_tensor(
+        self, slot_ids: list[int], device: torch.device
+    ) -> torch.Tensor:
+        """Per-step memo of a save chunk's slot tensor.
+
+        ``save_kv_layer`` runs once per LAYER with the SAME slot-id list
+        objects (the step metadata outlives the forward), so converting the
+        list to a device tensor num_layers times per chunk was pure waste.
+        Keyed by list identity with a strong reference held in the entry (no
+        id-recycling hazard); cleared in ``wait_for_save`` when the step's
+        metadata dies.
+        """
+        cache: dict = self.__dict__.setdefault("_save_slots_cache", {})
+        entry = cache.get(id(slot_ids))
+        if (
+            entry is not None
+            and entry[0] is slot_ids
+            and entry[1].device == device
+        ):
+            return entry[1]
+        t = torch.as_tensor(slot_ids, device=device, dtype=torch.long)
+        cache[id(slot_ids)] = (slot_ids, t)
+        return t
 
     def _harvest_to_cpu(self, src: torch.Tensor) -> torch.Tensor:
         """Copy one harvested K/V tensor to (pinned) CPU for the store.
@@ -1747,4 +1790,9 @@ class EpicConnector(KVConnectorBase_V1):
         if getattr(self, "_pending_save_sync", False):
             torch.cuda.current_stream().synchronize()
             self._pending_save_sync = False
+        # The step's save metadata (and its slot-id lists) is done -- drop the
+        # per-step slot-tensor memo so nothing outlives its list.
+        cache = self.__dict__.get("_save_slots_cache")
+        if cache:
+            cache.clear()
         return

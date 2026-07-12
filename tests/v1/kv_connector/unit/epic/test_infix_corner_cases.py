@@ -573,3 +573,59 @@ def test_link_per_run_chain_mismatch_stitches_both():
     m = _m(meta)
     assert set(range(2 * CHUNK, 2 * CHUNK + LINK)) <= m
     assert set(range(3 * CHUNK, 3 * CHUNK + LINK)) <= m  # stitched: no proof.
+
+
+# ---------------------------------------------------------------------------
+# Compound corners (2nd pass): interactions between the native-extent trim,
+# context chains, and per-run links.
+# ---------------------------------------------------------------------------
+
+
+def test_straddled_run_head_keeps_per_run_link_via_chains():
+    """nc cuts INTO the first chunk of a 2-chunk same-warm file: the trimmed
+    head still gets the (single) run link at the cut point, and the second
+    chunk stays link-free because chain continuity survives the trim
+    (chain_end/chain_start describe the stored chunks, not the trim)."""
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    c1, c2 = _seg(2000), _seg(3000)
+    _store_chunk(store, c1, old_start=0, save_context=[])
+    _store_chunk(store, c2, old_start=CHUNK, save_context=list(c1))
+    c = _connector(store, link_per_run=True)
+
+    tokens = _seg(0) + _seg(1000) + c1 + c2 + _seg(4000)  # A|B|C1|C2|G
+    cut = 2 * CHUNK + BLOCK  # native covers A+B+16 tokens of C1.
+    ext, meta = _schedule(c, tokens, nc=cut)
+
+    # external = nc + trimmed(C1) + C2.
+    assert ext == (CHUNK - BLOCK) + CHUNK
+    specs = {s.new_pos_start: s for load in meta.loads for s in load.chunks}
+    assert specs[cut].src_offset == BLOCK  # C1 head-trimmed.
+    assert specs[3 * CHUNK].src_offset == 0  # C2 full.
+    m = _m(meta)
+    assert m.isdisjoint(range(0, cut))  # native region untouched.
+    assert set(range(cut, cut + LINK)) <= m  # run link anchored at the cut.
+    assert m.isdisjoint(range(3 * CHUNK, 3 * CHUNK + LINK))  # run-internal.
+
+
+def test_chain_mismatch_head_with_partial_native_cover():
+    """First chunk content-matches the prompt head but was saved under a
+    DIFFERENT context, and the native cache covers part of it: the hit must
+    not fold, its load is head-trimmed to the uncovered tail, and the stitch
+    anchors at the native boundary."""
+    store = EpicChunkStore(capacity_bytes=10**8, pin_memory=False)
+    a, g = _seg(0), _seg(4000)
+    _store_chunk(store, a, save_context=_seg(9000))  # mismatched context.
+    c = _connector(store)
+
+    tokens = a + g
+    nc = BLOCK  # native covers the first 16 tokens.
+    ext, meta = _schedule(c, tokens, nc=nc)
+
+    assert ext == CHUNK - BLOCK  # only the uncovered tail is external.
+    specs = [s for load in meta.loads for s in load.chunks]
+    assert len(specs) == 1
+    assert specs[0].new_pos_start == nc and specs[0].src_offset == BLOCK
+    m = _m(meta)
+    assert m.isdisjoint(range(0, nc))
+    assert set(range(nc, nc + LINK)) <= m  # stitch at the native boundary.
+    assert (nc + LINK) not in m
