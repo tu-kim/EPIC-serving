@@ -46,6 +46,12 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.epic.filekv_catalog import (  # noqa: E501
+        FileKVCatalog,
+    )
 
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.prefetch_parser import (
     RenderFn,
@@ -181,14 +187,21 @@ class EpicPrefetchClient:
         chunk_hashes: list[str] | None = None,
         token_ids: list[int] | None = None,
         dst_worker: int = -1,
+        evict_hashes: list[str] | None = None,
     ) -> tuple[list[str], list[str]]:
-        """Inject a prefetch command. Returns (queued, dropped) hashes."""
+        """Inject a prefetch command. Returns (queued, dropped) hashes.
+
+        ``evict_hashes`` invalidates stale STAGED chunks on the workers
+        (file-modification lifecycle); may be sent with or without new
+        hashes to stage.
+        """
         reply = self._roundtrip(
             {
                 "cmd": "prefetch",
                 "chunk_hashes": list(chunk_hashes or []),
                 "token_ids": list(token_ids or []),
                 "dst_worker": int(dst_worker),
+                "evict_hashes": list(evict_hashes or []),
             }
         )
         if not reply.get("ok"):
@@ -209,6 +222,22 @@ class DynamoPrefetchBridge:
     decision (``dst_worker``) per turn; everything else -- parsing the tool
     calls out of the decode worker's response, byte-faithful rendering,
     tokenization, chunk hashing -- happens here, engine-independent.
+
+    Consistency (mid-turn file modifications; see filekv_catalog.py):
+      * ``catalog`` + ``fingerprint_fn``: every processed read is recorded as
+        (path, canonical range) -> (fingerprint, hashes). The file is
+        fingerprinted BEFORE and AFTER rendering; a mismatch means the render
+        may be TORN (an agent was writing concurrently) -> that file is
+        skipped this round (a prefetch is a hint).
+      * ``on_file_modified(path, dst_worker)``: the tool executor calls this
+        when an agent edits a file. Stale staged chunks are EVICTED on the
+        workers, and every previously-recorded unit of the path is
+        re-rendered at the new version and re-prefetched (its ``dropped``
+        reply fires ``warm_fn``, which repopulates fileKV via the engine's
+        normal save path -- the "re-save" flow).
+    Partial reads: ranges are canonicalized with ``snap_lines`` (see
+    ``canonicalize_range``); renders below ``min_cache_tokens`` are skipped
+    (sub-chunk text cannot fill a grid chunk and recompute is cheap).
     """
 
     def __init__(
@@ -220,6 +249,10 @@ class DynamoPrefetchBridge:
         chunk_size: int = 256,
         pad_token_id: int = 0,
         warm_fn: Callable[[ToolCallRead, str], None] | None = None,
+        catalog: "FileKVCatalog | None" = None,
+        fingerprint_fn: Callable[[str], str] | None = None,
+        snap_lines: int = 0,
+        min_cache_tokens: int | None = None,
     ):
         from vllm.distributed.kv_transfer.kv_connector.v1.epic.chunk_store import (  # noqa: E501
             hash_chunk_tokens,
@@ -232,6 +265,16 @@ class DynamoPrefetchBridge:
         self._pad = int(pad_token_id)
         self._warm = warm_fn
         self._hash = hash_chunk_tokens
+        self._catalog = catalog
+        self._fingerprint = fingerprint_fn
+        self._snap_lines = int(snap_lines)
+        # Below this many raw tokens a render cannot fill one grid chunk;
+        # caching it would be pure overhead (recompute is microseconds).
+        self._min_cache_tokens = (
+            int(min_cache_tokens)
+            if min_cache_tokens is not None
+            else self._chunk_size
+        )
 
     def _hashes(self, token_ids: list[int]) -> list[str]:
         ids = list(token_ids)
@@ -245,6 +288,75 @@ class DynamoPrefetchBridge:
             for i in range(0, len(ids), self._chunk_size)
         ]
 
+    def _canonical_read(self, read: ToolCallRead) -> ToolCallRead:
+        from vllm.distributed.kv_transfer.kv_connector.v1.epic.filekv_catalog import (  # noqa: E501
+            canonicalize_range,
+        )
+
+        start, end = canonicalize_range(
+            read.start_line, read.end_line, self._snap_lines
+        )
+        if (start, end) == (read.start_line, read.end_line):
+            return read
+        return ToolCallRead(
+            file_path=read.file_path, start_line=start, end_line=end
+        )
+
+    def _process_read(
+        self, read: ToolCallRead
+    ) -> "tuple[ToolCallRead, str, list[str], list[str]] | None":
+        """Canonicalize, render (torn-safe), hash and record one read.
+
+        Returns (canonical_read, text, hashes, stale_evictions) or None when
+        the read is skipped (torn render / sub-chunk / render error).
+        """
+        from vllm.distributed.kv_transfer.kv_connector.v1.epic.filekv_catalog import (  # noqa: E501
+            RangeKey,
+        )
+
+        read = self._canonical_read(read)
+        try:
+            fp_before = (
+                self._fingerprint(read.file_path) if self._fingerprint else ""
+            )
+            text = self._render(read)
+            fp_after = (
+                self._fingerprint(read.file_path) if self._fingerprint else ""
+            )
+            if fp_before != fp_after:
+                logger.warning(
+                    "EPIC prefetch bridge: %s changed WHILE rendering (torn "
+                    "render); skipping this round.",
+                    read.file_path,
+                )
+                return None
+            ids = self._tokenize(text)
+        except Exception as e:  # noqa: BLE001 -- best-effort per file.
+            logger.warning(
+                "EPIC prefetch bridge: render/tokenize failed for %s: %s",
+                read.file_path,
+                e,
+            )
+            return None
+        if len(ids) < self._min_cache_tokens:
+            logger.debug(
+                "EPIC prefetch bridge: %s render below %d tokens; "
+                "not cacheable (recompute is cheap), skipping.",
+                read.file_path,
+                self._min_cache_tokens,
+            )
+            return None
+        hashes = self._hashes(ids)
+        stale: list[str] = []
+        if self._catalog is not None:
+            key = RangeKey(read.file_path, read.start_line, read.end_line)
+            # Missed-modification defense: if the recorded fingerprint
+            # differs, the old unit's hashes are stale -> evict them along
+            # with this command.
+            stale = self._catalog.stale_check(key, fp_after)
+            self._catalog.record(key, fp_after, hashes)
+        return read, text, hashes, stale
+
     def on_turn_response(
         self, llm_output: str, dst_worker: int
     ) -> dict[str, list[str]]:
@@ -256,30 +368,35 @@ class DynamoPrefetchBridge:
         """
         per_read: list[tuple[ToolCallRead, str, list[str]]] = []
         all_hashes: list[str] = []
+        evictions: list[str] = []
         seen: set[str] = set()
         for read in parse_tool_call_reads(llm_output):
-            try:
-                text = self._render(read)
-                hashes = self._hashes(self._tokenize(text))
-            except Exception as e:  # noqa: BLE001 -- best-effort per file.
-                logger.warning(
-                    "EPIC prefetch bridge: render/tokenize failed for %s: %s",
-                    read.file_path,
-                    e,
-                )
+            processed = self._process_read(read)
+            if processed is None:
                 continue
-            per_read.append((read, text, hashes))
+            c_read, text, hashes, stale = processed
+            per_read.append((c_read, text, hashes))
+            evictions.extend(h for h in stale if h not in set(evictions))
             for h in hashes:
                 if h not in seen:
                     seen.add(h)
                     all_hashes.append(h)
 
-        if not all_hashes:
+        if not all_hashes and not evictions:
             return {"queued": [], "dropped": [], "warmed": []}
 
-        queued, dropped = self._client.prefetch(
-            chunk_hashes=all_hashes, dst_worker=dst_worker
-        )
+        kwargs: dict = {"chunk_hashes": all_hashes, "dst_worker": dst_worker}
+        if evictions:
+            kwargs["evict_hashes"] = evictions
+        queued, dropped = self._client.prefetch(**kwargs)
+        warmed = self._warm_dropped(per_read, dropped)
+        return {"queued": queued, "dropped": dropped, "warmed": warmed}
+
+    def _warm_dropped(
+        self,
+        per_read: list[tuple[ToolCallRead, str, list[str]]],
+        dropped: list[str],
+    ) -> list[str]:
         warmed: list[str] = []
         if dropped and self._warm is not None:
             dropped_set = set(dropped)
@@ -294,4 +411,72 @@ class DynamoPrefetchBridge:
                             read.file_path,
                             e,
                         )
-        return {"queued": queued, "dropped": dropped, "warmed": warmed}
+        return warmed
+
+    def on_file_modified(self, path: str, dst_worker: int) -> dict:
+        """File-modification lifecycle: evict stale staging, re-warm the new
+        version ("다시 fileKV로 저장").
+
+        Call from the tool executor whenever an agent writes ``path``
+        mid-turn. Effects, in order:
+          1. the catalog bumps the path's version and yields every recorded
+             unit -> their hashes are sent as ``evict_hashes`` (workers drop
+             the stale STAGED copies; the CPU store is untouched -- content
+             addressing keeps old chunks valid for in-flight prompts that
+             still embed the old bytes, and they age out via LRU);
+          2. every previously-known unit (whole file / canonical ranges) is
+             re-rendered at the NEW content and re-prefetched; hashes the
+             engine does not know yet come back as ``dropped`` and fire
+             ``warm_fn`` -- the engine's normal save path then re-saves the
+             new version's fileKV.
+        Without a catalog only step 2 for the whole file runs (no eviction
+        bookkeeping is possible).
+        """
+        stale: list[str] = []
+        reads: list[ToolCallRead] = []
+        if self._catalog is not None:
+            records = self._catalog.on_file_modified(path)
+            seen: set[str] = set()
+            for rec in records:
+                for h in rec.chunk_hashes:
+                    if h not in seen:
+                        seen.add(h)
+                        stale.append(h)
+                reads.append(
+                    ToolCallRead(
+                        file_path=path,
+                        start_line=rec.key.start_line,
+                        end_line=rec.key.end_line,
+                    )
+                )
+        if not reads:
+            reads = [ToolCallRead(file_path=path)]  # whole file fallback.
+
+        per_read: list[tuple[ToolCallRead, str, list[str]]] = []
+        new_hashes: list[str] = []
+        seen_h: set[str] = set()
+        for read in reads:
+            processed = self._process_read(read)
+            if processed is None:
+                continue
+            c_read, text, hashes, more_stale = processed
+            per_read.append((c_read, text, hashes))
+            stale.extend(h for h in more_stale if h not in set(stale))
+            for h in hashes:
+                if h not in seen_h:
+                    seen_h.add(h)
+                    new_hashes.append(h)
+
+        if not new_hashes and not stale:
+            return {"evicted": [], "queued": [], "dropped": [], "warmed": []}
+        kwargs: dict = {"chunk_hashes": new_hashes, "dst_worker": dst_worker}
+        if stale:
+            kwargs["evict_hashes"] = stale
+        queued, dropped = self._client.prefetch(**kwargs)
+        warmed = self._warm_dropped(per_read, dropped)
+        return {
+            "evicted": stale,
+            "queued": queued,
+            "dropped": dropped,
+            "warmed": warmed,
+        }

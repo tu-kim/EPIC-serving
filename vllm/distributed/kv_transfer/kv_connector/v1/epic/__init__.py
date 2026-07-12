@@ -39,6 +39,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.epic.prefetch_parser import (
     ToolCallRead,
     parse_tool_call_reads,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.epic.filekv_catalog import (
+    FileKVCatalog,
+    FileUnitRecord,
+    RangeKey,
+    canonicalize_range,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.prefetch_service import (
     DynamoPrefetchBridge,
     EpicPrefetchClient,
@@ -78,6 +84,10 @@ __all__ = [
     "ToolCallRead",
     "parse_tool_call_reads",
     "DynamoPrefetchBridge",
+    "FileKVCatalog",
+    "FileUnitRecord",
+    "RangeKey",
+    "canonicalize_range",
     "EpicPrefetchClient",
     "EpicPrefetchListener",
     "ExternalStagingBackend",

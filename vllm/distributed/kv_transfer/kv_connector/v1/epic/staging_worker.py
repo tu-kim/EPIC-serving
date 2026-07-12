@@ -164,6 +164,12 @@ def _staging_child_main(conn, device_str: str, capacity_bytes: int) -> None:
                     )
             elif cmd == "contains":
                 conn.send(("ok", msg[1] in store))
+            elif cmd == "evict":
+                _, h = msg
+                staged = store.pop(h, None)
+                if staged is not None:
+                    cur_bytes -= staged.nbytes()
+                conn.send(("ok", staged is not None))
             elif cmd == "stats":
                 conn.send(("ok", {"chunks": len(store), "bytes": cur_bytes}))
             elif cmd == "stop":
@@ -297,6 +303,19 @@ class ExternalStagingBackend:
         )
         if rep[0] != "ok":
             logger.warning("EPIC staging worker stage failed: %s", rep)
+
+    def evict(self, chunk_hash: str) -> None:
+        """Drop a staged chunk (file-modification invalidation).
+
+        Releases the parent-side mapping AND tells the child to drop its
+        copy; torch's shared-memory/IPC ref-counting frees the underlying
+        allocation once both sides have released.
+        """
+        cached = self._mapped.pop(chunk_hash, None)
+        if cached is not None:
+            self._mapped_bytes -= cached.nbytes()
+        if self._conn is not None:
+            self._request(("evict", chunk_hash))
 
     def get(self, chunk_hash: str) -> StagedChunk | None:
         cached = self._mapped.get(chunk_hash)

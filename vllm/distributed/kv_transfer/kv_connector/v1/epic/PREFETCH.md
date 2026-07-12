@@ -137,3 +137,66 @@ Staging inside the vLLM worker can contend with in-flight generation
   (gather → rotate → scatter, no collective), so a skew only shows up as
   per-rank latency, never as wrong KV. Shapes/positions/masks come from
   scheduler metadata identical on all ranks.
+
+## Mid-turn file modification & multi-agent consistency
+
+**The engine needs no coordination for correctness.** The store is
+content-addressed and (in sparse mode) chain-verified, which yields two
+invariants:
+
+1. *No stale reuse, ever*: an edited file renders to different bytes →
+   different chunk hashes → v1's chunks can never match a prompt embedding
+   v2. Reuse only ever serves bytes literally present in the prompt.
+2. *Versions coexist*: another agent whose in-flight context still embeds v1
+   correctly keeps hitting v1's chunks (that IS its prompt); v1 ages out via
+   LRU. A miss is just a recompute.
+
+What a modification breaks is *lifecycle efficiency*, handled frontend-side
+(`filekv_catalog.py` + the bridge; the catalog is shared by all agents of a
+frontend, so one agent's edit invalidates everyone's intents):
+
+```
+agent edits f.py (tool executor knows)
+      │
+      ▼
+bridge.on_file_modified("f.py", dst_worker)
+      │ 1. catalog bumps version, pops every (f.py, range) unit
+      │ 2. prefetch command with evict_hashes = stale staged chunks
+      │       → workers reclaim GPU staging budget NOW (evictions run
+      │         BEFORE stagings in the same directive, so old+new never
+      │         need to fit simultaneously); CPU store untouched
+      │ 3. every known unit re-rendered at the NEW content → re-prefetched
+      │       → unknown hashes come back `dropped` → warm_fn fires
+      │       → the engine's NORMAL save path re-saves the new fileKV
+      ▼
+next turn prefetches hit the new version
+```
+
+* **Torn renders**: the bridge fingerprints the file before AND after
+  rendering (`fingerprint_fn`, e.g. mtime+size or content sha); a mismatch
+  means an agent was writing concurrently → skip that file this round (a
+  prefetch is a hint; the `on_file_modified` round covers it).
+* **Missed-modification defense**: even without an `on_file_modified` call,
+  the next `on_turn_response` render notices the fingerprint drift
+  (`catalog.stale_check`) and sends the evictions with the same command.
+
+## Partial (line-range) reads
+
+A range read's tool-result text is its own byte content → its own chunks;
+the engine treats it like any other content. Policies (bridge-level):
+
+* **Sub-chunk renders are not cached** (`min_cache_tokens`, default =
+  chunk_size): a 3-line read can't fill a 256-token grid chunk, and
+  recomputing a few hundred tokens costs microseconds — caching would be
+  pure overhead.
+* **Exact-range caching** (default): a repeated identical range (≥ 1 chunk
+  of tokens, byte-identical render, grid-aligned in the prompt) reuses like
+  a small file.
+* **Canonical snapping** (`snap_lines=N`): requested ranges are snapped
+  OUTWARD to N-line boundaries, so nearby requests (50–100, then 1–90 with
+  snap=100 → both 1–100) map to ONE canonical render → same chunks → the
+  second request reuses the first's KV. Requires the tool result to serve
+  the snapped superset (deployment choice).
+* Full-file reads and range reads of the same file share no KV (different
+  bytes by construction) — prefer whole-file reads for hot files, snapping
+  for exploratory range reads.

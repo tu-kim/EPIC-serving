@@ -142,7 +142,12 @@ def test_duplicate_hashes_queue_once():
 def test_empty_command_is_ok_noop():
     c, _ = _scheduler_connector()
     reply = c.handle_prefetch_command({"cmd": "prefetch"})
-    assert reply == {"ok": True, "queued": [], "dropped": []}
+    assert reply == {
+        "ok": True,
+        "queued": [],
+        "dropped": [],
+        "evict_queued": 0,
+    }
     assert c._prefetch_queue == []
 
 

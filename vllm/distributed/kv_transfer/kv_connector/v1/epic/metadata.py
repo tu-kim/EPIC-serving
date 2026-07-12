@@ -144,6 +144,14 @@ class EpicReqPrefetch:
     # Target worker/replica id as assigned by the frontend scheduler (the
     # connector's ``epic_worker_id`` extra-config). -1 == every worker stages.
     dst_worker: int = -1
+    # Chunks to EVICT from the GPU staging store (file-modification
+    # invalidation: a mid-turn edit makes the old version's staged chunks
+    # dead weight -- they can never match the new render, so reclaim the
+    # staging budget immediately instead of waiting for LRU). Eviction only
+    # touches STAGING, never the CPU fileKV store: content addressing keeps
+    # old-version chunks valid for any in-flight prompt that still embeds
+    # the old bytes, and the CPU copy ages out via normal LRU.
+    evict_hashes: list[str] = field(default_factory=list)
 
 
 @dataclass

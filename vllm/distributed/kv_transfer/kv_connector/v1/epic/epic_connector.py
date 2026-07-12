@@ -207,6 +207,9 @@ class EpicConnector(KVConnectorBase_V1):
         "prefetch_staged": 0,
         "prefetch_hit": 0,
         "prefetch_miss": 0,
+        # prefetch_evicted -> staged chunks dropped by a file-modification
+        # invalidation directive (evict_hashes).
+        "prefetch_evicted": 0,
     }
 
     # EPIC diagnostics: per-request SELECTION summary so a probe (musique_blend)
@@ -965,6 +968,7 @@ class EpicConnector(KVConnectorBase_V1):
         chunk_hashes: list[str] | None = None,
         token_ids: list[int] | None = None,
         dst_worker: int = -1,
+        evict_hashes: list[str] | None = None,
     ) -> list[str]:
         """Queue fileKV chunks for GPU staging on a designated worker.
 
@@ -984,11 +988,17 @@ class EpicConnector(KVConnectorBase_V1):
                 connector's own chunk grid.
             dst_worker: the frontend-assigned worker/replica id that should
                 stage (matched against ``epic_worker_id``); -1 = every worker.
+            evict_hashes: chunks to DROP from the workers' GPU staging
+                (file-modification invalidation): the old version's staged
+                copies can never match the new render, so reclaim the budget
+                immediately. Passed through unfiltered (they may already be
+                gone from the index -- eviction must still reach staging).
 
-        Returns the hashes actually queued. Unknown hashes (not in the store
-        index -- e.g. the warm request has not run yet) are dropped with a log:
-        a prefetch can only stage what the fileKV store already holds.
-        Thread-safe; callable from outside the engine-core loop.
+        Returns the hashes actually queued for staging. Unknown hashes (not
+        in the store index -- e.g. the warm request has not run yet) are
+        dropped with a log: a prefetch can only stage what the fileKV store
+        already holds. Thread-safe; callable from outside the engine-core
+        loop.
         """
         hashes: list[str] = list(chunk_hashes or [])
         if token_ids:
@@ -999,6 +1009,7 @@ class EpicConnector(KVConnectorBase_V1):
         unique = list(dict.fromkeys(hashes))
         index = self._membership()
         known = [h for h in unique if index.contains(h)]
+        evict = list(dict.fromkeys(evict_hashes or []))
         if len(known) < len(unique):
             logger.info(
                 "EPIC prefetch: dropped %d/%d unknown chunk hashes (not in the "
@@ -1006,11 +1017,15 @@ class EpicConnector(KVConnectorBase_V1):
                 len(unique) - len(known),
                 len(unique),
             )
-        if not known:
+        if not known and not evict:
             return []
         with self._prefetch_lock:
             self._prefetch_queue.append(
-                EpicReqPrefetch(chunk_hashes=known, dst_worker=int(dst_worker))
+                EpicReqPrefetch(
+                    chunk_hashes=known,
+                    dst_worker=int(dst_worker),
+                    evict_hashes=evict,
+                )
             )
             # Bounded queue: the endpoint is externally driven, so a frontend
             # spamming commands between engine steps must not grow memory
@@ -1060,15 +1075,18 @@ class EpicConnector(KVConnectorBase_V1):
                 )
             )
         unique = list(dict.fromkeys(hashes))
+        evict = [str(h) for h in (msg.get("evict_hashes") or [])]
         queued = self.enqueue_prefetch(
             chunk_hashes=unique,
             dst_worker=int(msg.get("dst_worker", -1)),
+            evict_hashes=evict,
         )
         queued_set = set(queued)
         return {
             "ok": True,
             "queued": queued,
             "dropped": [h for h in unique if h not in queued_set],
+            "evict_queued": len(evict),
         }
 
     def build_connector_meta(
@@ -1655,12 +1673,19 @@ class EpicConnector(KVConnectorBase_V1):
             return  # KV caches not registered yet; directive dropped (hint).
 
         my_id = int(getattr(self, "_worker_id", -1))
-        staged = skipped = missing = 0
+        staged = skipped = missing = evicted = 0
         for directive in prefetches:
             dst = int(directive.dst_worker)
             if dst != -1 and my_id != -1 and dst != my_id:
                 skipped += len(directive.chunk_hashes)
                 continue  # addressed to a different worker/replica.
+            # Evictions first (file-modification invalidation): reclaim the
+            # staging budget the stale version holds BEFORE staging the new
+            # one, so both versions never need to fit simultaneously.
+            for h in getattr(directive, "evict_hashes", []) or []:
+                if staging.contains(h):
+                    staging.evict(h)
+                    evicted += 1
             for h in directive.chunk_hashes:
                 if staging.contains(h):
                     continue
@@ -1670,18 +1695,22 @@ class EpicConnector(KVConnectorBase_V1):
                     continue
                 staging.stage(stored, device)
                 staged += 1
-        if staged or missing or skipped:
+        if staged or missing or skipped or evicted:
             logger.info(
-                "EPIC prefetch: staged=%d store_missing=%d other_worker=%d "
-                "staging_bytes=%d/%d",
+                "EPIC prefetch: staged=%d evicted=%d store_missing=%d "
+                "other_worker=%d staging_bytes=%d/%d",
                 staged,
+                evicted,
                 missing,
                 skipped,
                 staging.current_bytes,
                 staging.capacity_bytes,
             )
-        if staged and getattr(self, "_debug_counters", False):
-            self._bump_counter("prefetch_staged", staged)
+        if getattr(self, "_debug_counters", False):
+            if staged:
+                self._bump_counter("prefetch_staged", staged)
+            if evicted:
+                self._bump_counter("prefetch_evicted", evicted)
 
     def _install_fusion_mask(
         self,
