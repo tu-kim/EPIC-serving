@@ -24,7 +24,6 @@ imp_indices), partial-mask fusion attention, sparse (non-prefix) forward.
 import threading
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
 import torch
 
 from vllm.config import VllmConfig
@@ -144,14 +143,23 @@ def _slot_ids_from_blocks(
 ) -> list[int]:
     """Compute paged slot ids for tokens [start_token, start_token+num_tokens).
 
-    Vectorized: one numpy fancy-index instead of a per-token Python loop --
-    this runs for every load spec AND every saved chunk of every prompt.
-    Out-of-range block indices raise IndexError exactly like list indexing.
+    Per-BLOCK iteration (a block's slots are one contiguous run, extended via
+    C-speed ``range``) instead of a per-token loop: ~3x fewer Python steps for
+    block_size=16 chunks. (A numpy formulation was measured SLOWER here --
+    converting the request's whole block list to an array per call dominates
+    for 256-token chunks.) Out-of-range block indices raise IndexError exactly
+    like before.
     """
-    idx = np.arange(start_token, start_token + num_tokens, dtype=np.int64)
-    blocks = np.asarray(block_ids, dtype=np.int64)
-    slots = blocks[idx // block_size] * block_size + idx % block_size
-    return slots.tolist()
+    slots: list[int] = []
+    i = start_token
+    end = start_token + num_tokens
+    while i < end:
+        base = block_ids[i // block_size] * block_size
+        off = i % block_size
+        take = min(block_size - off, end - i)
+        slots.extend(range(base + off, base + off + take))
+        i += take
+    return slots
 
 
 class EpicConnector(KVConnectorBase_V1):
