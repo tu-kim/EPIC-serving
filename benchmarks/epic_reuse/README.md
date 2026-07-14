@@ -228,3 +228,52 @@ HF questions). If even `epic@32` stays far below dense, suspect a PIC / mask bug
 The chunk-alignment contract is identical in both modes: B is still built at the
 token-id level to exactly `b_tokens` (a chunk multiple) so its content hashes
 collide between the warmup and target prompts.
+
+## Turn-migration bench: fileKV vs worker-to-worker copy (`bench_migration.py`)
+
+Answers: *worker1 served turn 9; turn 10 lands on worker2 — is it better to
+W2W-copy the whole history KV from (busy) worker1, or recompute the history
+on worker2 with fileKV assist?*
+
+Strategies compared: `w2w` (copy full history KV = exact prefix reuse; large
+bytes + worker1 HBM interference), `filekv` (recompute non-file history, load
+file chunks from the CPU store / GPU staging; zero worker1 contact; H2D hidden
+on a prefetch hit), `full` (recompute floor).
+
+Three layers:
+
+1. **Microbench** (needs >= 2 CUDA devices) — measures the machine inputs:
+   D2D peer bandwidth with the source idle vs busy (HBM-bound triad load),
+   the triad's own slowdown while a copy streams out (== worker1 serving
+   degradation), pinned H2D, and the through-CPU staged fallback:
+   ```bash
+   python -m benchmarks.epic_reuse.bench_migration --run -o migration.json
+   ```
+2. **Cost model** (CPU, torch-free) — sweeps history x file-fraction x
+   src-busy x prefetch-hit and prints per-strategy TTFT, bytes moved, and
+   worker1 interference, with the winner per cell:
+   ```bash
+   python -m benchmarks.epic_reuse.bench_migration --plan-only \
+       --measured migration.json --prefill-tokps <from bench_perf>
+   ```
+   Arithmetic pinned by `tests/.../epic/test_migration_bench.py`.
+3. **End-to-end** (2 GPUs, heavy — run after the model narrows the grid):
+   - worker1 = engine on GPU0 serving a steady decode load (reuse
+     `bench_perf` with a long-running batch).
+   - `w2w` arm: while worker1 decodes, copy `history_tokens *
+     bytes_per_token` from GPU0 tensors to GPU1 (this bench's copy routine),
+     then prefill only the new tokens on a GPU1 engine; record worker1's
+     tok/s during the window.
+   - `filekv` arm: GPU1 engine with `EpicConnector` + staged chunks
+     (`epic_prefetch_gpu_bytes` > 0), full turn-10 prompt; worker1 untouched.
+   - Report: turn-10 TTFT, worker1 tok/s dip, and accuracy delta of the two
+     arms (w2w is exact; filekv is EPIC-approximate — quality goes through
+     `bench_accuracy`).
+
+Honest caveat baked into the model: on PCIe-class defaults `w2w` wins raw
+TTFT for moderate file fractions (copying 128 KiB/token at 25-40 GB/s beats
+recomputing half the history). `filekv`'s wins concentrate where (a) the
+history is mostly file content, (b) the interconnect is slow/contended or
+cross-node (no p2p), (c) worker1's KV was already evicted (w2w impossible —
+fileKV persists on CPU), or (d) worker1 interference is priced in. The bench
+exists to locate that boundary on real hardware instead of asserting it.
