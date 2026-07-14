@@ -17,6 +17,12 @@ to worker2 (GPU1). worker2 has none of the history KV. Three strategies:
                    (EPIC non-contiguous reuse). M = non-file tokens + link
                    heads. Zero contact with worker1. H2D is hideable by
                    prefetch (the tool-call schema names the files a turn early).
+  * ``hostkv``  -- turn 9's KV was EVICTED to host memory (CPU offload tier:
+                   offloading connector / LMCache CPU cache). worker2 copies
+                   the exact history KV back H2D in paged-block pieces.
+                   Exact like w2w, zero worker1 interference (the D2H was
+                   paid at evict time), but the copy is reactive -- nothing
+                   prefetched it, and it moves the WHOLE history.
   * ``full``    -- worker2 recomputes everything (floor/reference).
 
 The crossover depends on: history length, file fraction of the history,
@@ -99,6 +105,12 @@ class MachineInputs:
     staged_busy_gbps: float = 12.0
     # Pinned-host -> GPU1 (the fileKV CPU-store load path).
     h2d_gbps: float = 20.0
+    # Host offload tier -> GPU1 (evicted history KV copied back). Lower than
+    # h2d_gbps by default: the offload tier hands back paged BLOCKS (16-token
+    # ~2 MiB pieces), so the copy is many small transfers, not one contiguous
+    # payload. The microbench measures this as a 2 MiB-piece copy loop. For a
+    # CROSS-NODE host tier, override with the network bandwidth instead.
+    host_gbps: float = 14.0
     # worker1 serving throughput multiplier while a copy is in flight
     # (1.0 = no impact; microbench measures triad_during/triad_solo).
     src_slowdown_during_copy: float = 0.85
@@ -194,6 +206,37 @@ def cost_filekv(s: Scenario, g: KVGeometry, m: MachineInputs) -> StrategyCost:
     )
 
 
+def cost_hostkv(s: Scenario, g: KVGeometry, m: MachineInputs) -> StrategyCost:
+    """History KV was EVICTED to host memory (CPU offload tier, e.g. the
+    offloading connector / LMCache CPU cache); worker2 copies it back H2D.
+
+    Exact prefix reuse like w2w, but the transfer source is host RAM, not
+    worker1's HBM: the D2H already happened at evict time, so worker1's GPU
+    is untouched (zero interference) and src_busy is irrelevant. Same-node
+    only in this model; cross-node adds a network hop (set ``host_gbps`` to
+    the network bandwidth to approximate that). H2D can overlap the
+    new-token prefill layer-by-layer, same accounting as the filekv miss
+    path -- but here the moved bytes cover the WHOLE history, and with
+    new_tokens small the copy dominates and is NOT hidden by any prefetch
+    (the eviction is reactive; nothing staged it on worker2 in advance).
+    Requires the history to actually be resident in the host tier
+    (eviction-policy coverage) -- the model assumes a 100% host hit.
+    """
+    move = s.history_tokens * g.bytes_per_token
+    h2d_s = move / (m.host_gbps * 1e9) + m.transfer_overhead_s
+    prefill_s = _prefill_time(s.new_tokens, m)
+    exposed_h2d = max(0.0, h2d_s - prefill_s)
+    return StrategyCost(
+        strategy="hostkv",
+        ttft_s=prefill_s + exposed_h2d,
+        bytes_moved=move,
+        recompute_tokens=s.new_tokens,
+        src_interference_s=0.0,  # D2H was paid at evict time, off the clock
+        src_slowdown=1.0,
+        detail={"h2d_s": h2d_s, "prefill_s": prefill_s, "exposed_h2d_s": exposed_h2d},
+    )
+
+
 def cost_full(s: Scenario, g: KVGeometry, m: MachineInputs) -> StrategyCost:
     recompute = s.history_tokens + s.new_tokens
     return StrategyCost(
@@ -206,8 +249,16 @@ def cost_full(s: Scenario, g: KVGeometry, m: MachineInputs) -> StrategyCost:
     )
 
 
+STRATEGIES = ("w2w", "hostkv", "filekv", "full")
+
+
 def evaluate(s: Scenario, g: KVGeometry, m: MachineInputs) -> list[StrategyCost]:
-    return [cost_w2w(s, g, m), cost_filekv(s, g, m), cost_full(s, g, m)]
+    return [
+        cost_w2w(s, g, m),
+        cost_hostkv(s, g, m),
+        cost_filekv(s, g, m),
+        cost_full(s, g, m),
+    ]
 
 
 def sweep(
@@ -244,6 +295,7 @@ def sweep(
                             "src_busy": busy,
                             "prefetch_hit": hit,
                             "ttft_w2w_ms": costs["w2w"].ttft_s * 1e3,
+                            "ttft_hostkv_ms": costs["hostkv"].ttft_s * 1e3,
                             "ttft_filekv_ms": costs["filekv"].ttft_s * 1e3,
                             "ttft_full_ms": costs["full"].ttft_s * 1e3,
                             "w2w_bytes_mb": costs["w2w"].bytes_moved / 1e6,
@@ -251,8 +303,7 @@ def sweep(
                             * 1e3,
                             "src_slowdown": costs["w2w"].src_slowdown,
                             "winner": min(
-                                ("w2w", "filekv", "full"),
-                                key=lambda k: costs[k].ttft_s,
+                                STRATEGIES, key=lambda k: costs[k].ttft_s
                             ),
                         }
                     )
@@ -366,6 +417,21 @@ def _measure(args: argparse.Namespace) -> MachineInputs:
     # --- pinned H2D on dst (the fileKV load path) ---
     t_h2d = timed(lambda: payload_dst.copy_(host, non_blocking=True))
 
+    # --- host offload tier -> dst: paged-block-shaped copy (2 MiB pieces) ---
+    # The eviction tier returns 16-token BLOCKS, so the restore is many small
+    # H2D transfers, not one contiguous memcpy. 2 MiB ~= one fp16 block of a
+    # Llama-8B-class model (16 tok * 128 KiB/tok).
+    piece = 2 * 1024 * 1024 // 2  # fp16 elements per 2 MiB piece
+    n_pieces = max(1, n // piece)
+
+    def blockwise_h2d():
+        for i in range(n_pieces):
+            payload_dst[i * piece : (i + 1) * piece].copy_(
+                host[i * piece : (i + 1) * piece], non_blocking=True
+            )
+
+    t_host = timed(blockwise_h2d)
+
     # Staged-busy is approximated by scaling staged-idle with the same
     # busy/idle degradation the direct path showed (the D2H leg contends for
     # the same src HBM); a dedicated measurement can replace this later.
@@ -376,6 +442,7 @@ def _measure(args: argparse.Namespace) -> MachineInputs:
         staged_idle_gbps=gbps(t_staged_idle),
         staged_busy_gbps=gbps(t_staged_idle) * min(1.0, busy_ratio),
         h2d_gbps=gbps(t_h2d),
+        host_gbps=gbps(t_host),
         src_slowdown_during_copy=min(1.0, t_triad_solo / t_triad_during),
         prefill_tokps=args.prefill_tokps,
         p2p_available=bool(p2p),

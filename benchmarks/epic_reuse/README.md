@@ -235,17 +235,22 @@ Answers: *worker1 served turn 9; turn 10 lands on worker2 — is it better to
 W2W-copy the whole history KV from (busy) worker1, or recompute the history
 on worker2 with fileKV assist?*
 
-Strategies compared: `w2w` (copy full history KV = exact prefix reuse; large
-bytes + worker1 HBM interference), `filekv` (recompute non-file history, load
-file chunks from the CPU store / GPU staging; zero worker1 contact; H2D hidden
-on a prefetch hit), `full` (recompute floor).
+Strategies compared: `w2w` (copy full history KV from worker1's HBM = exact
+prefix reuse; large bytes + worker1 HBM interference), `hostkv` (history KV
+already EVICTED to the host offload tier -- offloading connector / LMCache CPU
+cache -- copied back H2D in paged-block pieces; exact like w2w, zero worker1
+interference, but reactive: nothing prefetched it and the whole history
+moves), `filekv` (recompute non-file history, load file chunks from the CPU
+store / GPU staging; zero worker1 contact; H2D hidden on a prefetch hit),
+`full` (recompute floor).
 
 Three layers:
 
 1. **Microbench** (needs >= 2 CUDA devices) — measures the machine inputs:
    D2D peer bandwidth with the source idle vs busy (HBM-bound triad load),
    the triad's own slowdown while a copy streams out (== worker1 serving
-   degradation), pinned H2D, and the through-CPU staged fallback:
+   degradation), pinned H2D, blockwise 2 MiB-piece H2D (the hostkv restore
+   shape), and the through-CPU staged fallback:
    ```bash
    python -m benchmarks.epic_reuse.bench_migration --run -o migration.json
    ```
@@ -272,8 +277,14 @@ Three layers:
 
 Honest caveat baked into the model: on PCIe-class defaults `w2w` wins raw
 TTFT for moderate file fractions (copying 128 KiB/token at 25-40 GB/s beats
-recomputing half the history). `filekv`'s wins concentrate where (a) the
-history is mostly file content, (b) the interconnect is slow/contended or
-cross-node (no p2p), (c) worker1's KV was already evicted (w2w impossible —
-fileKV persists on CPU), or (d) worker1 interference is priced in. The bench
-exists to locate that boundary on real hardware instead of asserting it.
+recomputing half the history), and when worker1's GPU copy is unavailable or
+heavily contended, `hostkv` -- not `filekv` -- is the natural runner-up for
+SAME-conversation migration (exact, worker1-free, just a slower pipe).
+`filekv`'s wins concentrate where (a) the history is mostly file content
+(recompute collapses to link heads and it beats even hostkv's full-history
+copy), (b) the pipe to the KV source is slow or cross-node, (c) the KV fell
+out of BOTH tiers (only fileKV's content-addressed store persists), (d) the
+reuse is CROSS-conversation (N agents share files in different contexts --
+exact-prefix copies can't serve that at all), or (e) worker1 interference is
+priced in. The bench exists to locate these boundaries on real hardware
+instead of asserting them.

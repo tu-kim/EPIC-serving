@@ -11,11 +11,13 @@ silently change what the bench claims to measure.
 import pytest
 
 from benchmarks.epic_reuse.bench_migration import (
+    STRATEGIES,
     KVGeometry,
     MachineInputs,
     Scenario,
     cost_filekv,
     cost_full,
+    cost_hostkv,
     cost_w2w,
     evaluate,
     sweep,
@@ -91,6 +93,45 @@ def test_filekv_miss_h2d_overlaps_prefill():
     )
 
 
+def test_hostkv_exact_reuse_zero_interference_full_bytes():
+    m = MachineInputs()
+    for busy in (False, True):
+        c = cost_hostkv(_scenario(src_busy=busy), GEOM, m)
+        # Exact prefix reuse: only new tokens recomputed, like w2w.
+        assert c.recompute_tokens == 512
+        # But zero worker1 contact (D2H was paid at evict time)...
+        assert c.src_interference_s == 0.0 and c.src_slowdown == 1.0
+        # ...and the whole history moves, unaffected by src_busy.
+        assert c.bytes_moved == 16384 * GEOM.bytes_per_token
+    idle = cost_hostkv(_scenario(src_busy=False), GEOM, m)
+    busy_c = cost_hostkv(_scenario(src_busy=True), GEOM, m)
+    assert idle.ttft_s == pytest.approx(busy_c.ttft_s)
+
+
+def test_hostkv_vs_w2w_flips_on_busy_source():
+    """hostkv trades a slower pipe (host_gbps < d2d) for busy-immunity: with
+    the source busy enough, hostkv overtakes w2w at identical exactness."""
+    m = MachineInputs(d2d_idle_gbps=40.0, d2d_busy_gbps=8.0, host_gbps=14.0)
+    s_idle = _scenario(src_busy=False)
+    s_busy = _scenario(src_busy=True)
+    assert cost_w2w(s_idle, GEOM, m).ttft_s < cost_hostkv(s_idle, GEOM, m).ttft_s
+    assert cost_hostkv(s_busy, GEOM, m).ttft_s < cost_w2w(s_busy, GEOM, m).ttft_s
+
+
+def test_hostkv_vs_filekv_crossover():
+    """filekv beats hostkv when the history is nearly all file content and
+    staged (recompute ~= links only, zero bytes); hostkv wins at low file
+    fraction (its pipe beats recomputing most of the history)."""
+    m = MachineInputs()
+    hi_file = _scenario(
+        history_tokens=131072, file_tokens=129024, new_tokens=256,
+        prefetch_hit=True,
+    )
+    lo_file = _scenario(history_tokens=131072, file_tokens=16384, new_tokens=256)
+    assert cost_filekv(hi_file, GEOM, m).ttft_s < cost_hostkv(hi_file, GEOM, m).ttft_s
+    assert cost_hostkv(lo_file, GEOM, m).ttft_s < cost_filekv(lo_file, GEOM, m).ttft_s
+
+
 def test_full_is_upper_bound_on_recompute():
     s = _scenario()
     m = MachineInputs()
@@ -140,6 +181,7 @@ def test_sweep_snaps_file_tokens_to_chunks_and_labels_winner():
     assert rows
     for r in rows:
         assert r["file_tokens"] % 256 == 0
-        assert r["winner"] in ("w2w", "filekv", "full")
+        assert r["winner"] in STRATEGIES
+        assert "ttft_hostkv_ms" in r
         # full recompute can never strictly beat filekv in this model.
         assert r["ttft_filekv_ms"] <= r["ttft_full_ms"] + 1e-9
