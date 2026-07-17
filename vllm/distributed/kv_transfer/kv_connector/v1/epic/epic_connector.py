@@ -284,7 +284,8 @@ class EpicConnector(KVConnectorBase_V1):
         # role-appropriate one is constructed/used. (Constructing both would be
         # harmless metadata, but None makes the role intent explicit and trips
         # loudly if the wrong side is touched.)
-        self._store: EpicChunkStore | None = None
+        # Duck-typed store: EpicChunkStore or kvbm_store.KvbmChunkStore.
+        self._store: "EpicChunkStore | KvbmChunkStore | None" = None  # noqa: F821
         self._index: EpicSchedulerIndex | None = None
         if role == KVConnectorRole.SCHEDULER:
             self._index = EpicSchedulerIndex(
@@ -295,10 +296,30 @@ class EpicConnector(KVConnectorBase_V1):
                 cache_dtype_size=self._idx_dtype_size,
             )
         else:  # KVConnectorRole.WORKER
-            self._store = EpicChunkStore(
-                capacity_bytes=self._capacity_bytes,
-                pin_memory=bool(extra.get("epic_pin_memory", True)),
-            )
+            # Store backend: "cpu" (default) = process-local EpicChunkStore;
+            # "kvbm" = host-DRAM pool behind the KVBM interface (offline
+            # fileKV builds land there; see epic/kvbm_store.py). Both are
+            # duck-compatible, so everything downstream is backend-agnostic.
+            backend = str(extra.get("epic_store_backend", "cpu"))
+            if backend == "kvbm":
+                from vllm.distributed.kv_transfer.kv_connector.v1.epic.kvbm_store import (  # noqa: E501
+                    KvbmChunkStore,
+                    build_host_pool,
+                )
+                self._store = KvbmChunkStore(
+                    pool=build_host_pool(extra),
+                    capacity_bytes=self._capacity_bytes,
+                    pin_memory=bool(extra.get("epic_pin_memory", True)),
+                )
+            elif backend == "cpu":
+                self._store = EpicChunkStore(
+                    capacity_bytes=self._capacity_bytes,
+                    pin_memory=bool(extra.get("epic_pin_memory", True)),
+                )
+            else:
+                raise ValueError(
+                    f"unknown epic_store_backend: {backend!r} "
+                    "(expected 'cpu' or 'kvbm')")
 
         # Scheduler-side bookkeeping: req_id -> matched prefix chunk hashes.
         self._matched_prefix: dict[str, list[tuple[str, int]]] = {}

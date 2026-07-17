@@ -118,6 +118,37 @@ epic/
 | identity delta | 회전 생략 | R(0)=I (prefix 재로드) |
 | save 경로 | host copy 2회→1회, async | GPU→pinned 직행 D2H + `wait_for_save` fence |
 
+### Offline fileKV 빌드 (host DRAM, KVBM 인터페이스)
+
+`filekv_offline.py`: 지정 디렉토리의 모든 파일을 스캔해 fileKV를 **host DRAM**에
+상주시키는 오프라인 잡. 파이프라인 = scan → render(서빙과 byte-일치 필수) →
+tokenize → chunk-grid pad → **hash+chain plan(토큰이 oracle)** → whole-file
+1-run warm(파일 내부 long-range attention·context chain 보존) → `KvbmChunkStore`
+put → `FileKVCatalog` 등록 → manifest(JSON; frontend가 재렌더 없이 prefetch).
+재스캔은 증분(fingerprint 일치 + 청크 상주 시 skip).
+
+`kvbm_store.py`: host-DRAM 저장 계층.
+- `HostPool` 프로토콜(put/get/contains/evict bytes) — KVBM G2 계층의 최소 표면.
+- `PinnedHostPool`: pinned host-DRAM 기본 구현(테스트·standalone; DMA-ready).
+- `DynamoKvbmHostPool`: `kvbm` 패키지 어댑터. KVBM의 공식 표면은 vLLM connector
+  (`kvbm.vllm_integration.connector`) + `DYN_KVBM_CPU_CACHE_GB` 사이징이므로,
+  raw pool 핸들은 주입식(배포가 kvbm 바인딩을 감싼 객체 전달); `from_env()`는
+  알려진 바인딩을 탐색하고 없으면 지침과 함께 실패(조용한 degrade 없음).
+- `KvbmChunkStore`: `EpicChunkStore`와 duck-호환(멤버십은 로컬 인덱스로
+  역직렬화 0회, LRU/byte-budget/oversize-거부 동일 → scheduler mirror 결정성
+  유지, 외부 evict는 get에서 self-heal).
+
+커넥터 연결: extra-config `epic_store_backend: "kvbm"` (+`epic_kvbm_pool`:
+"pinned"|"dynamo"|객체). 기본 "cpu"는 기존 EpicChunkStore 그대로.
+
+```bash
+# CPU 어디서든: 스캔+해시플랜+manifest (KV 없음)
+python -m vllm.distributed.kv_transfer.kv_connector.v1.epic.filekv_offline \
+    --dir /repo --include "**/*.py" --tokenizer <serving-tokenizer> --dry-run
+# GPU 실빌드: EpicConnector(epic_store_backend=kvbm) 엔진으로 파일당
+# generate(render, max_tokens=1) — connector save 경로가 청크를 직접 적재.
+```
+
 ## 4. 사용법
 
 ```bash

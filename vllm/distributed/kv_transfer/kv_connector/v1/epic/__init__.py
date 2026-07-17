@@ -45,6 +45,22 @@ from vllm.distributed.kv_transfer.kv_connector.v1.epic.filekv_catalog import (
     RangeKey,
     canonicalize_range,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.epic.filekv_offline import (
+    ChunkPlan,
+    FileBuildResult,
+    OfflineFileKVBuilder,
+    default_render,
+    file_fingerprint,
+    plan_chunks,
+    scan_directory,
+    write_manifest,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.epic.kvbm_store import (
+    DynamoKvbmHostPool,
+    KvbmChunkStore,
+    PinnedHostPool,
+    build_host_pool,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.epic.prefetch_service import (
     DynamoPrefetchBridge,
     EpicPrefetchClient,
@@ -91,6 +107,19 @@ __all__ = [
     "EpicPrefetchClient",
     "EpicPrefetchListener",
     "ExternalStagingBackend",
+    # offline fileKV build + KVBM host-DRAM store
+    "OfflineFileKVBuilder",
+    "ChunkPlan",
+    "FileBuildResult",
+    "scan_directory",
+    "plan_chunks",
+    "default_render",
+    "file_fingerprint",
+    "write_manifest",
+    "KvbmChunkStore",
+    "PinnedHostPool",
+    "DynamoKvbmHostPool",
+    "build_host_pool",
     "FusionMaskTensors",
     "build_legolink_mask_mod",
     "EpicChunkStore",
