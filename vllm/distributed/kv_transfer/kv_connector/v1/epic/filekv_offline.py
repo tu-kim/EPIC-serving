@@ -203,7 +203,11 @@ class OfflineFileKVBuilder:
         self._store = store
         self._tokenize = tokenize_fn
         self._warm = warm_fn
-        self._catalog = catalog or FileKVCatalog()
+        # NOT `catalog or ...`: FileKVCatalog defines __len__, so an injected
+        # EMPTY catalog is falsy and would be silently replaced -- the caller
+        # (e.g. the frontend bridge sharing one catalog) would then never see
+        # the recorded units.
+        self._catalog = FileKVCatalog() if catalog is None else catalog
         self._render = render_fn
         self._chunk_size = int(chunk_size)
         self._pad_token_id = int(pad_token_id)
