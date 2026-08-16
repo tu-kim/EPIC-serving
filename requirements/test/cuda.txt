@@ -576,7 +576,7 @@ optuna==3.6.1
     # via genai-perf
 orjson==3.11.5
     # via genai-perf
-packaging==24.2
+packaging==26.2
     # via
     #   accelerate
     #   bitsandbytes
